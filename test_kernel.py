@@ -217,6 +217,25 @@ def test_dedup_vocabulary_merges_near_duplicates():
 # --------------------------------------------------------------------------- #
 # get_or_create_kc with mocked LLM
 # --------------------------------------------------------------------------- #
+def test_selective_update_gate_bootstraps_then_gates():
+    attempt = {"outcome": "failure", "partial_credit": 0.2}
+    # First contact (no prior state) always commits.
+    assert analyze_pipeline._should_commit(attempt, None, 1) is True
+    # Small change vs stored average, single attempt -> no commit.
+    prev = {"partial_credit_avg": 0.25, "mastery_score_raw": 0.3}
+    assert analyze_pipeline._should_commit(attempt, prev, 1) is False
+    # Large partial-credit shift -> commit.
+    prev_far = {"partial_credit_avg": 0.9, "mastery_score_raw": 0.9}
+    assert analyze_pipeline._should_commit(attempt, prev_far, 1) is True
+
+
+def test_velocity_and_persistence_bounds():
+    assert analyze_pipeline._velocity(0.3, 0.6) > 0.5      # improving
+    assert analyze_pipeline._velocity(0.6, 0.3) < 0.5      # declining
+    assert 0.05 <= analyze_pipeline._velocity(0.0, 1.0) <= 0.95
+    assert 0.05 <= analyze_pipeline._persistence(0.8, 1, 5) <= 0.95
+
+
 @pytest.mark.asyncio
 async def test_get_or_create_kc_creates_and_reuses(fake_supabase, monkeypatch):
     async def fake_llm_call(prompt, max_tokens=1000):

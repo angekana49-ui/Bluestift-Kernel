@@ -6,9 +6,10 @@ of main.py so the route handler stays thin and this stays unit-testable.
 """
 from __future__ import annotations
 
+from collections import Counter
 from datetime import datetime, timezone
 
-from core import bkt, detector, forgetting
+from core import bkt, calibration, detector, forgetting, mindset
 from core.graph import build_graph, node_id
 from services import db
 from services.kc_registry import get_or_create_kc
@@ -47,8 +48,20 @@ Reponds UNIQUEMENT en JSON valide, sans markdown, sans explication :
     }}
   ],
   "blocage_type": "conceptual" | "linguistic" | "ambiguous" | "none",
-  "langue_interaction": "fr" | "en" | "ar" | "other"
+  "langue_interaction": "fr" | "en" | "ar" | "other",
+  "mindset_signals": {{
+    "abandon_rate": 0.0,
+    "persistence_score": 0.0,
+    "time_on_task": 0.0,
+    "interaction_quality": 0.0
+  }}
 }}
+
+Pour mindset_signals (chaque valeur entre 0.0 et 1.0, juge depuis la conversation) :
+- abandon_rate : a quel point l'eleve abandonne / se decourage (1 = abandonne vite).
+- persistence_score : a quel point il persevere malgre la difficulte (1 = tres tenace).
+- time_on_task : engagement et effort percu dans l'echange (1 = tres investi).
+- interaction_quality : richesse et reflexion de ses reponses (1 = tres elaborees).
 
 Note : les KCs peuvent etre dans n'importe quelle matiere scolaire.
 Si le sujet traite n'est pas {subject}, ajuste le champ subject en consequence.
@@ -176,6 +189,8 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
 
     # 4-5. Decay -> effective mastery, then a selective BKT update on attempts.
     attempts_by_label: dict[str, dict] = {a.get("kc_label"): a for a in extraction.get("attempts", [])}
+    # How many times each KC is attempted in this conversation (= one "session").
+    attempt_counts = Counter(a.get("kc_label") for a in extraction.get("attempts", []))
 
     mastery_map: dict[str, dict] = {}
     effective_states: dict[str, float] = {}  # label -> k_effective (for DFS)
@@ -191,22 +206,25 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
             k_raw, kc.get("type_kc", "conceptual"), last_at, lambda_override=lam
         )
 
-        # Apply a BKT update when this KC has an attempt in the conversation.
         attempt = attempts_by_label.get(label)
-        if attempt:
+        # Selective-update gate: commit a BKT update only on a strong signal —
+        # the first contact (bootstrap), 3+ attempts this session, a large
+        # partial-credit shift, or an anomaly. Avoids overreacting to noise.
+        if attempt and _should_commit(attempt, state, attempt_counts.get(label, 1)):
             pc = attempt.get("partial_credit")
             if attempt.get("is_assisted"):
                 pc = min(pc if pc is not None else 0.9, 0.9)
             params = bkt.get_bkt_params(kc)
+            k_before = k_raw
             k_raw = bkt.update_bkt(
-                k_raw,
+                k_before,
                 correct=(attempt.get("outcome") == "success"),
                 partial_credit=pc,
                 params=params,
             )
             # Decay is relative to "now" after a fresh signal -> k_eff == k_raw.
             k_eff = k_raw
-            _persist_state(client, user_id, concept_id, k_raw, pc, attempt, state)
+            _persist_state(client, user_id, concept_id, kc, k_before, k_raw, pc, attempt, state, lam)
 
         p_slip = (state.get("p_slip_personal") if state else None) or bkt.get_bkt_params(kc)["p_slip"]
         pc_avg = (state.get("partial_credit_avg") if state else None) or 0.5
@@ -218,6 +236,9 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
             "status": status,
         }
         effective_states[label] = k_eff
+
+    # 5b. Mindset M from the conversation's behavioural signals (Dweck-bounded).
+    _update_mindset(client, user_id, extraction.get("mindset_signals"))
 
     # 6. Build the NetworkX graph from the full DB graph.
     nodes = db.load_concept_nodes(client)
@@ -264,30 +285,91 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
     return output
 
 
-def _persist_state(client, user_id, concept_id, k_raw, pc, attempt, prev_state) -> None:
-    """Write the updated student_concept_state after a BKT update."""
+def _should_commit(attempt: dict, prev_state: dict | None, attempts_this_session: int) -> bool:
+    """Selective-update gate (Corbett-style strong-signal rule).
+
+    First contact bootstraps the state; afterwards a BKT update commits only on a
+    strong signal: 3+ attempts on the KC this session, a partial-credit shift
+    > 0.3 vs the stored average, or a flagged anomaly.
+    """
+    if prev_state is None:
+        return True  # bootstrap the very first observation
+    pc = attempt.get("partial_credit")
+    prev_avg = prev_state.get("partial_credit_avg")
+    anomalous = attempt.get("outcome") == "failure" and (prev_state.get("mastery_score_raw") or 0) >= 0.8
+    return bkt.should_update_bkt(attempts_this_session, pc if pc is not None else 0.0, prev_avg, anomalous)
+
+
+def _velocity(k_before: float, k_after: float) -> float:
+    """v_score — learning velocity: 0.5 neutral, >0.5 improving, <0.5 declining."""
+    return round(max(0.05, min(0.95, 0.5 + 2.0 * (k_after - k_before))), 4)
+
+
+def _persistence(new_avg: float, struggle_index: int, interactions: int) -> float:
+    """p_score — perseverance/proficiency: solid performance kept up despite struggle."""
+    struggle_ratio = struggle_index / interactions if interactions else 0.0
+    return round(max(0.05, min(0.95, 0.5 * new_avg + 0.5 * (1.0 - struggle_ratio))), 4)
+
+
+def _persist_state(client, user_id, concept_id, kc, k_before, k_after, pc, attempt, prev_state, lam) -> None:
+    """Write the updated student_concept_state: K, V, P, personal lambda, trajectory."""
     now = datetime.now(timezone.utc).isoformat()
     prev_count = (prev_state or {}).get("interactions_on_kc", 0) or 0
     prev_struggle = (prev_state or {}).get("struggle_index", 0) or 0
-    is_struggle = (attempt.get("outcome") == "failure")
+    is_struggle = attempt.get("outcome") == "failure"
+    interactions = prev_count + 1
+    struggle_index = prev_struggle + (1 if is_struggle else 0)
 
-    # Running average of partial credit (simple incremental mean).
+    # Running average of partial credit (incremental mean).
     prev_avg = (prev_state or {}).get("partial_credit_avg")
     pc_val = pc if pc is not None else (1.0 if attempt.get("outcome") == "success" else 0.0)
-    if prev_avg is None:
-        new_avg = pc_val
-    else:
-        new_avg = (prev_avg * prev_count + pc_val) / (prev_count + 1)
+    new_avg = pc_val if prev_avg is None else (prev_avg * prev_count + pc_val) / (prev_count + 1)
 
-    db.upsert_student_concept_state(
-        client,
-        {
-            "user_id": user_id,
-            "concept_id": concept_id,
-            "mastery_score_raw": round(k_raw, 4),
-            "partial_credit_avg": round(new_avg, 4),
-            "struggle_index": prev_struggle + (1 if is_struggle else 0),
-            "interactions_on_kc": prev_count + 1,
-            "last_strong_signal_at": now,
-        },
-    )
+    row = {
+        "user_id": user_id,
+        "concept_id": concept_id,
+        "mastery_score_raw": round(k_after, 4),
+        "mastery_score_effective": round(k_after, 4),  # fresh signal -> no decay
+        "v_score": _velocity(k_before, k_after),
+        "p_score": _persistence(new_avg, struggle_index, interactions),
+        "partial_credit_avg": round(new_avg, 4),
+        "struggle_index": struggle_index,
+        "interactions_on_kc": interactions,
+        "last_strong_signal_at": now,
+    }
+
+    # Personal forgetting rate: if the student returns after a real gap, estimate
+    # lambda from the observed decay (stored mastery -> demonstrated level now).
+    personal_lambda = _estimate_personal_lambda(prev_state, pc_val, lam)
+    if personal_lambda is not None:
+        row["lambda_personal"] = round(personal_lambda, 5)
+
+    db.upsert_student_concept_state(client, row)
+    db.log_trajectory(client, user_id, concept_id, k_after, k_after)
+
+
+def _estimate_personal_lambda(prev_state: dict | None, observed_now: float, current_lambda: float):
+    """Estimate the student's personal decay rate from observed forgetting."""
+    if not prev_state or not prev_state.get("last_strong_signal_at"):
+        return None
+    prev_k = prev_state.get("mastery_score_raw") or 0.0
+    delta_days = forgetting.days_since(prev_state["last_strong_signal_at"])
+    if delta_days < 1 or prev_k <= 0 or observed_now <= 0:
+        return None
+    return calibration.calibrate_personal_lambda(prev_k, observed_now, delta_days, current_lambda)
+
+
+def _update_mindset(client, user_id: str, signals: dict | None) -> None:
+    """Compute and persist the mindset score M from behavioural signals."""
+    if not signals:
+        return
+    try:
+        m = mindset.compute_mindset_score(
+            abandon_rate=float(signals.get("abandon_rate", 0.0)),
+            persistence_score=float(signals.get("persistence_score", 0.0)),
+            time_on_task=float(signals.get("time_on_task", 0.0)),
+            interaction_quality=float(signals.get("interaction_quality", 0.0)),
+        )
+    except (TypeError, ValueError):
+        return
+    db.upsert_mindset(client, user_id, round(m, 4), mindset.classify_mindset(m))

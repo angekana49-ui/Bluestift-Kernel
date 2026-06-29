@@ -51,6 +51,14 @@ def _parse_ts(value) -> datetime:
     return dt
 
 
+def days_since(timestamp) -> float:
+    """Whole-and-fractional days elapsed since a timestamp (datetime or ISO str)."""
+    if timestamp is None:
+        return 0.0
+    delta = (datetime.now(timezone.utc) - _parse_ts(timestamp)).total_seconds() / 86400.0
+    return max(0.0, delta)
+
+
 def compute_effective_mastery(
     k_raw: float,
     kc_type: str,

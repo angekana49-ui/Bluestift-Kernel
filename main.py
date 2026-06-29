@@ -37,6 +37,7 @@ from models.schemas import (  # noqa: E402
 )
 from services import analyze as analyze_pipeline  # noqa: E402
 from services import db  # noqa: E402
+from services.analyze import _persistence, _velocity  # noqa: E402
 
 KERNEL_VERSION = os.getenv("KERNEL_VERSION", "1.0.0")
 
@@ -178,6 +179,10 @@ async def update_concept_state(
     prev_avg = state.get("partial_credit_avg") if state else None
     new_avg = pc if prev_avg is None else (prev_avg * prev_count + pc) / (prev_count + 1)
     prev_struggle = (state.get("struggle_index") if state else 0) or 0
+    interactions = prev_count + 1
+    struggle_index = prev_struggle + (1 if pc < 0.5 else 0)
+    v_score = _velocity(k_raw_prev, k_raw)
+    p_score = _persistence(new_avg, struggle_index, interactions)
 
     db.upsert_student_concept_state(
         client,
@@ -185,12 +190,16 @@ async def update_concept_state(
             "user_id": req.user_id,
             "concept_id": req.concept_id,
             "mastery_score_raw": round(k_raw, 4),
+            "mastery_score_effective": round(k_raw, 4),
+            "v_score": v_score,
+            "p_score": p_score,
             "partial_credit_avg": round(new_avg, 4),
-            "struggle_index": prev_struggle + (1 if pc < 0.5 else 0),
-            "interactions_on_kc": prev_count + 1,
+            "struggle_index": struggle_index,
+            "interactions_on_kc": interactions,
             "last_strong_signal_at": now,
         },
     )
+    db.log_trajectory(client, req.user_id, req.concept_id, k_raw, k_raw)
 
     k_eff = forgetting.compute_effective_mastery(
         k_raw, node.get("type_kc", "conceptual"), now,
@@ -206,7 +215,7 @@ async def update_concept_state(
         concept_id=req.concept_id,
         k_raw=round(k_raw, 4),
         k_effective=round(k_eff, 4),
-        p_score=state.get("p_score") if state else 0.5,
+        p_score=p_score,
         status=status,
         updated=True,
     )

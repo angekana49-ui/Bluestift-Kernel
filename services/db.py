@@ -145,6 +145,22 @@ def load_mindset(client, user_id: str) -> dict | None:
     return res.data[0] if res.data else None
 
 
+def log_trajectory(client, user_id: str, concept_id: str, k_raw: float, k_effective: float) -> None:
+    """Append a temporal mastery snapshot (best-effort; never breaks the flow)."""
+    try:
+        _kernel(client, "learning_trajectories").insert(
+            {
+                "user_id": user_id,
+                "concept_id": concept_id,
+                "k_raw": round(k_raw, 4),
+                "k_effective": round(k_effective, 4),
+                "snapshot_at": _now_iso(),
+            }
+        ).execute()
+    except Exception:  # noqa: BLE001 - trajectory logging is non-critical
+        pass
+
+
 def upsert_mindset(client, user_id: str, m_score: float, detected: str) -> None:
     _kernel(client, "student_mindset_state").upsert(
         {
