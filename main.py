@@ -37,7 +37,7 @@ from models.schemas import (  # noqa: E402
 )
 from services import analyze as analyze_pipeline  # noqa: E402
 from services import db  # noqa: E402
-from services.analyze import _persistence, _velocity  # noqa: E402
+from services.analyze import _persistence, _slip_estimate, _velocity  # noqa: E402
 
 KERNEL_VERSION = os.getenv("KERNEL_VERSION", "1.0.0")
 
@@ -181,8 +181,13 @@ async def update_concept_state(
     prev_struggle = (state.get("struggle_index") if state else 0) or 0
     interactions = prev_count + 1
     struggle_index = prev_struggle + (1 if pc < 0.5 else 0)
-    v_score = _velocity(k_raw_prev, k_raw)
-    p_score = _persistence(new_avg, struggle_index, interactions)
+
+    # Cognitive vector: V = learning rate p(T); P = (1 - personal slip) modulated by M.
+    m_row = db.load_mindset(client, req.user_id)
+    m_score = (m_row.get("m_score") if m_row else None) or 0.5
+    p_slip_personal = _slip_estimate(state.get("p_slip_personal") if state else None, k_raw_prev, pc < 0.5)
+    v_score = _velocity(state.get("v_score") if state else None, k_raw_prev, k_raw)
+    p_score = _persistence(p_slip_personal, m_score)
 
     db.upsert_student_concept_state(
         client,
@@ -193,6 +198,7 @@ async def update_concept_state(
             "mastery_score_effective": round(k_raw, 4),
             "v_score": v_score,
             "p_score": p_score,
+            "p_slip_personal": p_slip_personal,
             "partial_credit_avg": round(new_avg, 4),
             "struggle_index": struggle_index,
             "interactions_on_kc": interactions,

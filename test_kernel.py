@@ -229,11 +229,24 @@ def test_selective_update_gate_bootstraps_then_gates():
     assert analyze_pipeline._should_commit(attempt, prev_far, 1) is True
 
 
-def test_velocity_and_persistence_bounds():
-    assert analyze_pipeline._velocity(0.3, 0.6) > 0.5      # improving
-    assert analyze_pipeline._velocity(0.6, 0.3) < 0.5      # declining
-    assert 0.05 <= analyze_pipeline._velocity(0.0, 1.0) <= 0.95
-    assert 0.05 <= analyze_pipeline._persistence(0.8, 1, 5) <= 0.95
+def test_velocity_is_learning_rate():
+    # V = p(T): fraction of the remaining mastery gap closed this trial.
+    fast = analyze_pipeline._velocity(None, 0.2, 0.6)   # closed half the gap
+    slow = analyze_pipeline._velocity(None, 0.2, 0.25)  # barely moved
+    assert fast > slow
+    assert 0.05 <= analyze_pipeline._velocity(None, 0.0, 1.0) <= 0.95
+
+
+def test_slip_and_persistence():
+    # A failure while mastery looked solid raises personal slip.
+    slip_hi = analyze_pipeline._slip_estimate(0.1, k_before=0.9, outcome_failure=True)
+    slip_lo = analyze_pipeline._slip_estimate(0.1, k_before=0.3, outcome_failure=True)
+    assert slip_hi > slip_lo
+    # P = (1 - slip) modulated by mindset: growth mindset lifts persistence.
+    p_growth = analyze_pipeline._persistence(0.1, m_score=0.9)
+    p_fixed = analyze_pipeline._persistence(0.1, m_score=0.1)
+    assert p_growth > p_fixed
+    assert 0.05 <= p_growth <= 0.95
 
 
 @pytest.mark.asyncio

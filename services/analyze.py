@@ -187,6 +187,9 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
     states_rows = db.load_student_concept_states(client, user_id)
     states_by_concept = {s["concept_id"]: s for s in states_rows}
 
+    # 3b. Mindset M from the conversation (needed to modulate P during the loop).
+    m_score = _update_mindset(client, user_id, extraction.get("mindset_signals"))
+
     # 4-5. Decay -> effective mastery, then a selective BKT update on attempts.
     attempts_by_label: dict[str, dict] = {a.get("kc_label"): a for a in extraction.get("attempts", [])}
     # How many times each KC is attempted in this conversation (= one "session").
@@ -224,7 +227,7 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
             )
             # Decay is relative to "now" after a fresh signal -> k_eff == k_raw.
             k_eff = k_raw
-            _persist_state(client, user_id, concept_id, kc, k_before, k_raw, pc, attempt, state, lam)
+            _persist_state(client, user_id, concept_id, kc, k_before, k_raw, pc, attempt, state, lam, m_score)
 
         p_slip = (state.get("p_slip_personal") if state else None) or bkt.get_bkt_params(kc)["p_slip"]
         pc_avg = (state.get("partial_credit_avg") if state else None) or 0.5
@@ -236,9 +239,6 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
             "status": status,
         }
         effective_states[label] = k_eff
-
-    # 5b. Mindset M from the conversation's behavioural signals (Dweck-bounded).
-    _update_mindset(client, user_id, extraction.get("mindset_signals"))
 
     # 6. Build the NetworkX graph from the full DB graph.
     nodes = db.load_concept_nodes(client)
@@ -300,38 +300,63 @@ def _should_commit(attempt: dict, prev_state: dict | None, attempts_this_session
     return bkt.should_update_bkt(attempts_this_session, pc if pc is not None else 0.0, prev_avg, anomalous)
 
 
-def _velocity(k_before: float, k_after: float) -> float:
-    """v_score — learning velocity: 0.5 neutral, >0.5 improving, <0.5 declining."""
-    return round(max(0.05, min(0.95, 0.5 + 2.0 * (k_after - k_before))), 4)
+def _velocity(prev_v, k_before: float, k_after: float) -> float:
+    """V dimension — individualized learning rate, i.e. p(T) (Yudelson 2013).
+
+    Estimates the fraction of the remaining mastery gap closed on this trial (an
+    empirical p(T)) and smooths it across trials, so V reflects the student's
+    typical learning speed rather than a single jump. Bounded [0.05, 0.95].
+    """
+    room = max(1e-3, 1.0 - k_before)
+    realized = max(0.0, min(1.0, (k_after - k_before) / room))
+    if prev_v is None:
+        return round(max(0.05, min(0.95, realized)), 4)
+    return round(max(0.05, min(0.95, 0.7 * prev_v + 0.3 * realized)), 4)
 
 
-def _persistence(new_avg: float, struggle_index: int, interactions: int) -> float:
-    """p_score — perseverance/proficiency: solid performance kept up despite struggle."""
-    struggle_ratio = struggle_index / interactions if interactions else 0.0
-    return round(max(0.05, min(0.95, 0.5 * new_avg + 0.5 * (1.0 - struggle_ratio))), 4)
+def _slip_estimate(prev_slip, k_before: float, outcome_failure: bool) -> float:
+    """Personal p(S) — a slip is a failure made while mastery already looked solid."""
+    prior = prev_slip if prev_slip is not None else 0.1  # literature p(S)
+    is_slip = 1.0 if (outcome_failure and k_before >= 0.7) else 0.0
+    return round(max(0.01, min(0.5, 0.8 * prior + 0.2 * is_slip)), 4)
 
 
-def _persist_state(client, user_id, concept_id, kc, k_before, k_after, pc, attempt, prev_state, lam) -> None:
-    """Write the updated student_concept_state: K, V, P, personal lambda, trajectory."""
+def _persistence(p_slip: float, m_score: float) -> float:
+    """P dimension — resistance to slip = (1 - p(S)), modulated by mindset M.
+
+    Corbett's inverse-slip persistence, raised or lowered by the student's
+    mindset (a growth mindset sustains effort under difficulty). Bounded.
+    """
+    base = 1.0 - p_slip
+    return round(max(0.05, min(0.95, base * (0.6 + 0.4 * m_score))), 4)
+
+
+def _persist_state(client, user_id, concept_id, kc, k_before, k_after, pc, attempt, prev_state, lam, m_score) -> None:
+    """Write the updated student_concept_state: K, V, P, personal slip/lambda, trajectory."""
     now = datetime.now(timezone.utc).isoformat()
-    prev_count = (prev_state or {}).get("interactions_on_kc", 0) or 0
-    prev_struggle = (prev_state or {}).get("struggle_index", 0) or 0
+    prev = prev_state or {}
+    prev_count = prev.get("interactions_on_kc", 0) or 0
+    prev_struggle = prev.get("struggle_index", 0) or 0
     is_struggle = attempt.get("outcome") == "failure"
     interactions = prev_count + 1
     struggle_index = prev_struggle + (1 if is_struggle else 0)
 
     # Running average of partial credit (incremental mean).
-    prev_avg = (prev_state or {}).get("partial_credit_avg")
+    prev_avg = prev.get("partial_credit_avg")
     pc_val = pc if pc is not None else (1.0 if attempt.get("outcome") == "success" else 0.0)
     new_avg = pc_val if prev_avg is None else (prev_avg * prev_count + pc_val) / (prev_count + 1)
+
+    # Cognitive vector: V = learning rate p(T); P = (1 - personal slip) modulated by M.
+    p_slip_personal = _slip_estimate(prev.get("p_slip_personal"), k_before, is_struggle)
 
     row = {
         "user_id": user_id,
         "concept_id": concept_id,
         "mastery_score_raw": round(k_after, 4),
         "mastery_score_effective": round(k_after, 4),  # fresh signal -> no decay
-        "v_score": _velocity(k_before, k_after),
-        "p_score": _persistence(new_avg, struggle_index, interactions),
+        "v_score": _velocity(prev.get("v_score"), k_before, k_after),
+        "p_score": _persistence(p_slip_personal, m_score),
+        "p_slip_personal": p_slip_personal,
         "partial_credit_avg": round(new_avg, 4),
         "struggle_index": struggle_index,
         "interactions_on_kc": interactions,
@@ -359,10 +384,10 @@ def _estimate_personal_lambda(prev_state: dict | None, observed_now: float, curr
     return calibration.calibrate_personal_lambda(prev_k, observed_now, delta_days, current_lambda)
 
 
-def _update_mindset(client, user_id: str, signals: dict | None) -> None:
-    """Compute and persist the mindset score M from behavioural signals."""
+def _update_mindset(client, user_id: str, signals: dict | None) -> float:
+    """Compute and persist the mindset score M; return it (0.5 if no signal)."""
     if not signals:
-        return
+        return 0.5
     try:
         m = mindset.compute_mindset_score(
             abandon_rate=float(signals.get("abandon_rate", 0.0)),
@@ -371,5 +396,6 @@ def _update_mindset(client, user_id: str, signals: dict | None) -> None:
             interaction_quality=float(signals.get("interaction_quality", 0.0)),
         )
     except (TypeError, ValueError):
-        return
+        return 0.5
     db.upsert_mindset(client, user_id, round(m, 4), mindset.classify_mindset(m))
+    return m
