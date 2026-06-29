@@ -86,7 +86,9 @@ Regles :
 - Du plus elementaire au plus avance, SANS sauter d'etape intermediaire (chaque
   concept doit pouvoir s'appuyer sur un concept immediatement plus simple du strand).
 - Un KC = un concept enseignable en 1 a 3 seances.
-- 8 a 15 KCs pour ce strand, sans doublon.
+- 6 a 10 KCs pour ce strand, sans doublon. Reste a une granularite moyenne :
+  un concept solide, pas une micro-competence (ex: "fonction_affine" et non
+  "ecrire_equation_fonction_affine" + "tracer_fonction_affine" + "utiliser_fonction_affine").
 - Labels en snake_case, sans accents, concis et canoniques.
 - LANGUE OBLIGATOIRE : labels ET descriptions en FRANCAIS uniquement, JAMAIS en
   anglais (ex: "calcul_moyenne" et non "calculate_mean").
@@ -217,7 +219,12 @@ async def generate_vocabulary_stranded(subject: str, levels: list[str]) -> dict[
 
 
 def _dedup_vocabulary(vocab: dict[str, dict]) -> dict[str, dict]:
-    """Collapse near-duplicate labels (keeps the first seen)."""
+    """Collapse near-duplicate labels by string similarity (keeps the first seen).
+
+    This only catches lexically close labels. Semantic synonyms at different
+    wordings (e.g. fonction_affine vs fonctions_affines_et_pentes) are handled by
+    the LLM pass in `canonicalize_vocabulary`.
+    """
     kept: dict[str, dict] = {}
     for label, node in vocab.items():
         dupe_of = next(
@@ -229,17 +236,78 @@ def _dedup_vocabulary(vocab: dict[str, dict]) -> dict[str, dict]:
     return kept
 
 
+CANONICALIZE_PROMPT = """\
+Voici une liste de Knowledge Components (KC) de la matiere {subject} :
+{labels}
+
+Identifie les DOUBLONS et QUASI-SYNONYMES : concepts identiques formules
+differemment, ou plusieurs micro-competences du meme concept (ex:
+"ecrire_fonction_affine", "tracer_fonction_affine", "utiliser_fonction_affine"
+sont le meme concept que "fonction_affine").
+
+Pour chaque groupe redondant, choisis UN label canonique (le plus simple et
+general, deja present dans la liste) et liste les autres a fusionner dedans.
+Ne fusionne JAMAIS deux concepts reellement distincts.
+
+Reponds UNIQUEMENT en JSON valide, sans markdown :
+{{ "merges": [ {{ "canonical": "label_garde", "aliases": ["label_a_fusionner", "..."] }} ] }}
+"""
+
+
+async def canonicalize_vocabulary(subject: str, vocab: dict[str, dict]) -> dict[str, dict]:
+    """LLM pass that merges semantic duplicates/synonyms into canonical labels.
+
+    Returns the vocabulary with alias labels dropped (their canonical kept). On
+    any failure the vocabulary is returned unchanged.
+    """
+    from services.llm import llm_call
+
+    if len(vocab) < 2:
+        return vocab
+    prompt = CANONICALIZE_PROMPT.format(subject=subject, labels=", ".join(vocab.keys()))
+    try:
+        text, _model = await llm_call(prompt, max_tokens=4000)
+        data = extract_json(text)
+    except Exception:  # noqa: BLE001 - keep the vocab as-is on failure
+        return vocab
+
+    drop: set[str] = set()
+    for merge in (data.get("merges", []) if isinstance(data, dict) else []):
+        canonical = _norm(merge.get("canonical", ""))
+        if canonical not in vocab:
+            continue
+        for alias in merge.get("aliases", []) or []:
+            alias = _norm(alias)
+            if alias != canonical and alias in vocab:
+                drop.add(alias)
+    return {label: node for label, node in vocab.items() if label not in drop}
+
+
 # --------------------------------------------------------------------------- #
 # Step 2 + 3 — closed-world prerequisites, corroborated across providers
 # --------------------------------------------------------------------------- #
 async def _prereqs_from_provider(call, subject: str, labels: list[str]) -> set[tuple[str, str]]:
-    """Get (prerequisite, concept) edges from one provider, filtered to the vocab."""
+    """Get (prerequisite, concept) edges from one provider, filtered to the vocab.
+
+    Retries with backoff so a transient rate limit (e.g. Gemini free-tier 429,
+    which resets per minute) doesn't silently drop a provider's corroboration.
+    """
     prompt = PREREQ_PROMPT.format(subject=subject, labels=", ".join(labels))
     label_set = set(labels)
+
+    text = None
+    for attempt in range(3):
+        try:
+            text = await call(prompt, max_tokens=6000)
+            break
+        except Exception:  # noqa: BLE001 - retry, then give up gracefully
+            if attempt < 2:
+                await asyncio.sleep(2 ** attempt + 1)  # ~2s, 3s
+            else:
+                return set()
     try:
-        text = await call(prompt, max_tokens=6000)
         data = extract_json(text)
-    except Exception:  # noqa: BLE001 - a failing provider just contributes nothing
+    except Exception:  # noqa: BLE001
         return set()
 
     edges: set[tuple[str, str]] = set()
@@ -317,6 +385,8 @@ async def build_graph(subject: str, levels: list[str], stranded: bool = True) ->
         vocab = await generate_vocabulary_stranded(subject, levels)
     else:
         vocab = await generate_vocabulary(subject, levels)
+    # Merge semantic synonyms/duplicates before wiring edges.
+    vocab = await canonicalize_vocabulary(subject, vocab)
     labels = list(vocab.keys())
     raw_edges = await generate_edges(subject, labels)
     kept_edges, dropped_edges = enforce_dag(raw_edges)

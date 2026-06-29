@@ -168,6 +168,23 @@ def test_dfs_stops_at_mastered_prerequisite():
     assert result["detection_path"] == ["derivees"]  # blocked by mastered prereq
 
 
+def test_root_selection_prefers_convergence_over_longest_chain():
+    # variable underlies BOTH failing branches; derivee's chain is longer, but
+    # variable is the convergence point and must win.
+    import networkx as nx
+
+    g = nx.DiGraph()
+    g.add_edge("variable", "fonction_affine")     # prereq -> concept
+    g.add_edge("fonction_affine", "derivee")
+    g.add_edge("variable", "equation_lineaire")
+    states = {"derivee": 0.2, "equation_lineaire": 0.2, "variable": 0.2}  # fonction_affine unknown
+    known = {"derivee", "equation_lineaire", "variable"}
+
+    result = detector.detect_root_cause(g, ["derivee", "equation_lineaire"], states, known=known)
+    assert result["root_gap"] == "variable"            # convergence wins
+    assert result["confidence"] > 0.6                  # 2/2 failing converge
+
+
 # --------------------------------------------------------------------------- #
 # Graph builder — pure validation (no LLM)
 # --------------------------------------------------------------------------- #

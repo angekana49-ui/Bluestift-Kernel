@@ -26,15 +26,19 @@ def detect_root_cause(
 ) -> dict:
     """Find the root gap among failing KCs.
 
+    The root is chosen by **convergence** first, not by chain length: a weak or
+    unverified concept that many failing KCs depend on is the strongest
+    explanation for the struggle. Ties break on evidence (a known-weak concept
+    beats a merely-unknown one), then on depth (more foundational).
+
     Args:
         graph: the Kernel Graph (prerequisite -> concept).
         failing_kcs: labels the student is currently failing.
         concept_states: label -> effective mastery in [0, 1].
         known: labels with actual student evidence. Labels absent from this set
-            are treated as *unknown* (never practised) rather than as a neutral
-            0.5 — an untouched prerequisite of a failing concept is a prime
-            suspect, so the search descends into it (within a budget). When None,
-            every label present in concept_states is considered known.
+            are treated as *unknown* (never practised), so the search descends
+            into them as suspects. When None, every label in concept_states is
+            considered known.
 
     Returns:
         dict with root_gap, detection_path (surface -> root), and confidence.
@@ -42,23 +46,74 @@ def detect_root_cause(
     if known is None:
         known = set(concept_states.keys())
 
-    root_gap = None
-    detection_path: list[str] = []
+    failing_in_graph = [kc for kc in failing_kcs if kc in graph]
+    if not failing_in_graph:
+        return {"root_gap": None, "detection_path": [], "confidence": 0.0}
 
-    for kc in failing_kcs:
-        if kc not in graph:
-            continue
-        path = _dfs_find_root(graph, kc, concept_states, known, visited=set(), budget=UNKNOWN_BUDGET)
-        # Prefer the longest chain — it digs to the deepest underlying gap.
-        if path and len(path) > len(detection_path):
-            detection_path = path
-            root_gap = path[-1]
+    # Each failing KC -> its chain down to a deepest weak/unknown concept.
+    chains: dict[str, list[str]] = {
+        kc: _dfs_find_root(graph, kc, concept_states, known, set(), UNKNOWN_BUDGET)
+        for kc in failing_in_graph
+    }
+
+    # Candidate roots: every concept appearing on any failing chain.
+    candidates: set[str] = set()
+    for chain in chains.values():
+        candidates.update(chain)
+    if not candidates:
+        return {"root_gap": None, "detection_path": [], "confidence": 0.0}
+
+    def convergence(r: str) -> int:
+        # How many failing KCs depend (transitively) on r — the core signal.
+        return sum(
+            1 for kc in failing_in_graph if kc == r or nx.has_path(graph, r, kc)
+        )
+
+    def has_evidence(r: str) -> int:
+        return 1 if (r in known and concept_states.get(r, 0.5) < FAILING_THRESHOLD) else 0
+
+    def depth(r: str) -> int:
+        return max((len(ch) for ch in chains.values() if ch and ch[-1] == r), default=1)
+
+    root_gap = max(candidates, key=lambda r: (convergence(r), has_evidence(r), depth(r)))
+
+    # detection_path: a real surface -> root prerequisite chain.
+    detection_path = _path_to_root(graph, chains, root_gap, failing_in_graph)
 
     return {
         "root_gap": root_gap,
         "detection_path": detection_path,
-        "confidence": _compute_confidence(detection_path, concept_states),
+        "confidence": _compute_confidence(
+            detection_path, concept_states, convergence(root_gap), len(failing_in_graph)
+        ),
     }
+
+
+def _path_to_root(
+    graph: nx.DiGraph,
+    chains: dict[str, list[str]],
+    root: str,
+    failing: list[str],
+) -> list[str]:
+    """Build a surface -> root chain for the chosen root.
+
+    Prefers a DFS chain that already ends at the root; otherwise reconstructs the
+    prerequisite chain from the root up to the failing KC it best explains (the
+    one giving the deepest chain), using the graph.
+    """
+    # A real chain has length > 1; the root's own length-1 self-chain doesn't count.
+    ending = [ch for ch in chains.values() if len(ch) > 1 and ch[-1] == root]
+    if ending:
+        return max(ending, key=len)
+
+    best = [root]
+    for kc in failing:
+        if kc != root and nx.has_path(graph, root, kc):
+            # shortest_path gives root..kc (prereq -> concept); reverse to surface -> root.
+            chain = list(reversed(nx.shortest_path(graph, root, kc)))
+            if len(chain) > len(best):
+                best = chain
+    return best
 
 
 def _dfs_find_root(
@@ -109,11 +164,18 @@ def _dfs_find_root(
     return [node]
 
 
-def _compute_confidence(detection_path: list[str], states: dict[str, float]) -> float:
+def _compute_confidence(
+    detection_path: list[str],
+    states: dict[str, float],
+    convergence: int = 1,
+    failing_count: int = 1,
+) -> float:
     """Confidence that the root gap is real.
 
-    Higher when (a) the chain is long (consistent prerequisite weakness) and
-    (b) the root node's mastery is clearly low. Bounded to [0, 1].
+    Blends three signals, each in [0, 1]:
+      - depth: longer prerequisite chains are stronger (saturates ~3 hops),
+      - severity: the lower the root's mastery, the more confident,
+      - convergence: the share of failing KCs that trace to this root.
     """
     if not detection_path:
         return 0.0
@@ -121,12 +183,11 @@ def _compute_confidence(detection_path: list[str], states: dict[str, float]) -> 
     root = detection_path[-1]
     root_mastery = states.get(root, 0.5)
 
-    # Depth signal: each extra hop adds evidence, saturating around 3 hops.
     depth_signal = min(1.0, len(detection_path) / 3.0)
-    # Severity signal: the lower the root mastery, the more confident.
     severity_signal = max(0.0, 1.0 - root_mastery)
+    convergence_signal = min(1.0, convergence / max(1, failing_count))
 
-    confidence = 0.5 * depth_signal + 0.5 * severity_signal
+    confidence = 0.4 * convergence_signal + 0.3 * depth_signal + 0.3 * severity_signal
     return round(min(1.0, max(0.0, confidence)), 4)
 
 
