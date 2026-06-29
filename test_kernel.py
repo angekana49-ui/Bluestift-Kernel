@@ -20,6 +20,7 @@ from core import bkt, calibration, detector, forgetting, mindset
 from core.graph import build_graph
 from services import analyze as analyze_pipeline
 from services import db as db_module
+from services import graph_builder
 from services import kc_registry
 
 
@@ -145,6 +146,35 @@ def test_recommended_path_starts_at_root():
     graph = _sample_graph()
     path = detector.recommended_path(graph, "fonctions_affines")
     assert path[0] == "fonctions_affines"
+
+
+# --------------------------------------------------------------------------- #
+# Graph builder — pure validation (no LLM)
+# --------------------------------------------------------------------------- #
+def test_enforce_dag_drops_cycle_creating_edges():
+    # a->b->c->a is a cycle; the weakest edge closing it must be dropped.
+    edges = [
+        {"prerequisite": "a", "concept": "b", "weight": 1.0, "agreed_by": 2},
+        {"prerequisite": "b", "concept": "c", "weight": 1.0, "agreed_by": 2},
+        {"prerequisite": "c", "concept": "a", "weight": 0.6, "agreed_by": 1},
+    ]
+    kept, dropped = graph_builder.enforce_dag(edges)
+    assert len(kept) == 2
+    assert len(dropped) == 1
+    assert dropped[0]["prerequisite"] == "c"  # the weakest edge was sacrificed
+
+
+def test_dedup_vocabulary_merges_near_duplicates():
+    vocab = {
+        "fonctions_affines": {"label": "fonctions_affines"},
+        "fonction_affine": {"label": "fonction_affine"},  # near-dup
+        "derivees": {"label": "derivees"},
+    }
+    kept = graph_builder._dedup_vocabulary(vocab)
+    # The two affine variants collapse to one; derivees stays.
+    assert "fonctions_affines" in kept
+    assert "derivees" in kept
+    assert len(kept) == 2
 
 
 # --------------------------------------------------------------------------- #

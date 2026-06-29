@@ -50,6 +50,46 @@ Regles de granularite :
 - Couvre la progression complete, du plus elementaire au plus avance.
 - Entre 20 et 40 KCs, sans doublon.
 - Labels en snake_case, sans accents, concis et canoniques.
+- LANGUE OBLIGATOIRE : labels ET descriptions en FRANCAIS uniquement, jamais en anglais.
+
+Reponds UNIQUEMENT en JSON valide, sans markdown :
+{{
+  "kcs": [
+    {{
+      "label": "nom_en_snake_case",
+      "type_kc": "procedural" | "declarative" | "conceptual",
+      "level": "cycle3" | "cycle4" | "college" | "lycee",
+      "description": "une phrase courte"
+    }}
+  ]
+}}
+"""
+
+STRANDS_PROMPT = """\
+Tu es un expert en ingenierie curriculaire. Pour la matiere {subject} aux niveaux
+{levels}, liste les grands STRANDS (sous-domaines) qui structurent le programme.
+Exemple pour les maths : nombres et calcul, algebre, fonctions et analyse,
+geometrie, statistiques et probabilites.
+
+LANGUE OBLIGATOIRE : noms de strands en FRANCAIS uniquement.
+
+Reponds UNIQUEMENT en JSON valide, sans markdown :
+{{ "strands": ["nom_strand_1", "nom_strand_2", "..."] }}
+"""
+
+STRAND_VOCAB_PROMPT = """\
+Tu es un expert en ingenierie curriculaire. Pour la matiere {subject} (niveaux
+{levels}), enumere la progression COMPLETE et PROFONDE des Knowledge Components du
+strand : "{strand}".
+
+Regles :
+- Du plus elementaire au plus avance, SANS sauter d'etape intermediaire (chaque
+  concept doit pouvoir s'appuyer sur un concept immediatement plus simple du strand).
+- Un KC = un concept enseignable en 1 a 3 seances.
+- 8 a 15 KCs pour ce strand, sans doublon.
+- Labels en snake_case, sans accents, concis et canoniques.
+- LANGUE OBLIGATOIRE : labels ET descriptions en FRANCAIS uniquement, JAMAIS en
+  anglais (ex: "calcul_moyenne" et non "calculate_mean").
 
 Reponds UNIQUEMENT en JSON valide, sans markdown :
 {{
@@ -90,18 +130,10 @@ def _norm(label: str) -> str:
 # --------------------------------------------------------------------------- #
 # Step 1 — vocabulary
 # --------------------------------------------------------------------------- #
-async def generate_vocabulary(subject: str, levels: list[str]) -> dict[str, dict]:
-    """Generate the canonical KC vocabulary. Returns label -> node dict."""
-    prompt = VOCAB_PROMPT.format(subject=subject, levels=", ".join(levels))
-    # Use whichever provider answers first via the fallback chain for the vocab.
-    from services.llm import llm_call
-
-    text, _model = await llm_call(prompt, max_tokens=2500)
-    data = extract_json(text)
-    raw = data.get("kcs", []) if isinstance(data, dict) else []
-
+def _parse_vocab_items(raw: list, subject: str) -> dict[str, dict]:
+    """Turn raw LLM KC items into normalized node dicts keyed by label."""
     vocab: dict[str, dict] = {}
-    for kc in raw:
+    for kc in raw or []:
         label = _norm(kc.get("label", ""))
         if not label:
             continue
@@ -118,7 +150,70 @@ async def generate_vocabulary(subject: str, levels: list[str]) -> dict[str, dict
             "tau": 0.5,
             "empirical_difficulty": 0.5,
         }
-    return _dedup_vocabulary(vocab)
+    return vocab
+
+
+async def generate_vocabulary(subject: str, levels: list[str]) -> dict[str, dict]:
+    """Generate the canonical KC vocabulary in one shot. Returns label -> node."""
+    from services.llm import llm_call
+
+    prompt = VOCAB_PROMPT.format(subject=subject, levels=", ".join(levels))
+    text, _model = await llm_call(prompt, max_tokens=4000)
+    data = extract_json(text)
+    raw = data.get("kcs", []) if isinstance(data, dict) else []
+    return _dedup_vocabulary(_parse_vocab_items(raw, subject))
+
+
+async def generate_strands(subject: str, levels: list[str]) -> list[str]:
+    """Ask the LLM for the curriculum strands (sub-domains) of a subject.
+
+    Returns [] on any failure so the caller can fall back to a single-shot
+    vocabulary. Token budget is generous: reasoning models (e.g. gpt-oss) spend
+    tokens thinking before emitting the JSON.
+    """
+    from services.llm import llm_call
+
+    prompt = STRANDS_PROMPT.format(subject=subject, levels=", ".join(levels))
+    try:
+        text, _model = await llm_call(prompt, max_tokens=3000)
+        data = extract_json(text)
+        strands = data.get("strands", []) if isinstance(data, dict) else []
+        return [s for s in strands if isinstance(s, str) and s.strip()]
+    except Exception:  # noqa: BLE001 - fall back to single-shot vocab
+        return []
+
+
+async def _vocab_for_strand(subject: str, levels: list[str], strand: str) -> dict[str, dict]:
+    from services.llm import llm_call
+
+    prompt = STRAND_VOCAB_PROMPT.format(subject=subject, levels=", ".join(levels), strand=strand)
+    try:
+        text, _model = await llm_call(prompt, max_tokens=4000)
+        data = extract_json(text)
+    except Exception:  # noqa: BLE001 - a failed strand just contributes nothing
+        return {}
+    raw = data.get("kcs", []) if isinstance(data, dict) else []
+    return _parse_vocab_items(raw, subject)
+
+
+async def generate_vocabulary_stranded(subject: str, levels: list[str]) -> dict[str, dict]:
+    """Generate vocabulary strand-by-strand for depth, then merge + dedup.
+
+    A single broad prompt trades depth for breadth (it skips intermediate steps
+    in each sub-domain). Generating per strand forces a complete progression in
+    every strand; the union is then deduplicated into one canonical vocabulary.
+    """
+    strands = await generate_strands(subject, levels)
+    if not strands:
+        return await generate_vocabulary(subject, levels)
+
+    per_strand = await asyncio.gather(
+        *[_vocab_for_strand(subject, levels, s) for s in strands]
+    )
+    merged: dict[str, dict] = {}
+    for vocab in per_strand:
+        merged.update(vocab)
+    return _dedup_vocabulary(merged)
 
 
 def _dedup_vocabulary(vocab: dict[str, dict]) -> dict[str, dict]:
@@ -142,7 +237,7 @@ async def _prereqs_from_provider(call, subject: str, labels: list[str]) -> set[t
     prompt = PREREQ_PROMPT.format(subject=subject, labels=", ".join(labels))
     label_set = set(labels)
     try:
-        text = await call(prompt, max_tokens=3000)
+        text = await call(prompt, max_tokens=6000)
         data = extract_json(text)
     except Exception:  # noqa: BLE001 - a failing provider just contributes nothing
         return set()
@@ -212,9 +307,16 @@ def enforce_dag(edges: list[dict]) -> tuple[list[dict], list[dict]]:
 # --------------------------------------------------------------------------- #
 # Orchestration
 # --------------------------------------------------------------------------- #
-async def build_graph(subject: str, levels: list[str]) -> dict:
-    """Run the full offline build and return a structured result (no DB writes)."""
-    vocab = await generate_vocabulary(subject, levels)
+async def build_graph(subject: str, levels: list[str], stranded: bool = True) -> dict:
+    """Run the full offline build and return a structured result (no DB writes).
+
+    `stranded` generates vocabulary per sub-domain for depth (recommended);
+    set False for a single broad vocabulary call.
+    """
+    if stranded:
+        vocab = await generate_vocabulary_stranded(subject, levels)
+    else:
+        vocab = await generate_vocabulary(subject, levels)
     labels = list(vocab.keys())
     raw_edges = await generate_edges(subject, labels)
     kept_edges, dropped_edges = enforce_dag(raw_edges)
