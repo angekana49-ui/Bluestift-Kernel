@@ -12,3 +12,6 @@ env/
 .idea/
 .vscode/
 .env.example
+
+# Local corporate-proxy CA bundle (machine-specific, not for the repo)
+.ca-bundle.pem
