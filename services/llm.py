@@ -14,8 +14,19 @@ import json
 import os
 import re
 
-GROQ_MODEL = "llama-3.3-70b-versatile"
-GEMINI_MODEL = "gemini-1.5-flash"
+# Use the OS trust store for TLS as early as possible. On managed Windows
+# machines TLS is often intercepted by a corporate proxy whose root CA lives in
+# the Windows store, not in certifi. truststore patches the stdlib ssl module
+# globally, which httpx (Groq) and Gemini's REST transport both rely on.
+try:
+    import truststore as _truststore
+
+    _truststore.inject_into_ssl()
+except Exception:  # noqa: BLE001 - best effort; fall back to default CAs
+    pass
+
+GROQ_MODEL = "openai/gpt-oss-120b"
+GEMINI_MODEL = "gemini-3.1-flash-lite"
 
 _groq_client = None
 _gemini_configured = False
@@ -43,7 +54,10 @@ def _ensure_gemini():
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
             raise RuntimeError("GEMINI_API_KEY is not set")
-        genai.configure(api_key=api_key)
+        # REST transport (not grpc) so TLS goes through the stdlib ssl module,
+        # which truststore patches — grpc uses its own CA store and would fail
+        # behind a corporate TLS proxy.
+        genai.configure(api_key=api_key, transport="rest")
         _gemini_configured = True
 
 
@@ -89,6 +103,38 @@ async def llm_call(prompt: str, max_tokens: int = 1000) -> tuple[str, str]:
         last_error = e
 
     raise RuntimeError(f"All LLMs failed: {last_error}")
+
+
+# --------------------------------------------------------------------------- #
+# Provider-targeted calls (no fallback) — used for cross-model corroboration.
+# --------------------------------------------------------------------------- #
+async def call_groq(prompt: str, max_tokens: int = 2000, temperature: float = 0.2) -> str:
+    """Call Groq directly. Raises on failure (no fallback)."""
+    client = _get_groq()
+    response = await client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=max_tokens,
+        temperature=temperature,
+    )
+    return response.choices[0].message.content
+
+
+async def call_gemini(prompt: str, max_tokens: int = 2000, temperature: float = 0.2) -> str:
+    """Call Gemini directly. Raises on failure (no fallback)."""
+    import google.generativeai as genai
+
+    _ensure_gemini()
+    model = genai.GenerativeModel(GEMINI_MODEL)
+    response = await asyncio.to_thread(model.generate_content, prompt)
+    return response.text
+
+
+# Registry so the graph builder can iterate over available providers by name.
+PROVIDERS = {
+    GROQ_MODEL: call_groq,
+    GEMINI_MODEL: call_gemini,
+}
 
 
 def extract_json(text: str) -> dict | list:
