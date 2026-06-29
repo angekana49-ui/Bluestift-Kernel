@@ -229,9 +229,10 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
     all_states: dict[str, float] = {n["label"]: 0.5 for n in nodes}
     all_states.update(effective_states)
 
-    # 7. DFS root-cause from failing KCs.
+    # 7. DFS root-cause from failing KCs. `known` = labels with real evidence, so
+    #    the DFS can descend into untouched (suspected) prerequisites.
     failing = [lbl for lbl, eff in effective_states.items() if eff < detector.FAILING_THRESHOLD]
-    detection = detector.detect_root_cause(graph, failing, all_states)
+    detection = detector.detect_root_cause(graph, failing, all_states, known=set(effective_states))
     root_gap = detection["root_gap"]
     detection_path = detection["detection_path"]
     confidence = detection["confidence"]

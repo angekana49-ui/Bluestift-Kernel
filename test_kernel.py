@@ -148,6 +148,26 @@ def test_recommended_path_starts_at_root():
     assert path[0] == "fonctions_affines"
 
 
+def test_dfs_descends_through_unknown_prerequisites():
+    # derivees is failing; the intermediate node was never practised (unknown)
+    # and the deep root is also failing. The search must bridge the unknown.
+    graph = _sample_graph()  # fonctions_affines -> fonctions_polynomiales -> derivees
+    states = {"derivees": 0.2, "fonctions_affines": 0.25}  # polynomiales unknown
+    known = {"derivees", "fonctions_affines"}
+    result = detector.detect_root_cause(graph, ["derivees"], states, known=known)
+    assert result["root_gap"] == "fonctions_affines"
+    assert result["detection_path"] == ["derivees", "fonctions_polynomiales", "fonctions_affines"]
+
+
+def test_dfs_stops_at_mastered_prerequisite():
+    # A known-mastered prerequisite is a barrier: the search must not pass it.
+    graph = _sample_graph()
+    states = {"derivees": 0.2, "fonctions_polynomiales": 0.9, "fonctions_affines": 0.1}
+    known = {"derivees", "fonctions_polynomiales", "fonctions_affines"}
+    result = detector.detect_root_cause(graph, ["derivees"], states, known=known)
+    assert result["detection_path"] == ["derivees"]  # blocked by mastered prereq
+
+
 # --------------------------------------------------------------------------- #
 # Graph builder — pure validation (no LLM)
 # --------------------------------------------------------------------------- #

@@ -12,10 +12,17 @@ import networkx as nx
 FAILING_THRESHOLD = 0.5
 
 
+# How many consecutive *unknown* (never-practised) prerequisites the search may
+# bridge before stopping. Lets it cross small evidence gaps to reach a deeper
+# weak concept, without bottoming out at the most elementary leaf every time.
+UNKNOWN_BUDGET = 2
+
+
 def detect_root_cause(
     graph: nx.DiGraph,
     failing_kcs: list[str],
     concept_states: dict[str, float],
+    known: set[str] | None = None,
 ) -> dict:
     """Find the root gap among failing KCs.
 
@@ -23,17 +30,25 @@ def detect_root_cause(
         graph: the Kernel Graph (prerequisite -> concept).
         failing_kcs: labels the student is currently failing.
         concept_states: label -> effective mastery in [0, 1].
+        known: labels with actual student evidence. Labels absent from this set
+            are treated as *unknown* (never practised) rather than as a neutral
+            0.5 — an untouched prerequisite of a failing concept is a prime
+            suspect, so the search descends into it (within a budget). When None,
+            every label present in concept_states is considered known.
 
     Returns:
         dict with root_gap, detection_path (surface -> root), and confidence.
     """
+    if known is None:
+        known = set(concept_states.keys())
+
     root_gap = None
     detection_path: list[str] = []
 
     for kc in failing_kcs:
         if kc not in graph:
             continue
-        path = _dfs_find_root(graph, kc, concept_states, visited=set())
+        path = _dfs_find_root(graph, kc, concept_states, known, visited=set(), budget=UNKNOWN_BUDGET)
         # Prefer the longest chain — it digs to the deepest underlying gap.
         if path and len(path) > len(detection_path):
             detection_path = path
@@ -50,9 +65,18 @@ def _dfs_find_root(
     graph: nx.DiGraph,
     node: str,
     states: dict[str, float],
+    known: set[str],
     visited: set,
+    budget: int,
 ) -> list[str]:
-    """Walk prerequisites; return the chain to the deepest failing prerequisite."""
+    """Walk prerequisites to the deepest weak-or-unverified concept.
+
+    A prerequisite is descended into when it is either known-weak (mastery below
+    the failing threshold) or unknown (no evidence). Known-mastered prerequisites
+    act as a barrier — the gap is above them. The `budget` caps how many unknown
+    prerequisites in a row may be crossed; it refills whenever the search lands on
+    a known-weak concept (fresh evidence).
+    """
     if node in visited:
         return []
     visited.add(node)
@@ -61,13 +85,24 @@ def _dfs_find_root(
     if not prerequisites:
         return [node]
 
-    # Descend into the weakest failing prerequisite chain.
     best_chain: list[str] = []
     for prereq in prerequisites:
-        if states.get(prereq, 0.5) < FAILING_THRESHOLD:
-            deeper = _dfs_find_root(graph, prereq, states, visited)
-            if len(deeper) > len(best_chain):
-                best_chain = deeper
+        is_known = prereq in known
+        mastery = states.get(prereq, 0.5)
+
+        if is_known and mastery >= FAILING_THRESHOLD:
+            continue  # mastered prerequisite -> barrier, don't descend
+        if is_known:
+            # Known-weak: strong evidence, descend and refill the unknown budget.
+            deeper = _dfs_find_root(graph, prereq, states, known, visited, UNKNOWN_BUDGET)
+        else:
+            # Unknown: a suspected gap, descend only while budget remains.
+            if budget <= 0:
+                continue
+            deeper = _dfs_find_root(graph, prereq, states, known, visited, budget - 1)
+
+        if len(deeper) > len(best_chain):
+            best_chain = deeper
 
     if best_chain:
         return [node] + best_chain
