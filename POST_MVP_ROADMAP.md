@@ -24,7 +24,16 @@ Shipped and verified live:
 - **Pedagogical-safety anomaly detection** → `kernel_monitoring` + `/analyze` alerts.
 - 8 migrations, 30 tests, deployed on Railway.
 
-What follows is deliberately **not** in v1.
+### Shipped beyond the original v1 spec
+
+- **Multi-subject** — the same builder produces a coherent graph for any subject
+  (MATH + PHYSICS graphs live); extraction is grounded on the all-subject vocabulary.
+- **Cross-subject bridges (basic)** — `scripts/build_bridges.py` generates
+  prerequisite edges *between* subjects (foundational → applied); the detector
+  traverses them with no change. Verified: a physics conversation traces its root
+  gap into maths. Refinement still needed — see §4.
+
+What follows is deliberately **not** in v1 (or only basic).
 
 ---
 
@@ -100,6 +109,11 @@ Two detectors were deferred because they need population baselines or history:
   third provider).
 - **Per-population parameters** (flywheel level 3) — BKT priors and lambda that
   vary by school level × mindset × interaction language.
+- **Cross-subject refinement** — a basic version ships (see "Shipped beyond v1").
+  Next: fold bridge generation into the main build, validate bridges with teachers,
+  tune root-stop depth so a cross-subject chain stops at the meaningful root
+  (e.g. `derivation_fonction`) instead of the most elementary leaf, and avoid weak
+  generic links (e.g. "multiplication" pulled in everywhere).
 
 ---
 

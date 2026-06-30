@@ -23,7 +23,8 @@ Given a student↔RAYA conversation, the Kernel:
 3. **Decays** stored mastery over time (exponential forgetting).
 4. **Updates** the cognitive vector with Bayesian Knowledge Tracing on strong signals.
 5. **Walks** the prerequisite graph (DFS) to find the *deepest* underlying gap,
-   chosen by **convergence** (the concept many failing KCs trace back to).
+   chosen by **convergence** (the concept many failing KCs trace back to) —
+   **across subjects**: a physics struggle can trace to a maths root.
 6. **Detects anomalies** (false mastery, passive dependency, cognitive overload,
    fixed mindset, re-emergence errors) for pedagogical safety.
 7. **Explains** the gap in one learner-friendly sentence.
@@ -70,6 +71,7 @@ Each KC, per student, carries a four-dimensional state (Luckin / corpus §1.2):
 ├── seed/math_kcs.py         # Starter Math KCs (examples, not exhaustive)
 ├── scripts/
 │   ├── build_graph.py       # CLI: distill a KC graph from the LLMs
+│   ├── build_bridges.py     # CLI: generate cross-subject prerequisite bridges
 │   └── apply_migrations.py  # CLI: apply migrations via the Management API
 ├── migrations/              # 8 numbered Supabase SQL migrations
 ├── conftest.py              # In-memory fake Supabase for tests
@@ -188,6 +190,21 @@ python scripts/build_graph.py MATH cycle3 cycle4 lycee
 
 The LLM supplies the **structure** (nodes + edges); real student data later
 calibrates the **parameters** (difficulty, decay) — the flywheel.
+
+### Cross-subject bridges
+
+The graph spans subjects in one table, and the detector traverses any edge — so
+once **bridge** edges exist, a physics struggle can trace to a maths root. Generate
+them closed-world over two subjects' vocabularies (foundational → applied),
+cross-model corroborated and DAG-validated:
+
+```bash
+python scripts/build_bridges.py PHYSICS MATH --dry-run   # inspect
+python scripts/build_bridges.py PHYSICS MATH             # persist
+```
+
+Example: `acceleration_moyenne` (physics) → `derivation_fonction` (maths) — no
+detector change needed; the convergence search crosses the bridge automatically.
 
 ---
 
