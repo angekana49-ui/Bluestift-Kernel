@@ -91,7 +91,7 @@ def _format_vocabulary(labels: list[str]) -> str:
     """
     if not labels:
         return "(aucun concept connu pour l'instant)"
-    capped = labels[:120]
+    capped = labels[:400]
     return ", ".join(sorted(set(capped)))
 
 
@@ -163,9 +163,10 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
     level = payload.get("level", "unknown")
     conversation = payload["conversation_history"]
 
-    # 1. LLM extraction of mentioned KCs + attempt evaluations. The existing
-    #    KC vocabulary for the subject is fed to the prompt to curb label drift.
-    known_labels = db.load_labels_for_subject(client, subject)
+    # 1. LLM extraction of mentioned KCs + attempt evaluations. The existing KC
+    #    vocabulary (across ALL subjects) is fed to the prompt to curb label drift,
+    #    including cross-subject references (e.g. a physics chat mentioning maths).
+    known_labels = db.load_all_labels(client)
     extraction, llm_used = await extract_kcs(conversation, subject, level, known_labels)
     langue = extraction.get("langue_interaction", "fr")
 

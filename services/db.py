@@ -78,6 +78,13 @@ def load_labels_for_subject(client, subject: str) -> list[str]:
     return [r["label"] for r in (res.data or []) if r.get("label")]
 
 
+def load_all_labels(client) -> list[str]:
+    """Return KC labels across all subjects — grounds cross-subject extraction so a
+    physics conversation referencing math reuses the canonical math labels."""
+    res = _kernel(client, "concept_nodes").select("label").execute()
+    return [r["label"] for r in (res.data or []) if r.get("label")]
+
+
 # --------------------------------------------------------------------------- #
 # Student concept state
 # --------------------------------------------------------------------------- #

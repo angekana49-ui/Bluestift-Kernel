@@ -357,9 +357,13 @@ async def generate_edges(subject: str, labels: list[str]) -> list[dict]:
 # --------------------------------------------------------------------------- #
 # Step 4 — DAG validation (drop cycle-creating edges, weakest first)
 # --------------------------------------------------------------------------- #
-def enforce_dag(edges: list[dict]) -> tuple[list[dict], list[dict]]:
-    """Keep the largest acyclic subset of edges. Returns (kept, dropped)."""
-    graph = nx.DiGraph()
+def enforce_dag(edges: list[dict], base: nx.DiGraph | None = None) -> tuple[list[dict], list[dict]]:
+    """Keep the largest acyclic subset of edges. Returns (kept, dropped).
+
+    `base` seeds the check with an existing graph (used for cross-subject bridges,
+    which must stay acyclic against the whole graph, not just among themselves).
+    """
+    graph = base.copy() if base is not None else nx.DiGraph()
     kept, dropped = [], []
     # Add stronger, multi-provider edges first so they win ties over cycles.
     for edge in sorted(edges, key=lambda e: (-e["weight"], -e["agreed_by"])):
@@ -370,6 +374,96 @@ def enforce_dag(edges: list[dict]) -> tuple[list[dict], list[dict]]:
             graph.remove_edge(edge["prerequisite"], edge["concept"])
             dropped.append(edge)
     return kept, dropped
+
+
+# --------------------------------------------------------------------------- #
+# Cross-subject bridges (e.g. PHYSICS concept depends on a MATH prerequisite)
+# --------------------------------------------------------------------------- #
+CROSS_SUBJECT_PROMPT = """\
+Concepts de la matiere APPLIQUEE "{applied}" :
+{applied_labels}
+
+Concepts de la matiere FONDAMENTALE "{foundational}" :
+{foundational_labels}
+
+Pour chaque concept de "{applied}", indique quels concepts de "{foundational}" en
+sont des PREREQUIS DIRECTS (un savoir fondamental qu'il faut maitriser AVANT de
+comprendre le concept applique). Exemple : l'acceleration en physique a besoin de
+la derivation en maths.
+
+Regles STRICTES :
+- Choisis EXCLUSIVEMENT dans la liste "{foundational}".
+- Sois TRES parcimonieux : seulement les liens evidents et forts. La plupart des
+  concepts n'ont AUCUN prerequis cross-matiere.
+- Maximum 2 prerequis fondamentaux par concept applique.
+
+Reponds UNIQUEMENT en JSON valide, sans markdown :
+{{ "bridges": [ {{ "applied": "label_applique", "prerequisites": ["label_fondamental"] }} ] }}
+"""
+
+
+async def _bridges_from_provider(call, applied, foundational, applied_labels, foundational_labels):
+    """Cross-subject (foundational -> applied) edges from one provider, with retry."""
+    prompt = CROSS_SUBJECT_PROMPT.format(
+        applied=applied,
+        foundational=foundational,
+        applied_labels=", ".join(applied_labels),
+        foundational_labels=", ".join(foundational_labels),
+    )
+    applied_set, found_set = set(applied_labels), set(foundational_labels)
+    text = None
+    for attempt in range(3):
+        try:
+            text = await call(prompt, max_tokens=6000)
+            break
+        except Exception:  # noqa: BLE001
+            if attempt < 2:
+                await asyncio.sleep(2 ** attempt + 1)
+            else:
+                return set()
+    try:
+        data = extract_json(text)
+    except Exception:  # noqa: BLE001
+        return set()
+
+    edges: set[tuple[str, str]] = set()
+    for item in (data.get("bridges", []) if isinstance(data, dict) else []):
+        ap = _norm(item.get("applied", ""))
+        if ap not in applied_set:
+            continue
+        for pre in item.get("prerequisites", []) or []:
+            pre = _norm(pre)
+            if pre in found_set:
+                edges.add((pre, ap))  # foundational prerequisite -> applied concept
+    return edges
+
+
+async def generate_cross_subject_edges(applied, foundational, applied_labels, foundational_labels):
+    """Corroborated cross-subject prerequisite edges (foundational -> applied)."""
+    results = await asyncio.gather(
+        *[
+            _bridges_from_provider(call, applied, foundational, applied_labels, foundational_labels)
+            for call in PROVIDERS.values()
+        ],
+        return_exceptions=True,
+    )
+    provider_edges = [r for r in results if isinstance(r, set)]
+    tally: dict[tuple[str, str], int] = {}
+    for edges in provider_edges:
+        for e in edges:
+            tally[e] = tally.get(e, 0) + 1
+
+    out = []
+    for (prereq, concept), votes in tally.items():
+        out.append(
+            {
+                "prerequisite": prereq,
+                "concept": concept,
+                "weight": WEIGHT_BOTH if votes >= 2 else WEIGHT_SINGLE,
+                "agreed_by": votes,
+            }
+        )
+    return out
 
 
 # --------------------------------------------------------------------------- #
