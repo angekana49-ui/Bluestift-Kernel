@@ -9,7 +9,7 @@ from __future__ import annotations
 from collections import Counter
 from datetime import datetime, timezone
 
-from core import bkt, calibration, detector, forgetting, mindset
+from core import anomaly, bkt, calibration, detector, forgetting, mindset
 from core.graph import build_graph, node_id
 from services import db
 from services.kc_registry import get_or_create_kc
@@ -197,9 +197,12 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
 
     mastery_map: dict[str, dict] = {}
     effective_states: dict[str, float] = {}  # label -> k_effective (for DFS)
+    kc_records: list[dict] = []              # per-KC snapshot for anomaly detection
+    label_to_concept: dict[str, str] = {}
 
     for label, kc in resolved.items():
         concept_id = kc["id"]
+        label_to_concept[label] = concept_id
         state = states_by_concept.get(concept_id)
         k_raw = state["mastery_score_raw"] if state else bkt.get_bkt_params(kc)["p_init"]
         last_at = state.get("last_strong_signal_at") if state else None
@@ -210,6 +213,7 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
         )
 
         attempt = attempts_by_label.get(label)
+        committed_slip = None
         # Selective-update gate: commit a BKT update only on a strong signal —
         # the first contact (bootstrap), 3+ attempts this session, a large
         # partial-credit shift, or an anomaly. Avoids overreacting to noise.
@@ -227,11 +231,14 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
             )
             # Decay is relative to "now" after a fresh signal -> k_eff == k_raw.
             k_eff = k_raw
-            _persist_state(client, user_id, concept_id, kc, k_before, k_raw, pc, attempt, state, lam, m_score)
+            committed_slip = _persist_state(
+                client, user_id, concept_id, kc, k_before, k_raw, pc, attempt, state, lam, m_score
+            )
 
-        p_slip = (state.get("p_slip_personal") if state else None) or bkt.get_bkt_params(kc)["p_slip"]
+        p_slip = committed_slip or (state.get("p_slip_personal") if state else None) or bkt.get_bkt_params(kc)["p_slip"]
         pc_avg = (state.get("partial_credit_avg") if state else None) or 0.5
         status = bkt.classify_status(k_eff, p_slip, pc_avg)
+        kc_records.append({"label": label, "k_effective": k_eff, "p_slip": p_slip})
 
         mastery_map[label] = {
             "k_raw": round(k_raw, 4),
@@ -249,6 +256,18 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
     # can reason about prerequisites the student hasn't explicitly touched.
     all_states: dict[str, float] = {n["label"]: 0.5 for n in nodes}
     all_states.update(effective_states)
+
+    # 6b. Pedagogical-safety anomaly detection -> persist alerts to monitoring.
+    for rec in kc_records:
+        rec["prereq_masteries"] = (
+            [all_states.get(p, 0.5) for p in graph.predecessors(rec["label"])]
+            if rec["label"] in graph else []
+        )
+    alerts = anomaly.detect_anomalies(
+        kc_records, extraction.get("attempts", []), extraction.get("blocage_type"), m_score
+    )
+    for alert in alerts:
+        db.log_alert(client, user_id, alert, label_to_concept.get(alert.get("concept")))
 
     # 7. DFS root-cause from failing KCs. `known` = labels with real evidence, so
     #    the DFS can descend into untouched (suspected) prerequisites.
@@ -275,6 +294,7 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
         "confidence": confidence,
         "summary": summary,
         "recommended_path": rec_path,
+        "alerts": [{"type": a["alert_type"], "severity": a["alert_severity"]} for a in alerts],
         "llm_used": llm_used if llm_used != "none" else summary_llm,
     }
 
@@ -371,6 +391,7 @@ def _persist_state(client, user_id, concept_id, kc, k_before, k_after, pc, attem
 
     db.upsert_student_concept_state(client, row)
     db.log_trajectory(client, user_id, concept_id, k_after, k_after)
+    return p_slip_personal
 
 
 def _estimate_personal_lambda(prev_state: dict | None, observed_now: float, current_lambda: float):

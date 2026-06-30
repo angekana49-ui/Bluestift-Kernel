@@ -219,6 +219,26 @@ def log_individual_insight(client, user_id: str, request_id: str, summary: str, 
     ).execute()
 
 
+def log_alert(client, user_id: str, alert: dict, concept_id: str | None = None) -> None:
+    """Persist a pedagogical-safety alert to kernel_monitoring (best-effort)."""
+    try:
+        _kernel(client, "kernel_monitoring").insert(
+            {
+                "level": "alert",
+                "event": alert["alert_type"],
+                "user_id": user_id,
+                "concept_id": concept_id,
+                "alert_type": alert["alert_type"],
+                "alert_severity": alert["alert_severity"],
+                "alert_details": alert.get("alert_details", {}),
+                "resolved": False,
+                "created_at": _now_iso(),
+            }
+        ).execute()
+    except Exception:  # noqa: BLE001 - monitoring must never break a flow
+        pass
+
+
 def log_monitoring(client, level: str, event: str, detail: dict | None = None) -> None:
     """Best-effort monitoring write; swallow errors so it never breaks a flow."""
     try:

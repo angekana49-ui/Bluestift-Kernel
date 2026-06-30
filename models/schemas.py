@@ -72,6 +72,7 @@ class AnalyzeResponse(BaseModel):
     confidence: float = 0.0
     summary: str = ""
     recommended_path: list[str] = Field(default_factory=list)
+    alerts: list[dict] = Field(default_factory=list)
     kernel_version: str
     llm_used: str
 

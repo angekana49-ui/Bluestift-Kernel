@@ -16,7 +16,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import main
-from core import bkt, calibration, detector, forgetting, mindset
+from core import anomaly, bkt, calibration, detector, forgetting, mindset
 from core.graph import build_graph
 from services import analyze as analyze_pipeline
 from services import db as db_module
@@ -235,6 +235,40 @@ def test_velocity_is_learning_rate():
     slow = analyze_pipeline._velocity(None, 0.2, 0.25)  # barely moved
     assert fast > slow
     assert 0.05 <= analyze_pipeline._velocity(None, 0.0, 1.0) <= 0.95
+
+
+def test_anomaly_false_mastery():
+    # High mastery + high slip -> false mastery.
+    assert anomaly.detect_false_mastery("frac", 0.96, 0.25) is not None
+    assert anomaly.detect_false_mastery("frac", 0.96, 0.05) is None  # solid
+    assert anomaly.detect_false_mastery("frac", 0.5, 0.25) is None   # not mastered
+
+
+def test_anomaly_passive_dependency():
+    assisted = [
+        {"is_assisted": True, "outcome": "success", "response_time_estimate": "fast"},
+        {"is_assisted": True, "outcome": "success", "response_time_estimate": "fast"},
+    ]
+    assert anomaly.detect_passive_dependency(assisted) is not None
+    autonomous = [
+        {"is_assisted": False, "outcome": "failure", "response_time_estimate": "slow"},
+        {"is_assisted": False, "outcome": "partial", "response_time_estimate": "normal"},
+    ]
+    assert anomaly.detect_passive_dependency(autonomous) is None
+
+
+def test_anomaly_re_emergence_and_orchestrator():
+    # Fails the KC while every prerequisite looks mastered -> re-emergence.
+    assert anomaly.detect_re_emergence("derivee", 0.2, [0.9, 0.85]) is not None
+    assert anomaly.detect_re_emergence("derivee", 0.2, [0.3]) is None  # weak prereq
+    alerts = anomaly.detect_anomalies(
+        kc_records=[{"label": "x", "k_effective": 0.96, "p_slip": 0.3, "prereq_masteries": []}],
+        attempts=[],
+        blocage_type="none",
+        m_score=0.2,  # fixed mindset
+    )
+    types = {a["alert_type"] for a in alerts}
+    assert "false_mastery" in types and "fixed_mindset" in types
 
 
 def test_slip_and_persistence():
