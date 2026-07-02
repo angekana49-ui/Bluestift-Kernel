@@ -12,12 +12,13 @@ Routes:
 """
 from __future__ import annotations
 
+import hmac
 import os
 import uuid
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 load_dotenv()
@@ -61,7 +62,29 @@ app.add_middleware(
 
 
 # --------------------------------------------------------------------------- #
-# /health
+# Optional shared-secret auth
+# --------------------------------------------------------------------------- #
+# If KERNEL_API_SECRET is set, protected routes require the caller to present it.
+# The secret is accepted via any common convention so it works with whatever the
+# client sends: `Authorization: Bearer <s>`, `X-Kernel-Secret: <s>`, `X-API-Key: <s>`.
+# When the env var is unset, auth is disabled (open) — backward compatible.
+async def require_auth(
+    authorization: str | None = Header(default=None),
+    x_kernel_secret: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None),
+) -> None:
+    secret = os.getenv("KERNEL_API_SECRET")
+    if not secret:
+        return  # auth disabled
+    provided = x_kernel_secret or x_api_key
+    if not provided and authorization:
+        provided = authorization[7:] if authorization.lower().startswith("bearer ") else authorization
+    if not provided or not hmac.compare_digest(provided, secret):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+# --------------------------------------------------------------------------- #
+# /health  (always open — Railway health check + app connectivity probe)
 # --------------------------------------------------------------------------- #
 @app.get("/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
@@ -71,7 +94,7 @@ async def health() -> HealthResponse:
 # --------------------------------------------------------------------------- #
 # /analyze — main route
 # --------------------------------------------------------------------------- #
-@app.post("/analyze", response_model=AnalyzeResponse)
+@app.post("/analyze", response_model=AnalyzeResponse, dependencies=[Depends(require_auth)])
 async def analyze(req: AnalyzeRequest) -> AnalyzeResponse:
     request_id = str(uuid.uuid4())
     payload = req.model_dump(mode="json")
@@ -95,7 +118,7 @@ async def analyze(req: AnalyzeRequest) -> AnalyzeResponse:
 # --------------------------------------------------------------------------- #
 # /load_profile
 # --------------------------------------------------------------------------- #
-@app.post("/load_profile", response_model=LoadProfileResponse)
+@app.post("/load_profile", response_model=LoadProfileResponse, dependencies=[Depends(require_auth)])
 async def load_profile(req: LoadProfileRequest) -> LoadProfileResponse:
     client = db.get_client()
 
@@ -152,7 +175,11 @@ async def load_profile(req: LoadProfileRequest) -> LoadProfileResponse:
 # --------------------------------------------------------------------------- #
 # /update_concept_state — called by RAYA on a strong signal
 # --------------------------------------------------------------------------- #
-@app.post("/update_concept_state", response_model=UpdateConceptStateResponse)
+@app.post(
+    "/update_concept_state",
+    response_model=UpdateConceptStateResponse,
+    dependencies=[Depends(require_auth)],
+)
 async def update_concept_state(
     req: UpdateConceptStateRequest, background: BackgroundTasks
 ) -> UpdateConceptStateResponse:
@@ -246,7 +273,7 @@ def _recalibrate_kc(concept_id: str) -> None:
 # --------------------------------------------------------------------------- #
 # /seed_kcs
 # --------------------------------------------------------------------------- #
-@app.post("/seed_kcs", response_model=SeedResponse)
+@app.post("/seed_kcs", response_model=SeedResponse, dependencies=[Depends(require_auth)])
 async def seed_kcs() -> SeedResponse:
     from seed.math_kcs import seed_math_kcs
 

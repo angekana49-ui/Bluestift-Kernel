@@ -331,6 +331,25 @@ def test_health(client):
     assert body["kernel"] == "bluestift-cognitive-kernel"
 
 
+def test_auth_enforced_when_secret_set(client, fake_supabase, monkeypatch):
+    monkeypatch.setenv("KERNEL_API_SECRET", "s3cr3t")
+    monkeypatch.setattr(db_module, "get_client", lambda: fake_supabase)  # hermetic
+    # /health stays open.
+    assert client.get("/health").status_code == 200
+    # Protected route without the secret -> 401.
+    assert client.post("/load_profile", json={"user_id": "u1"}).status_code == 401
+    # Wrong secret -> 401.
+    r = client.post("/load_profile", json={"user_id": "u1"}, headers={"X-Kernel-Secret": "nope"})
+    assert r.status_code == 401
+    # Correct secret via each accepted convention -> passes the gate (200).
+    for headers in (
+        {"X-Kernel-Secret": "s3cr3t"},
+        {"X-API-Key": "s3cr3t"},
+        {"Authorization": "Bearer s3cr3t"},
+    ):
+        assert client.post("/load_profile", json={"user_id": "u1"}, headers=headers).status_code == 200
+
+
 @pytest.mark.asyncio
 async def test_analyze_pipeline_end_to_end(fake_supabase, monkeypatch):
     # Seed a minimal graph the DFS can walk.
