@@ -85,13 +85,18 @@ Each KC, per student, carries a four-dimensional state (Luckin / corpus §1.2):
 
 ## API
 
-| Method | Route                    | Purpose                                            |
-|--------|--------------------------|----------------------------------------------------|
-| GET    | `/health`                | Liveness + version.                                |
-| POST   | `/analyze`               | **Main route.** Conversation → root-gap + alerts.  |
-| POST   | `/load_profile`          | Full cognitive profile with K_effective recomputed. |
-| POST   | `/update_concept_state`  | Manual KC update on a strong signal (called by RAYA). |
-| POST   | `/seed_kcs`              | Seed starter Math KCs if the table is empty.       |
+| Method | Route                    | Auth | Purpose                                            |
+|--------|--------------------------|------|----------------------------------------------------|
+| GET    | `/health`                | open | Liveness + version.                                |
+| GET    | `/ready`                 | open | Deep health — kernel-schema read+write (503 if degraded). |
+| POST   | `/analyze`               | 🔒   | **Main route.** Conversation → root-gap + alerts.  |
+| POST   | `/load_profile`          | 🔒   | Full cognitive profile with K_effective recomputed. |
+| POST   | `/update_concept_state`  | 🔒   | Manual KC update on a strong signal (called by RAYA). |
+| POST   | `/seed_kcs`              | 🔒   | Seed starter Math KCs if the table is empty.       |
+
+🔒 = requires `KERNEL_API_SECRET` when set (via `Authorization: Bearer`,
+`X-Kernel-Secret`, or `X-API-Key`). Unset = open (dev). See [KERNEL_HANDOFF.md](KERNEL_HANDOFF.md)
+for the app-integration contract.
 
 Interactive docs at `/docs`.
 
