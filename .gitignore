@@ -15,3 +15,6 @@ env/
 
 # Local corporate-proxy CA bundle (machine-specific, not for the repo)
 .ca-bundle.pem
+
+# Generated graph visualization (regenerate with scripts/visualize_graph.py)
+graph_viz.html
