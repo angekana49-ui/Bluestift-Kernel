@@ -73,9 +73,9 @@ Each KC, per student, carries a four-dimensional state (Luckin / corpus §1.2):
 │   ├── build_graph.py       # CLI: distill a KC graph from the LLMs
 │   ├── build_bridges.py     # CLI: generate cross-subject prerequisite bridges
 │   └── apply_migrations.py  # CLI: apply migrations via the Management API
-├── migrations/              # 8 numbered Supabase SQL migrations
+├── migrations/              # 9 numbered Supabase SQL migrations
 ├── conftest.py              # In-memory fake Supabase for tests
-├── test_kernel.py           # 30 tests
+├── test_kernel.py           # 31 tests
 ├── requirements.txt
 ├── Procfile / railway.toml / render.yaml
 └── .env.example
@@ -161,7 +161,12 @@ Management API with `scripts/apply_migrations.py`):
 006_grant_service_role.sql   # grant service_role on custom schemas
 007_rls_policies.sql         # full RLS policy set
 008_kernel_monitoring_alerts.sql  # pedagogical-safety alert schema
+009_shared_db_hardening.sql       # re-assert exposed schemas + grants (shared DB)
 ```
+
+> **Shared DB:** the Kernel shares its Supabase project with the RAYA app. If the
+> app's setup ever drops `kernel` from the exposed schemas or resets grants,
+> re-run `009_shared_db_hardening.sql` (it re-asserts the union + grants + reload).
 
 > PostgREST must **expose** the `kernel`, `schools`, `rag` schemas
 > (Dashboard → Project Settings → API → Exposed schemas).
@@ -214,7 +219,7 @@ detector change needed; the convergence search crosses the bridge automatically.
 pytest -q
 ```
 
-30 tests. The suite mocks the LLM and uses an in-memory fake Supabase
+31 tests. The suite mocks the LLM and uses an in-memory fake Supabase
 (`conftest.py`), so **no network or real keys are required**. Coverage: BKT,
 forgetting, mindset, detector (convergence), calibration, the cognitive vector
 (V/P/slip), anomaly detectors, graph-builder validation, `get_or_create_kc`, and
