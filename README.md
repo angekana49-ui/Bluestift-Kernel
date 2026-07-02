@@ -149,7 +149,7 @@ The chain never crashes `/analyze`: Groq → Gemini, and only raises if both fai
 
 ### Database migrations
 
-Apply the eight SQL files **in order** in the Supabase SQL editor (or via the
+Apply the nine SQL files **in order** in the Supabase SQL editor (or via the
 Management API with `scripts/apply_migrations.py`):
 
 ```
