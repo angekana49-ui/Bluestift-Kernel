@@ -331,6 +331,24 @@ def test_health(client):
     assert body["kernel"] == "bluestift-cognitive-kernel"
 
 
+def test_ready_ok_when_db_reachable(client, fake_supabase, monkeypatch):
+    monkeypatch.setattr(db_module, "get_client", lambda: fake_supabase)
+    resp = client.get("/ready")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok" and body["read_ok"] and body["write_ok"]
+
+
+def test_check_db_access_reports_read_failure(monkeypatch):
+    class _Boom:
+        def schema(self, *_):
+            raise RuntimeError("Invalid schema: kernel")
+
+    status = db_module.check_db_access(_Boom())
+    assert status["read_ok"] is False
+    assert "read:" in (status["detail"] or "")
+
+
 def test_auth_enforced_when_secret_set(client, fake_supabase, monkeypatch):
     monkeypatch.setenv("KERNEL_API_SECRET", "s3cr3t")
     monkeypatch.setattr(db_module, "get_client", lambda: fake_supabase)  # hermetic

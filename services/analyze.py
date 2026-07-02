@@ -232,9 +232,13 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
             )
             # Decay is relative to "now" after a fresh signal -> k_eff == k_raw.
             k_eff = k_raw
-            committed_slip = _persist_state(
-                client, user_id, concept_id, kc, k_before, k_raw, pc, attempt, state, lam, m_score
-            )
+            # Best-effort: a write/permission failure must not sink the diagnosis.
+            try:
+                committed_slip = _persist_state(
+                    client, user_id, concept_id, kc, k_before, k_raw, pc, attempt, state, lam, m_score
+                )
+            except Exception as e:  # noqa: BLE001 - degrade, still return the analysis
+                db.log_monitoring(client, "warn", "persist_state_failed", {"error": str(e)[:300]})
 
         p_slip = committed_slip or (state.get("p_slip_personal") if state else None) or bkt.get_bkt_params(kc)["p_slip"]
         pc_avg = (state.get("partial_credit_avg") if state else None) or 0.5

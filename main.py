@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 load_dotenv()
 
@@ -89,6 +90,35 @@ async def require_auth(
 @app.get("/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
     return HealthResponse(status="ok", version=KERNEL_VERSION)
+
+
+# --------------------------------------------------------------------------- #
+# /ready  (deep health — verifies kernel-schema read + write access)
+# --------------------------------------------------------------------------- #
+# Surfaces the recurring shared-DB regression (exposed schema / grants reset by
+# an app setup) proactively: returns 503 when the Kernel can't reach its schema.
+@app.get("/ready")
+async def ready() -> JSONResponse:
+    try:
+        status = db.check_db_access(db.get_client())
+    except Exception as e:  # noqa: BLE001 - creds missing / client build failed
+        status = {"read_ok": False, "write_ok": False, "detail": str(e)[:200]}
+    ok = status["read_ok"] and status["write_ok"]
+    status["status"] = "ok" if ok else "degraded"
+    status["version"] = KERNEL_VERSION
+    return JSONResponse(status_code=200 if ok else 503, content=status)
+
+
+@app.on_event("startup")
+async def _startup_db_check() -> None:
+    """Log a clear alert if the Kernel boots without full DB access."""
+    try:
+        client = db.get_client()
+        status = db.check_db_access(client)
+        if not (status["read_ok"] and status["write_ok"]):
+            db.log_monitoring(client, "error", "startup_db_degraded", status)
+    except Exception:  # noqa: BLE001 - never block startup (e.g. tests without creds)
+        pass
 
 
 # --------------------------------------------------------------------------- #

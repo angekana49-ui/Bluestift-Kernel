@@ -199,31 +199,62 @@ def log_kernel_request(client, request_id: str, user_id: str, payload: dict) -> 
 
 
 def log_kernel_output(client, request_id: str, user_id: str, output: dict) -> None:
-    _kernel(client, "kernel_outputs").insert(
-        {
-            "request_id": request_id,
-            "user_id": user_id,
-            "root_gap": output.get("root_gap"),
-            "root_concept_id": output.get("root_concept_id"),
-            "detection_path": output.get("detection_path"),
-            "confidence": output.get("confidence"),
-            "llm_used": output.get("llm_used"),
-            "output": output,
-            "created_at": _now_iso(),
-        }
-    ).execute()
+    """Best-effort: a logging/permission failure must not break the analysis."""
+    try:
+        _kernel(client, "kernel_outputs").insert(
+            {
+                "request_id": request_id,
+                "user_id": user_id,
+                "root_gap": output.get("root_gap"),
+                "root_concept_id": output.get("root_concept_id"),
+                "detection_path": output.get("detection_path"),
+                "confidence": output.get("confidence"),
+                "llm_used": output.get("llm_used"),
+                "output": output,
+                "created_at": _now_iso(),
+            }
+        ).execute()
+    except Exception as e:  # noqa: BLE001 - degrade, don't crash /analyze
+        log_monitoring(client, "warn", "output_log_failed", {"error": str(e)[:300]})
 
 
 def log_individual_insight(client, user_id: str, request_id: str, summary: str, root_gap: str | None) -> None:
-    _kernel(client, "individual_insights").insert(
-        {
-            "user_id": user_id,
-            "request_id": request_id,
-            "root_gap": root_gap,
-            "insight_text": summary,
-            "created_at": _now_iso(),
-        }
-    ).execute()
+    """Best-effort: never break the analysis if the insight write fails."""
+    try:
+        _kernel(client, "individual_insights").insert(
+            {
+                "user_id": user_id,
+                "request_id": request_id,
+                "root_gap": root_gap,
+                "insight_text": summary,
+                "created_at": _now_iso(),
+            }
+        ).execute()
+    except Exception as e:  # noqa: BLE001
+        log_monitoring(client, "warn", "insight_log_failed", {"error": str(e)[:300]})
+
+
+def check_db_access(client) -> dict:
+    """Probe kernel-schema read and write access, for readiness/health.
+
+    A recurring failure mode is the shared DB losing the Kernel's exposed schema
+    or service_role grants (a RAYA setup can reset them). This surfaces it.
+    """
+    status = {"read_ok": False, "write_ok": False, "detail": None}
+    try:
+        _kernel(client, "concept_nodes").select("id").limit(1).execute()
+        status["read_ok"] = True
+    except Exception as e:  # noqa: BLE001
+        status["detail"] = f"read: {str(e)[:200]}"
+        return status
+    try:
+        _kernel(client, "kernel_monitoring").insert(
+            {"level": "info", "event": "readiness_probe", "detail": {}, "created_at": _now_iso()}
+        ).execute()
+        status["write_ok"] = True
+    except Exception as e:  # noqa: BLE001
+        status["detail"] = f"write: {str(e)[:200]}"
+    return status
 
 
 def log_alert(client, user_id: str, alert: dict, concept_id: str | None = None) -> None:
