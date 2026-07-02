@@ -139,8 +139,10 @@ async def analyze(req: AnalyzeRequest) -> AnalyzeResponse:
     try:
         output = await analyze_pipeline.run_analysis(client, request_id, payload)
     except Exception as e:  # noqa: BLE001
+        # Log the full detail internally; return a generic message (no internals
+        # like schema/constraint names leak to the caller). request_id correlates.
         db.log_monitoring(client, "error", "analyze_failed", {"request_id": request_id, "error": str(e)})
-        raise HTTPException(status_code=500, detail=f"Analysis failed: {e}") from e
+        raise HTTPException(status_code=500, detail=f"Analysis failed (request_id={request_id})") from e
 
     return AnalyzeResponse(kernel_version=KERNEL_VERSION, **output)
 

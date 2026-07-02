@@ -45,15 +45,16 @@ class HealthResponse(BaseModel):
 # --------------------------------------------------------------------------- #
 class Message(BaseModel):
     role: Role
-    content: str = Field(..., min_length=1)
+    # Upper bound caps payload size (anti-abuse: prevents huge LLM cost blowups).
+    content: str = Field(..., min_length=1, max_length=8000)
 
 
 class AnalyzeRequest(BaseModel):
-    user_id: str = Field(..., description="UUID of the student")
-    conversation_history: list[Message] = Field(..., min_length=1)
-    subject: str = Field(default="MATH")
-    level: str = Field(default="unknown")
-    trigger: str = Field(default="post_conversation")
+    user_id: str = Field(..., min_length=1, max_length=128, description="UUID of the student")
+    conversation_history: list[Message] = Field(..., min_length=1, max_length=200)
+    subject: str = Field(default="MATH", max_length=64)
+    level: str = Field(default="unknown", max_length=64)
+    trigger: str = Field(default="post_conversation", max_length=64)
 
 
 class MasteryEntry(BaseModel):
