@@ -9,7 +9,7 @@ from __future__ import annotations
 from collections import Counter
 from datetime import datetime, timezone
 
-from core import anomaly, bkt, calibration, detector, forgetting, mindset
+from core import anomaly, bkt, calibration, curriculum, detector, forgetting, mindset
 from core.graph import build_graph, node_id
 from services import db
 from services.kc_registry import get_or_create_kc
@@ -300,7 +300,13 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
     confidence = detection["confidence"]
 
     root_concept_id = node_id(graph, root_gap) if root_gap else None
-    rec_path = detector.recommended_path(graph, root_gap)
+
+    # 7b. School layer: if the student belongs to a school, its curriculum layers
+    #     shape the sequencing and its objectives are reported against real state.
+    #     Best-effort throughout — no school, or a school with bad JSON, must land
+    #     the student on exactly the analysis they'd get without one.
+    layers = _load_curriculum_layers(client, user_id, subject, level)
+    rec_path = detector.recommended_path(graph, root_gap, priorities=layers.weights)
 
     # 8. Natural-language summary.
     surface = detection_path[0] if detection_path else (failing[0] if failing else "")
@@ -320,11 +326,42 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
         "llm_used": llm_used if llm_used != "none" else summary_llm,
     }
 
+    if not layers.is_empty:
+        output["curriculum"] = {
+            "school_id": layers.school_id,
+            "layers_applied": layers.applied(),
+            "objectives": curriculum.objective_report(layers.objectives, effective_states),
+            # Whether the detected root gap is part of the school's program. A
+            # gap outside it is still the truth and still reported — the school
+            # just knows it is looking at something off-program.
+            "root_gap_in_program": (
+                root_gap in layers.concepts if (root_gap and layers.concepts) else None
+            ),
+            "rules": layers.rules,
+        }
+
     # 9. Persist output + insight (request was already logged by the caller).
     db.log_kernel_output(client, request_id, user_id, output)
     db.log_individual_insight(client, user_id, request_id, summary, root_gap)
 
     return output
+
+
+def _load_curriculum_layers(client, user_id: str, subject: str, level: str):
+    """Load and parse the student's school layers; empty when they have no school.
+
+    Wrapped whole: a student's analysis must not depend on their school's data
+    being present or well-formed.
+    """
+    try:
+        school_id = db.load_school_id(client, user_id)
+        if not school_id:
+            return curriculum.CurriculumLayers()
+        rows = db.load_curriculum_layers(client, school_id, subject, level)
+        return curriculum.parse_layers(rows, school_id=school_id)
+    except Exception as e:  # noqa: BLE001 - degrade to no school context
+        db.log_monitoring(client, "warn", "curriculum_layers_failed", {"error": str(e)[:300]})
+        return curriculum.CurriculumLayers()
 
 
 def _group_trajectories(rows: list[dict]) -> dict[str, list[float]]:

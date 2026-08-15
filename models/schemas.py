@@ -79,6 +79,10 @@ class AnalyzeResponse(BaseModel):
     summary: str = ""
     recommended_path: list[str] = Field(default_factory=list)
     alerts: list[dict] = Field(default_factory=list)
+    # Present only for a student who belongs to a school that has set layers:
+    # {school_id, layers_applied, objectives, root_gap_in_program, rules}.
+    # See core/curriculum.py and migration 010.
+    curriculum: Optional[dict] = None
     kernel_version: str
     llm_used: str
 

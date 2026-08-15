@@ -65,19 +65,39 @@ updates state, and changes RAYA's next move.
 ## 2. School → AI → Student channel
 
 The corpus calls this the strongest **differentiator** (§4.1): the school does
-not just read reports — it actively calibrates the Kernel and RAYA. The
-`schools.school_curriculum_layers` table exists but no logic consumes it.
+not just read reports — it actively calibrates the Kernel and RAYA.
 
-- Ingest active layers into the analysis context:
-  - `curriculum` → constrain/seed the KC graph to the national program (MINESEC).
-  - `kc_priorities` → weight multipliers feeding the sequencing decision.
-  - `objectives` → mastery targets + deadlines surfaced on the dashboard.
-  - `custom_rules` → instructions injected into RAYA's prompt (layers 3/4).
-- Teacher override of Kernel inferences (scalable oversight, Amodei) — validate a
-  sample, extrapolate the rest.
-- An institutional dashboard exposing K/V/P/M per student per KC, the
-  `kernel_monitoring` alerts, behavioural/dropout risk, and equity (K
-  distribution per KC). Pitch line: *"audit what RAYA tells your students."*
+**Ingestion — shipped.** `schools.school_curriculum_layers` had a name and a list
+of concept ids and nothing read it. Migration 010 gives it a `layer_type` and a
+per-type `payload`, and `/analyze` now consumes the active layers for a student's
+school (via `schools.student_identities`), returning a `curriculum` block:
+
+- `curriculum` → the program's concepts; the response reports whether the
+  detected root gap is inside the program (`root_gap_in_program`).
+- `kc_priorities` → weight multipliers that reorder `recommended_path`. Bounded
+  to [0.1, 5.0] and applied *only* between concepts that are already valid next
+  steps: a school says what to reach for first, it cannot ask for a concept
+  before its prerequisites.
+- `objectives` → targets with deadlines, reported against real mastery as
+  `met` / `at_risk` / `overdue` / `pending` / `unknown`. A concept with no
+  evidence is reported `unknown` rather than counted as failure.
+- `custom_rules` → passed through for RAYA's prompt (the app already merges
+  `class_instructions` + `school_directives` into its soft nudges).
+
+A student with no school, or a school with malformed JSON, gets exactly the
+analysis they'd get with no school at all — the whole path is best-effort.
+
+Still open here:
+
+- **Constrain graph *construction*** to the national program (MINESEC). Today the
+  curriculum layer annotates and sequences; it does not stop the open graph from
+  creating off-program KCs.
+- **Teacher override of Kernel inferences** (scalable oversight, Amodei) —
+  validate a sample, extrapolate the rest. Nothing built.
+- **The institutional dashboard** — K/V/P/M per student per KC, the
+  `kernel_monitoring` alerts (now including the stability metrics), dropout risk,
+  and equity (K distribution per KC). This is app-side work; the Kernel exposes
+  what it needs. Pitch line: *"audit what RAYA tells your students."*
 
 ---
 
@@ -185,7 +205,8 @@ temporally stable, interpretable, works with ~10% of the training data.
    `/update_concept_state` with their real partial credit.
 2. ~~**Finish anomaly layer (OOD, inconsistency)**~~ — done (§3); thresholds still
    want calibrating against real outcomes.
-3. **School channel + dashboard** — the differentiator, and what institutions buy.
+3. **School channel** — layer ingestion is in (§2); the institutional dashboard,
+   teacher override, and program-constrained graph construction are what's left.
 4. **Data-gated work** — confidence calibration, per-population params,
    Responsible-DKT — once real interactions accumulate.
 5. **GraphRAG, offline, multilingual, auth** — as scale and context demand.

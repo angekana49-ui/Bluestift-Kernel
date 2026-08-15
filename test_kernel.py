@@ -16,7 +16,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import main
-from core import anomaly, bkt, calibration, detector, forgetting, mindset
+from core import anomaly, bkt, calibration, curriculum, detector, forgetting, mindset
 from core.graph import build_graph
 from services import analyze as analyze_pipeline
 from services import db as db_module
@@ -353,6 +353,108 @@ def test_group_trajectories_keeps_order_per_concept():
     assert analyze_pipeline._group_trajectories(rows) == {"a": [0.1, 0.4], "b": [0.7]}
 
 
+# --------------------------------------------------------------------------- #
+# School -> AI -> Student channel
+# --------------------------------------------------------------------------- #
+def test_parse_layers_merges_and_validates():
+    rows = [
+        {"layer_type": "curriculum", "payload": {"concepts": ["Fractions", "notion de variable"]}},
+        {"layer_type": "curriculum", "concept_ids": ["derivation_fonction"]},  # legacy row
+        {"layer_type": "kc_priorities", "payload": {"weights": {"Fractions": 3, "x": "nope", "y": 99}}},
+        {"layer_type": "objectives", "payload": {"targets": [
+            {"concept": "fractions", "mastery": 0.8, "due_at": "2026-12-15T00:00:00Z"},
+            {"nothing": "usable"},
+        ]}},
+        {"layer_type": "custom_rules", "payload": {"rules": ["Toujours partir d'un exemple concret."]}},
+    ]
+    layers = curriculum.parse_layers(rows, school_id="s1")
+
+    # Labels are canonicalized, so a school can write prose.
+    assert layers.concepts == {"fractions", "notion_de_variable", "derivation_fonction"}
+    assert layers.weights["fractions"] == 3.0
+    assert "x" not in layers.weights                      # unparseable weight dropped
+    assert layers.weights["y"] == curriculum.MAX_PRIORITY  # 99 clamped, not obeyed
+    assert len(layers.objectives) == 1                     # the unusable target is skipped
+    assert layers.rules == ["Toujours partir d'un exemple concret."]
+    assert set(layers.applied()) == {"curriculum", "kc_priorities", "objectives", "custom_rules"}
+
+
+def test_parse_layers_survives_garbage():
+    layers = curriculum.parse_layers(
+        [
+            {"layer_type": "kc_priorities", "payload": "not a dict"},
+            {"layer_type": "objectives", "payload": {"targets": "nope"}},
+            {"layer_type": "unknown_type", "payload": {"weights": {"a": 2}}},
+            {},
+        ]
+    )
+    assert layers.is_empty
+
+
+def test_school_priorities_reorder_but_never_reach_past_prerequisites():
+    import networkx as nx
+
+    graph = nx.DiGraph()
+    # root -> both branches are valid next steps; alphabetically "algebre" wins.
+    graph.add_edge("racine", "algebre")
+    graph.add_edge("racine", "trigonometrie")
+
+    assert detector.recommended_path(graph, "racine")[1] == "algebre"
+    # The school prioritizes trigonometry: it now comes first among the
+    # legitimate next steps.
+    weighted = detector.recommended_path(graph, "racine", priorities={"trigonometrie": 3.0})
+    assert weighted[1] == "trigonometrie"
+    # The walk still starts at the root gap — priorities can't skip foundations.
+    assert weighted[0] == "racine"
+
+
+def test_objective_report_statuses():
+    now = datetime(2026, 8, 15, tzinfo=timezone.utc)
+    objectives = [
+        {"concept": "fractions", "mastery": 0.8, "due_at": "2026-12-01T00:00:00Z"},
+        {"concept": "derivees", "mastery": 0.8, "due_at": "2026-08-20T00:00:00Z"},
+        {"concept": "limites", "mastery": 0.8, "due_at": "2026-07-01T00:00:00Z"},
+        {"concept": "integrales", "mastery": 0.8, "due_at": None},
+        {"concept": "jamais_vu", "mastery": 0.8, "due_at": "2026-09-01T00:00:00Z"},
+    ]
+    mastery = {"fractions": 0.9, "derivees": 0.4, "limites": 0.3, "integrales": 0.2}
+
+    report = {r["concept"]: r["status"] for r in curriculum.objective_report(objectives, mastery, now=now)}
+    assert report["fractions"] == "met"
+    assert report["derivees"] == "at_risk"   # under target, due in 5 days
+    assert report["limites"] == "overdue"    # deadline already passed
+    assert report["integrales"] == "pending"  # no deadline set
+    # No evidence yet is reported as unknown, not silently counted as failure.
+    assert report["jamais_vu"] == "unknown"
+
+
+def test_load_curriculum_layers_matches_wildcard_levels(fake_supabase):
+    fake_supabase.seed(
+        "schools.school_curriculum_layers",
+        [
+            {"id": "l1", "school_id": "s1", "subject": "MATH", "level": "lycee",
+             "is_active": True, "layer_type": "curriculum", "payload": {"concepts": ["a"]}},
+            {"id": "l2", "school_id": "s1", "subject": "MATH", "level": "*",
+             "is_active": True, "layer_type": "kc_priorities", "payload": {"weights": {"a": 2}}},
+            {"id": "l3", "school_id": "s1", "subject": "MATH", "level": "college",
+             "is_active": True, "layer_type": "curriculum", "payload": {"concepts": ["b"]}},
+            {"id": "l4", "school_id": "s1", "subject": "MATH", "level": "lycee",
+             "is_active": False, "layer_type": "curriculum", "payload": {"concepts": ["c"]}},
+        ],
+    )
+    rows = db_module.load_curriculum_layers(fake_supabase, "s1", "MATH", "lycee")
+    # This level plus the subject-wide layer; not another level's, not an inactive one.
+    assert {r["layer_type"] for r in rows} == {"curriculum", "kc_priorities"}
+    assert len(rows) == 2
+
+
+def test_no_school_means_no_curriculum_block(fake_supabase):
+    # An independent learner: no student_identities row at all.
+    assert db_module.load_school_id(fake_supabase, "u1") is None
+    layers = analyze_pipeline._load_curriculum_layers(fake_supabase, "u1", "MATH", "lycee")
+    assert layers.is_empty
+
+
 def test_slip_and_persistence():
     # A failure while mastery looked solid raises personal slip.
     slip_hi = analyze_pipeline._slip_estimate(0.1, k_before=0.9, outcome_failure=True)
@@ -564,6 +666,35 @@ async def test_analyze_pipeline_end_to_end(fake_supabase, monkeypatch):
     assert resp2.status_code == 200, resp2.text
     assert resp2.json()["root_gap"] == "fonctions_affines"
     assert fake_supabase.tables["kernel.student_concept_state"] == []
+
+    # An independent learner gets no curriculum block at all.
+    assert resp2.json().get("curriculum") is None
+
+    # Same student, now attached to a school that has set layers.
+    fake_supabase.seed(
+        "schools.student_identities",
+        [{"id": "si1", "user_id": payload["user_id"], "school_id": "school-1"}],
+    )
+    fake_supabase.seed(
+        "schools.school_curriculum_layers",
+        [
+            {"id": "l1", "school_id": "school-1", "subject": "MATH", "level": "*",
+             "is_active": True, "layer_type": "curriculum",
+             "payload": {"concepts": ["fonctions_affines", "derivees"]}},
+            {"id": "l2", "school_id": "school-1", "subject": "MATH", "level": "*",
+             "is_active": True, "layer_type": "objectives",
+             "payload": {"targets": [{"concept": "derivees", "mastery": 0.8,
+                                      "due_at": "2026-01-01T00:00:00Z"}]}},
+        ],
+    )
+    resp3 = client.post("/analyze", json={**payload, "commit_state": False})
+    assert resp3.status_code == 200, resp3.text
+    school_block = resp3.json()["curriculum"]
+    assert school_block["school_id"] == "school-1"
+    assert set(school_block["layers_applied"]) == {"curriculum", "objectives"}
+    assert school_block["root_gap_in_program"] is True
+    # The deadline is long past and the student is nowhere near the target.
+    assert school_block["objectives"][0]["status"] == "overdue"
 
 
 def test_load_profile(fake_supabase, monkeypatch):

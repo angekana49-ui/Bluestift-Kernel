@@ -202,6 +202,55 @@ def upsert_mindset(client, user_id: str, m_score: float, detected: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# School curriculum layers (School -> AI -> Student channel)
+# --------------------------------------------------------------------------- #
+def _schools(client, table: str):
+    return client.schema("schools").table(table)
+
+
+def load_school_id(client, user_id: str) -> str | None:
+    """The school a student belongs to, or None for an independent learner.
+
+    `schools.student_identities` is owned by the app; the Kernel only reads it.
+    Most students have no school, so this failing or returning nothing is an
+    ordinary outcome, not an error.
+    """
+    try:
+        res = (
+            _schools(client, "student_identities")
+            .select("school_id")
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        )
+        return (res.data[0].get("school_id") if res.data else None) or None
+    except Exception:  # noqa: BLE001 - no school context is a normal state
+        return None
+
+
+def load_curriculum_layers(client, school_id: str, subject: str, level: str) -> list[dict]:
+    """Active curriculum layers for a school, for this subject.
+
+    Level is matched permissively: a layer set for the whole subject (level
+    `'*'` or empty) applies to every level, so a school doesn't have to restate
+    its program per class.
+    """
+    try:
+        res = (
+            _schools(client, "school_curriculum_layers")
+            .select("layer_type, payload, concept_ids, level")
+            .eq("school_id", school_id)
+            .eq("is_active", True)
+            .eq("subject", subject)
+            .execute()
+        )
+        rows = res.data or []
+    except Exception:  # noqa: BLE001 - school context is an enrichment, never a blocker
+        return []
+    return [r for r in rows if r.get("level") in (level, "*", "", None)]
+
+
+# --------------------------------------------------------------------------- #
 # Logging — requests, outputs, insights, monitoring
 # --------------------------------------------------------------------------- #
 def log_kernel_request(client, request_id: str, user_id: str, payload: dict) -> None:

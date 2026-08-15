@@ -63,10 +63,28 @@ Response (note the **new `alerts`** field):
   "summary": "Tu bloques parce que ...",
   "recommended_path": ["notion_de_variable", "..."],
   "alerts": [{ "type": "cognitive_overload", "severity": "medium" }],
+  "curriculum": {
+    "school_id": "uuid",
+    "layers_applied": ["curriculum", "kc_priorities", "objectives"],
+    "objectives": [
+      { "concept": "derivees", "target_mastery": 0.8, "observed_mastery": 0.4,
+        "due_at": "2026-12-15T00:00:00Z", "status": "at_risk" }
+    ],
+    "root_gap_in_program": true,
+    "rules": ["Toujours partir d'un exemple concret."]
+  },
   "kernel_version": "1.0.0",
   "llm_used": "openai/gpt-oss-120b"
 }
 ```
+
+`curriculum` is **absent (null)** unless the student belongs to a school that has
+set layers — most students won't have it, so treat it as optional. When present:
+`recommended_path` has already been reordered by the school's priorities;
+`objectives[].status` is one of `met` / `at_risk` / `overdue` / `pending` /
+`unknown` (`unknown` = no evidence on that concept yet, not a failure); and
+`rules` are the school's instructions for RAYA's prompt — the same intent as the
+app's existing `class_instructions` / `school_directives` nudges.
 
 ### `POST /load_profile`
 `{ "user_id": "uuid" }` → cognitive profile (per-KC `k_raw`, `k_effective`,
@@ -154,6 +172,13 @@ public, graphql_public, kernel, learning, schools, rag, content
 If the Kernel ever returns `degraded` on `/ready` (or 500s with "permission
 denied for table kernel_*"), re-run the Kernel's `migrations/009_shared_db_hardening.sql`
 (re-asserts the union + grants + reloads PostgREST).
+
+The Kernel also **reads** two app-owned tables in the `schools` schema:
+`student_identities` (to map a student to their school) and
+`school_curriculum_layers` (the layers themselves, extended by the Kernel's
+migration 010). It never writes to them. If the app changes their shape, the
+Kernel degrades to "no school context" rather than failing — but the school
+channel goes quiet, so tell the Kernel side.
 
 ---
 

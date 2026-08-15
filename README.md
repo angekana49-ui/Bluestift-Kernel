@@ -60,7 +60,8 @@ Each KC, per student, carries a four-dimensional state (Luckin / corpus §1.2):
 │   ├── mindset.py           # Mindset score M (sigmoid blend)
 │   ├── detector.py          # DFS root-cause by convergence
 │   ├── calibration.py       # Self-calibration of living parameters
-│   └── anomaly.py           # Pedagogical-safety anomaly detection
+│   ├── anomaly.py           # Pedagogical-safety anomaly detection
+│   └── curriculum.py        # School curriculum layers -> sequencing + objectives
 ├── services/
 │   ├── llm.py               # LLM chain: Groq primary -> Gemini fallback
 │   ├── kc_registry.py       # get_or_create_kc() — dynamic KCs
@@ -154,7 +155,7 @@ The chain never crashes `/analyze`: Groq → Gemini, and only raises if both fai
 
 ### Database migrations
 
-Apply the nine SQL files **in order** in the Supabase SQL editor (or via the
+Apply the ten SQL files **in order** in the Supabase SQL editor (or via the
 Management API with `scripts/apply_migrations.py`):
 
 ```
@@ -167,6 +168,7 @@ Management API with `scripts/apply_migrations.py`):
 007_rls_policies.sql         # full RLS policy set
 008_kernel_monitoring_alerts.sql  # pedagogical-safety alert schema
 009_shared_db_hardening.sql       # re-assert exposed schemas + grants (shared DB)
+010_school_curriculum_layers.sql  # school layer types + payloads (School -> AI -> Student)
 ```
 
 > **Shared DB:** the Kernel shares its Supabase project with the RAYA app. If the
@@ -224,11 +226,13 @@ detector change needed; the convergence search crosses the bridge automatically.
 pytest -q
 ```
 
-31 tests. The suite mocks the LLM and uses an in-memory fake Supabase
+51 tests. The suite mocks the LLM and uses an in-memory fake Supabase
 (`conftest.py`), so **no network or real keys are required**. Coverage: BKT,
 forgetting, mindset, detector (convergence), calibration, the cognitive vector
-(V/P/slip), anomaly detectors, graph-builder validation, `get_or_create_kc`, and
-the `/health`, `/analyze`, `/load_profile`, `/seed_kcs` routes.
+(V/P/slip), anomaly detectors (including temporal inconsistency and OOD),
+school curriculum layers, graph-builder validation, `get_or_create_kc`, and the
+`/health`, `/ready`, `/analyze`, `/load_profile`, `/update_concept_state`,
+`/seed_kcs` routes.
 
 ---
 
