@@ -15,6 +15,8 @@ from __future__ import annotations
 import hmac
 import os
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
@@ -51,7 +53,20 @@ DEFAULT_CORS = [
 _cors_env = os.getenv("CORS_ORIGINS")
 CORS_ORIGINS = [o.strip() for o in _cors_env.split(",")] if _cors_env else DEFAULT_CORS
 
-app = FastAPI(title="Bluestift Cognitive Kernel", version=KERNEL_VERSION)
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """Log a clear alert if the Kernel boots without full DB access."""
+    try:
+        client = db.get_client()
+        status = db.check_db_access(client)
+        if not (status["read_ok"] and status["write_ok"]):
+            db.log_monitoring(client, "error", "startup_db_degraded", status)
+    except Exception:  # noqa: BLE001 - never block startup (e.g. tests without creds)
+        pass
+    yield
+
+
+app = FastAPI(title="Bluestift Cognitive Kernel", version=KERNEL_VERSION, lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -107,18 +122,6 @@ async def ready() -> JSONResponse:
     status["status"] = "ok" if ok else "degraded"
     status["version"] = KERNEL_VERSION
     return JSONResponse(status_code=200 if ok else 503, content=status)
-
-
-@app.on_event("startup")
-async def _startup_db_check() -> None:
-    """Log a clear alert if the Kernel boots without full DB access."""
-    try:
-        client = db.get_client()
-        status = db.check_db_access(client)
-        if not (status["read_ok"] and status["write_ok"]):
-            db.log_monitoring(client, "error", "startup_db_degraded", status)
-    except Exception:  # noqa: BLE001 - never block startup (e.g. tests without creds)
-        pass
 
 
 # --------------------------------------------------------------------------- #
