@@ -189,6 +189,11 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
     states_rows = db.load_student_concept_states(client, user_id)
     states_by_concept = {s["concept_id"]: s for s in states_rows}
 
+    # 3a. Mastery history, one query for the whole student, grouped per KC. Feeds
+    #     the temporal-inconsistency detector and — because it is loaded before
+    #     the BKT loop — the selective-update gate below.
+    trajectories = _group_trajectories(db.load_recent_trajectories(client, user_id))
+
     # 3b. Mindset M from the conversation (needed to modulate P during the loop).
     m_score = _update_mindset(client, user_id, extraction.get("mindset_signals"))
 
@@ -216,10 +221,13 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
 
         attempt = attempts_by_label.get(label)
         committed_slip = None
+        history = trajectories.get(concept_id, [])
         # Selective-update gate: commit a BKT update only on a strong signal —
         # the first contact (bootstrap), 3+ attempts this session, a large
         # partial-credit shift, or an anomaly. Avoids overreacting to noise.
-        if attempt and commit_state and _should_commit(attempt, state, attempt_counts.get(label, 1)):
+        if attempt and commit_state and _should_commit(
+            attempt, state, attempt_counts.get(label, 1), history
+        ):
             pc = attempt.get("partial_credit")
             if attempt.get("is_assisted"):
                 pc = min(pc if pc is not None else 0.9, 0.9)
@@ -244,7 +252,15 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
         p_slip = committed_slip or (state.get("p_slip_personal") if state else None) or bkt.get_bkt_params(kc)["p_slip"]
         pc_avg = (state.get("partial_credit_avg") if state else None) or 0.5
         status = bkt.classify_status(k_eff, p_slip, pc_avg)
-        kc_records.append({"label": label, "k_effective": k_eff, "p_slip": p_slip})
+        kc_records.append(
+            {
+                "label": label,
+                "k_effective": k_eff,
+                "p_slip": p_slip,
+                "trajectory": history,
+                "population_difficulty": _population_baseline(kc),
+            }
+        )
 
         mastery_map[label] = {
             "k_raw": round(k_raw, 4),
@@ -311,18 +327,62 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
     return output
 
 
-def _should_commit(attempt: dict, prev_state: dict | None, attempts_this_session: int) -> bool:
+def _group_trajectories(rows: list[dict]) -> dict[str, list[float]]:
+    """Group trajectory snapshots into a k_raw series per concept, oldest first.
+
+    The query already orders by snapshot_at, so append order is chronological.
+    """
+    series: dict[str, list[float]] = {}
+    for row in rows:
+        concept_id = row.get("concept_id")
+        k_raw = row.get("k_raw")
+        if concept_id is None or k_raw is None:
+            continue
+        series.setdefault(concept_id, []).append(float(k_raw))
+    return series
+
+
+def _population_baseline(kc: dict) -> float | None:
+    """The KC's calibrated empirical difficulty, or None if it has none yet.
+
+    New KCs are created with a neutral 0.5 placeholder, so the value alone can't
+    say whether a baseline exists. `last_calibration_at` is what distinguishes a
+    real, population-derived difficulty from that default — comparing a student
+    against the placeholder would manufacture out-of-distribution signal from
+    nothing.
+    """
+    if not kc.get("last_calibration_at"):
+        return None
+    difficulty = kc.get("empirical_difficulty")
+    return float(difficulty) if difficulty is not None else None
+
+
+def _should_commit(
+    attempt: dict,
+    prev_state: dict | None,
+    attempts_this_session: int,
+    trajectory: list[float] | None = None,
+) -> bool:
     """Selective-update gate (Corbett-style strong-signal rule).
 
     First contact bootstraps the state; afterwards a BKT update commits only on a
     strong signal: 3+ attempts on the KC this session, a partial-credit shift
     > 0.3 vs the stored average, or a flagged anomaly.
+
+    The anomaly arm reads two signals. The first is the classic one: failing a KC
+    that looked mastered. The second is an unstable history — when the estimate
+    is already oscillating, holding an update back keeps a stale, unreliable
+    value on the books, so a wobbling KC is exactly where fresh evidence counts.
     """
     if prev_state is None:
         return True  # bootstrap the very first observation
     pc = attempt.get("partial_credit")
     prev_avg = prev_state.get("partial_credit_avg")
-    anomalous = attempt.get("outcome") == "failure" and (prev_state.get("mastery_score_raw") or 0) >= 0.8
+    failed_a_mastered_kc = (
+        attempt.get("outcome") == "failure" and (prev_state.get("mastery_score_raw") or 0) >= 0.8
+    )
+    unstable = anomaly.detect_inconsistency_high("", trajectory or []) is not None
+    anomalous = failed_a_mastered_kc or unstable
     return bkt.should_update_bkt(attempts_this_session, pc if pc is not None else 0.0, prev_avg, anomalous)
 
 

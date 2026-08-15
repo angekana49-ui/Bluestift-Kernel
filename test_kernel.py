@@ -271,6 +271,88 @@ def test_anomaly_re_emergence_and_orchestrator():
     assert "false_mastery" in types and "fixed_mindset" in types
 
 
+def test_volatility_and_inconsistency_metrics():
+    climbing = [0.1, 0.25, 0.4, 0.55, 0.7, 0.85]
+    # A monotonic climb spends all its movement on progress: no churn.
+    assert anomaly.temporal_inconsistency(climbing) == 0.0
+    # Oscillating around the same level: nearly all churn, no net progress.
+    swinging = [0.5, 0.9, 0.2, 0.85, 0.25, 0.5]
+    assert anomaly.temporal_inconsistency(swinging) > 0.9
+    # Volatility is about step size, not direction — the climb is the calmer one.
+    assert anomaly.volatility_score(swinging) > anomaly.volatility_score(climbing)
+    # Degenerate inputs are stable, not inconsistent.
+    assert anomaly.temporal_inconsistency([0.4]) == 0.0
+    assert anomaly.temporal_inconsistency([0.4, 0.4, 0.4]) == 0.0
+
+
+def test_anomaly_inconsistency_high():
+    swinging = [0.5, 0.9, 0.2, 0.85, 0.25, 0.9, 0.3]
+    alert = anomaly.detect_inconsistency_high("derivee", swinging)
+    assert alert is not None
+    assert alert["alert_details"]["inconsistency_rate"] > anomaly.INCONSISTENCY_HIGH
+    assert alert["alert_details"]["interactions_count"] == len(swinging)
+
+    # A steady climb never fires, however long.
+    assert anomaly.detect_inconsistency_high("derivee", [0.1, 0.3, 0.4, 0.6, 0.8, 0.95]) is None
+    # Too little history to judge stability at all.
+    assert anomaly.detect_inconsistency_high("derivee", [0.5, 0.9, 0.2]) is None
+
+
+def test_anomaly_ood_distribution():
+    # Struggling on three KCs the local population finds easy -> the calibrated
+    # parameters don't describe this student.
+    struggling = [
+        {"label": "a", "k_effective": 0.2, "p_slip": 0.1, "population_difficulty": 0.1},
+        {"label": "b", "k_effective": 0.3, "p_slip": 0.1, "population_difficulty": 0.2},
+        {"label": "c", "k_effective": 0.1, "p_slip": 0.1, "population_difficulty": 0.1},
+    ]
+    alert = anomaly.detect_ood_distribution(struggling)
+    assert alert is not None
+    assert alert["alert_details"]["direction"] == "below_population"
+    assert alert["alert_severity"] == "high"  # the silent-failure direction
+
+    # A student tracking the local baseline is not out of distribution.
+    typical = [
+        {"label": "a", "k_effective": 0.2, "p_slip": 0.1, "population_difficulty": 0.8},
+        {"label": "b", "k_effective": 0.9, "p_slip": 0.1, "population_difficulty": 0.2},
+        {"label": "c", "k_effective": 0.9, "p_slip": 0.1, "population_difficulty": 0.1},
+    ]
+    assert anomaly.detect_ood_distribution(typical) is None
+
+    # Uncalibrated KCs carry no baseline, so there is nothing to diverge from.
+    assert anomaly.detect_ood_distribution(
+        [{"label": "a", "k_effective": 0.1, "p_slip": 0.1} for _ in range(5)]
+    ) is None
+
+
+def test_population_baseline_ignores_the_uncalibrated_default():
+    # A fresh KC carries a neutral 0.5 placeholder — not a population baseline.
+    assert analyze_pipeline._population_baseline({"empirical_difficulty": 0.5}) is None
+    calibrated = {"empirical_difficulty": 0.15, "last_calibration_at": "2026-07-01T00:00:00Z"}
+    assert analyze_pipeline._population_baseline(calibrated) == 0.15
+
+
+def test_selective_update_gate_fires_on_an_unstable_history():
+    state = {"partial_credit_avg": 0.5, "mastery_score_raw": 0.5}
+    attempt = {"outcome": "partial", "partial_credit": 0.5}  # no shift, one attempt
+    # Nothing notable in the attempt itself: the gate holds.
+    assert analyze_pipeline._should_commit(attempt, state, 1, []) is False
+    # Same attempt, but the KC's estimate has been oscillating -> commit, because
+    # holding back would leave an unreliable value on the books.
+    swinging = [0.5, 0.9, 0.2, 0.85, 0.25, 0.9, 0.3]
+    assert analyze_pipeline._should_commit(attempt, state, 1, swinging) is True
+
+
+def test_group_trajectories_keeps_order_per_concept():
+    rows = [
+        {"concept_id": "a", "k_raw": 0.1},
+        {"concept_id": "b", "k_raw": 0.7},
+        {"concept_id": "a", "k_raw": 0.4},
+        {"concept_id": "a", "k_raw": None},  # skipped, not a data point
+    ]
+    assert analyze_pipeline._group_trajectories(rows) == {"a": [0.1, 0.4], "b": [0.7]}
+
+
 def test_slip_and_persistence():
     # A failure while mastery looked solid raises personal slip.
     slip_hi = analyze_pipeline._slip_estimate(0.1, k_before=0.9, outcome_failure=True)
@@ -337,6 +419,37 @@ def test_ready_ok_when_db_reachable(client, fake_supabase, monkeypatch):
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "ok" and body["read_ok"] and body["write_ok"]
+
+
+def test_load_recent_trajectories_is_chronological(fake_supabase):
+    fake_supabase.seed(
+        "kernel.learning_trajectories",
+        [
+            {"id": "t2", "user_id": "u1", "concept_id": "a", "k_raw": 0.6, "snapshot_at": "2026-07-02T00:00:00Z"},
+            {"id": "t1", "user_id": "u1", "concept_id": "a", "k_raw": 0.3, "snapshot_at": "2026-07-01T00:00:00Z"},
+            {"id": "t3", "user_id": "u2", "concept_id": "a", "k_raw": 0.9, "snapshot_at": "2026-07-03T00:00:00Z"},
+        ],
+    )
+    rows = db_module.load_recent_trajectories(fake_supabase, "u1")
+    # Only this student's rows, oldest first — the series is read in order.
+    assert [r["k_raw"] for r in rows] == [0.3, 0.6]
+
+
+def test_log_alert_promotes_the_stability_metrics(fake_supabase):
+    alert = anomaly.detect_inconsistency_high("derivee", [0.5, 0.9, 0.2, 0.85, 0.25, 0.9, 0.3])
+    db_module.log_alert(fake_supabase, "u1", alert, concept_id="c1")
+
+    row = fake_supabase.tables["kernel.kernel_monitoring"][0]
+    assert row["alert_type"] == "inconsistency_high"
+    # Migration 008 gave these their own columns; a dashboard shouldn't have to
+    # dig them out of the details JSON.
+    assert row["inconsistency_rate"] == alert["alert_details"]["inconsistency_rate"]
+    assert row["volatility_score"] == alert["alert_details"]["volatility_score"]
+    assert row["interactions_count"] == 7
+
+    # An alert without those metrics doesn't invent the columns.
+    db_module.log_alert(fake_supabase, "u1", anomaly.detect_fixed_mindset(0.1))
+    assert "inconsistency_rate" not in fake_supabase.tables["kernel.kernel_monitoring"][1]
 
 
 def test_check_db_access_reports_read_failure(monkeypatch):

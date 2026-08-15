@@ -22,7 +22,7 @@ Shipped and verified live:
   validation).
 - Dynamic KCs for any subject; runtime label canonicalization.
 - **Pedagogical-safety anomaly detection** → `kernel_monitoring` + `/analyze` alerts.
-- 8 migrations, 30 tests, deployed on Railway.
+- 9 migrations, 45 tests, deployed on Railway.
 
 ### Shipped beyond the original v1 spec
 
@@ -81,19 +81,39 @@ not just read reports — it actively calibrates the Kernel and RAYA. The
 
 ---
 
-## 3. Finish the anomaly / monitoring layer
+## 3. Finish the anomaly / monitoring layer — **shipped**
 
-Two detectors were deferred because they need population baselines or history:
+The two deferred detectors are in, both reading beyond a single conversation:
 
-- **`ood_distribution`** — distributional shift detection. All KT priors come
-  from North-American/Estonian data; a sub-Saharan deployment risks silent
-  failure (Goodhart, Amodei). Flag when a student's patterns diverge from the
-  calibrated distribution; trigger local recalibration once N > threshold.
-- **`inconsistency_high`** — temporal inconsistency > 0.40 over 20 interactions
-  (Hooshyar), plus `volatility_score`. Compute from `learning_trajectories`
-  once enough snapshots exist; this is the stability metric for the dashboard.
-- Wire richer anomaly signals back into the selective-update gate's `anomalous`
-  flag (currently a simple high-mastery-failure heuristic).
+- **`inconsistency_high`** — temporal inconsistency (Hooshyar) over the last 20
+  `learning_trajectories` snapshots, alongside `volatility_score`. Inconsistency
+  is total variation vs net displacement: a monotonic climb scores 0, an estimate
+  that swings and ends where it began scores 1. Fires above 0.40. The corpus
+  specifies a 20-interaction window; we compute from 6 snapshots up over whatever
+  part of the window exists, and carry `interactions_count` in the alert — waiting
+  for a full 20 would leave the first cohort unprotected.
+- **`ood_distribution`** — compares the student against the *local* population
+  baseline each KC accumulates (`empirical_difficulty`), not against the imported
+  priors. A large signed mean deviation across 3+ calibrated KCs means the
+  parameters don't describe this student. Direction is reported:
+  `below_population` is the silent-failure case (Goodhart, Amodei) and is raised
+  at high severity. KCs that haven't been calibrated carry no baseline and are
+  skipped — the neutral 0.5 placeholder a new KC is created with would otherwise
+  manufacture divergence out of nothing.
+- The selective-update gate's `anomalous` flag now also fires on an unstable
+  history, not only on failing a KC that looked mastered: when the estimate is
+  already oscillating, holding an update back keeps an unreliable value on the
+  books, so that is precisely where fresh evidence should count.
+- Alerts write `inconsistency_rate`, `volatility_score` and `interactions_count`
+  into their own `kernel_monitoring` columns (migration 008 already defined them),
+  so the dashboard can filter and chart without parsing the details JSON.
+
+Still open here:
+
+- **Trigger local recalibration** once a population's N passes threshold, instead
+  of only flagging the divergence.
+- Calibrate the thresholds (0.40 inconsistency, 0.4 OOD deviation, the 6-snapshot
+  floor) against real outcomes — they are reasoned defaults, not measured ones.
 
 ---
 
@@ -160,9 +180,12 @@ temporally stable, interpretable, works with ~10% of the training data.
 
 ## Suggested order
 
-1. **RAYA integration** — turn on the flywheel (nothing else matters without it).
-2. **School channel + dashboard** — the differentiator, and what institutions buy.
-3. **Finish anomaly layer (OOD, inconsistency)** — pedagogical-safety story.
+1. ~~**RAYA integration**~~ — done: RAYA calls `/analyze` (chat, challenges,
+   assignments), reacts to alerts, and sends graded attempts to
+   `/update_concept_state` with their real partial credit.
+2. ~~**Finish anomaly layer (OOD, inconsistency)**~~ — done (§3); thresholds still
+   want calibrating against real outcomes.
+3. **School channel + dashboard** — the differentiator, and what institutions buy.
 4. **Data-gated work** — confidence calibration, per-population params,
    Responsible-DKT — once real interactions accumulate.
 5. **GraphRAG, offline, multilingual, auth** — as scale and context demand.

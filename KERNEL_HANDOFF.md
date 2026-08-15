@@ -74,9 +74,24 @@ Response (note the **new `alerts`** field):
 detected_mindset }`. Use for the dynamic prompt layer.
 
 ### `POST /update_concept_state`
-`{ user_id, concept_id, partial_credit_score, is_assisted, response_time_ms,
-blocage_type }` → updates one KC on a strong signal. Optional today (the Kernel
-also derives updates from `/analyze`), but preferred for graded attempts.
+`{ user_id, concept_id | concept_label, subject, level, partial_credit_score,
+is_assisted, response_time_ms, blocage_type }` → updates one KC on a strong
+signal. **Use this for every graded attempt** — it carries the real score, where
+`/analyze` can only re-infer one from prose.
+
+Identify the KC either way:
+- `concept_label` — a plain concept name (`"derivation_fonction"`). The Kernel
+  canonicalizes it onto an existing KC, or creates it. This is the normal path:
+  grading knows the concept's name, never its UUID.
+- `concept_id` — a `kernel.concept_nodes` UUID. The response returns the resolved
+  `concept_id` and canonical `label`, so a caller can cache the id and skip
+  resolution next time.
+
+> **Pairing it with `/analyze`:** send `commit_state: false` on the `/analyze`
+> call that follows graded updates. Otherwise the Kernel re-derives the same
+> attempts from the conversation and commits them *on top of* yours — the same
+> evidence counted twice, inflating mastery. The diagnosis (root gap, path,
+> alerts) is returned either way.
 
 ---
 
@@ -85,7 +100,8 @@ also derives updates from `/analyze`), but preferred for graded attempts.
 1. **Auth** — now enforced (see §1). Was open.
 2. **`alerts` in `/analyze`** — pedagogical-safety flags. Types:
    `passive_dependency`, `false_mastery`, `re_emergence_error`,
-   `cognitive_overload`, `fixed_mindset`. RAYA should react (see §4).
+   `cognitive_overload`, `fixed_mindset`, `inconsistency_high`,
+   `ood_distribution`. RAYA should react (see §4).
 3. **`/ready`** — new deep-health probe. Point a deeper connectivity check at it
    (the current `/api/kernel/health` only tests liveness).
 4. **Input limits** — `conversation_history` ≤ 200 messages, `content` ≤ 8000
@@ -108,6 +124,11 @@ also derives updates from `/analyze`), but preferred for graded attempts.
 | `cognitive_overload` | Frequent errors mid-solving | Reduce task complexity; worked examples |
 | `fixed_mindset` | Low M, quick give-ups | Mindset intervention (process feedback) BEFORE any retry |
 | `re_emergence_error` | Simple KC ok → complex KC fails | Decompose the KC |
+| `inconsistency_high` | Mastery estimate oscillates instead of settling | Treat the KC's K as unreliable: re-establish with a clean, unassisted check before sequencing on it |
+| `ood_distribution` | The student doesn't match the population the parameters were calibrated on | Don't harden decisions on K here; `direction: below_population` in the details is the silent-failure case and warrants a human look |
+
+The last two read beyond a single conversation (trajectory history, population
+baselines), so they surface on students with some history rather than on turn one.
 
 ---
 

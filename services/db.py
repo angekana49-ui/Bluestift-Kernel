@@ -168,6 +168,27 @@ def log_trajectory(client, user_id: str, concept_id: str, k_raw: float, k_effect
         pass
 
 
+def load_recent_trajectories(client, user_id: str, limit: int = 400) -> list[dict]:
+    """Recent mastery snapshots for one student, across every KC.
+
+    One query for the whole user rather than one per KC: /analyze touches a
+    handful of KCs and the caller groups the rows in memory. Ordered oldest
+    first so a series can be read as-is; the limit caps a long history.
+    """
+    try:
+        res = (
+            _kernel(client, "learning_trajectories")
+            .select("concept_id, k_raw, snapshot_at")
+            .eq("user_id", user_id)
+            .order("snapshot_at", desc=False)
+            .limit(limit)
+            .execute()
+        )
+        return res.data or []
+    except Exception:  # noqa: BLE001 - history is an enrichment, never a blocker
+        return []
+
+
 def upsert_mindset(client, user_id: str, m_score: float, detected: str) -> None:
     _kernel(client, "student_mindset_state").upsert(
         {
@@ -259,20 +280,26 @@ def check_db_access(client) -> dict:
 
 def log_alert(client, user_id: str, alert: dict, concept_id: str | None = None) -> None:
     """Persist a pedagogical-safety alert to kernel_monitoring (best-effort)."""
+    details = alert.get("alert_details", {}) or {}
+    row = {
+        "level": "alert",
+        "event": alert["alert_type"],
+        "user_id": user_id,
+        "concept_id": concept_id,
+        "alert_type": alert["alert_type"],
+        "alert_severity": alert["alert_severity"],
+        "alert_details": details,
+        "resolved": False,
+        "created_at": _now_iso(),
+    }
+    # Stability metrics get their own columns (migration 008) so a dashboard can
+    # filter and chart them without digging through the details JSON.
+    for column in ("inconsistency_rate", "volatility_score", "interactions_count"):
+        if details.get(column) is not None:
+            row[column] = details[column]
+
     try:
-        _kernel(client, "kernel_monitoring").insert(
-            {
-                "level": "alert",
-                "event": alert["alert_type"],
-                "user_id": user_id,
-                "concept_id": concept_id,
-                "alert_type": alert["alert_type"],
-                "alert_severity": alert["alert_severity"],
-                "alert_details": alert.get("alert_details", {}),
-                "resolved": False,
-                "created_at": _now_iso(),
-            }
-        ).execute()
+        _kernel(client, "kernel_monitoring").insert(row).execute()
     except Exception:  # noqa: BLE001 - monitoring must never break a flow
         pass
 

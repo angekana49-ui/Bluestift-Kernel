@@ -30,6 +30,7 @@ class _Query:
         self._on_conflict = None
         self._limit = None
         self._count = None
+        self._order = None
 
     # --- terminal-ish builders ------------------------------------------- #
     def select(self, *_args, count=None):
@@ -66,6 +67,10 @@ class _Query:
         self._limit = n
         return self
 
+    def order(self, col, desc=False):
+        self._order = (col, desc)
+        return self
+
     # --- helpers --------------------------------------------------------- #
     def _matches(self, row) -> bool:
         for col, value, kind in self._filters:
@@ -86,6 +91,11 @@ class _Query:
     def execute(self) -> _Result:
         if self._op == "select":
             rows = [r for r in self._rows if self._matches(r)]
+            if self._order is not None:
+                col, desc = self._order
+                # Sort before the limit, as PostgREST does — a limit applied to
+                # unordered rows would silently return the wrong window.
+                rows = sorted(rows, key=lambda r: (r.get(col) is None, r.get(col)), reverse=desc)
             if self._limit is not None:
                 rows = rows[: self._limit]
             return _Result(data=[dict(r) for r in rows], count=len(rows))
