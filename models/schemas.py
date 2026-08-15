@@ -55,6 +55,11 @@ class AnalyzeRequest(BaseModel):
     subject: str = Field(default="MATH", max_length=64)
     level: str = Field(default="unknown", max_length=64)
     trigger: str = Field(default="post_conversation", max_length=64)
+    # Diagnose-only mode. A caller that already sent its graded attempts through
+    # /update_concept_state must set this to False: the same evidence committed
+    # twice would count twice in BKT and inflate mastery. The diagnosis (root
+    # gap, path, alerts) is returned either way.
+    commit_state: bool = True
 
 
 class MasteryEntry(BaseModel):

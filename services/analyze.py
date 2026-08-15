@@ -162,6 +162,7 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
     subject = payload.get("subject", "MATH")
     level = payload.get("level", "unknown")
     conversation = payload["conversation_history"]
+    commit_state = payload.get("commit_state", True)
 
     # 1. LLM extraction of mentioned KCs + attempt evaluations. The existing KC
     #    vocabulary (across ALL subjects) is fed to the prompt to curb label drift,
@@ -218,7 +219,7 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
         # Selective-update gate: commit a BKT update only on a strong signal —
         # the first contact (bootstrap), 3+ attempts this session, a large
         # partial-credit shift, or an anomaly. Avoids overreacting to noise.
-        if attempt and _should_commit(attempt, state, attempt_counts.get(label, 1)):
+        if attempt and commit_state and _should_commit(attempt, state, attempt_counts.get(label, 1)):
             pc = attempt.get("partial_credit")
             if attempt.get("is_assisted"):
                 pc = min(pc if pc is not None else 0.9, 0.9)

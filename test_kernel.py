@@ -440,6 +440,17 @@ async def test_analyze_pipeline_end_to_end(fake_supabase, monkeypatch):
     # The request was logged.
     assert len(fake_supabase.tables["kernel.kernel_requests"]) == 1
     assert len(fake_supabase.tables["kernel.kernel_outputs"]) == 1
+    # Default mode commits the attempts it extracted.
+    assert len(fake_supabase.tables["kernel.student_concept_state"]) == 2
+
+    # Diagnose-only: same diagnosis, no state written. A caller that already sent
+    # its graded attempts to /update_concept_state uses this so the evidence
+    # isn't counted twice.
+    fake_supabase.tables["kernel.student_concept_state"].clear()
+    resp2 = client.post("/analyze", json={**payload, "commit_state": False})
+    assert resp2.status_code == 200, resp2.text
+    assert resp2.json()["root_gap"] == "fonctions_affines"
+    assert fake_supabase.tables["kernel.student_concept_state"] == []
 
 
 def test_load_profile(fake_supabase, monkeypatch):
