@@ -9,7 +9,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 # --------------------------------------------------------------------------- #
@@ -112,17 +112,40 @@ class LoadProfileResponse(BaseModel):
 # /update_concept_state
 # --------------------------------------------------------------------------- #
 class UpdateConceptStateRequest(BaseModel):
+    """A graded attempt on one KC.
+
+    The caller identifies the KC either by `concept_id` (a `kernel.concept_nodes`
+    UUID it already holds) or by `concept_label` — a plain concept name, which the
+    Kernel canonicalizes and creates on the fly if unknown, exactly as `/analyze`
+    does. Callers like RAYA grade a question long before they know a KC's UUID, so
+    the label path is the normal one; they can cache the `concept_id` the response
+    returns and use it directly next time.
+    """
+
     user_id: str
-    concept_id: str
+    concept_id: Optional[str] = None
+    concept_label: Optional[str] = Field(default=None, max_length=128)
+    subject: str = Field(default="MATH", max_length=64)
+    level: str = Field(default="unknown", max_length=64)
     partial_credit_score: float = Field(..., ge=0.0, le=1.0)
     is_assisted: bool = False
     response_time_ms: Optional[int] = Field(default=None, ge=0)
     blocage_type: BlocageType = BlocageType.none
 
+    @model_validator(mode="after")
+    def _require_a_concept(self) -> "UpdateConceptStateRequest":
+        if not self.concept_id and not (self.concept_label or "").strip():
+            raise ValueError("either concept_id or concept_label is required")
+        return self
+
 
 class UpdateConceptStateResponse(BaseModel):
     user_id: str
     concept_id: str
+    # The canonical label of the KC that was updated. Worth returning even when
+    # the caller passed a concept_id: label canonicalization means what it sent
+    # ("Dérivées") and what the Kernel stored ("derivees") can differ.
+    label: str = ""
     k_raw: float
     k_effective: float
     p_score: float

@@ -474,6 +474,94 @@ def test_load_profile(fake_supabase, monkeypatch):
     assert cs["k_effective"] <= cs["k_raw"]  # decay applied
 
 
+def test_update_concept_state_by_id(fake_supabase, monkeypatch):
+    fake_supabase.seed(
+        "kernel.concept_nodes",
+        [{"id": "a", "label": "fractions", "subject": "MATH", "type_kc": "procedural"}],
+    )
+    monkeypatch.setattr(db_module, "get_client", lambda: fake_supabase)
+
+    client = TestClient(main.app)
+    resp = client.post(
+        "/update_concept_state",
+        json={"user_id": "u1", "concept_id": "a", "partial_credit_score": 0.9},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["concept_id"] == "a"
+    assert body["label"] == "fractions"   # canonical label comes back
+    assert body["updated"] is True
+
+    state = fake_supabase.tables["kernel.student_concept_state"][0]
+    assert state["user_id"] == "u1" and state["concept_id"] == "a"
+    assert state["interactions_on_kc"] == 1
+
+
+def test_update_concept_state_resolves_a_label(fake_supabase, monkeypatch):
+    """A caller that only knows the concept's name still gets a graded update."""
+    fake_supabase.seed(
+        "kernel.concept_nodes",
+        [{"id": "a", "label": "fractions", "subject": "MATH", "type_kc": "procedural"}],
+    )
+    monkeypatch.setattr(db_module, "get_client", lambda: fake_supabase)
+
+    client = TestClient(main.app)
+    # "Fractions" canonicalizes onto the existing `fractions` node — no duplicate.
+    resp = client.post(
+        "/update_concept_state",
+        json={
+            "user_id": "u1",
+            "concept_label": "Fractions",
+            "subject": "MATH",
+            "partial_credit_score": 0.2,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["concept_id"] == "a"
+    assert body["label"] == "fractions"
+    assert len(fake_supabase.tables["kernel.concept_nodes"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_update_concept_state_creates_an_unknown_label(fake_supabase, monkeypatch):
+    """An unseen concept is created on the fly, like /analyze does."""
+    async def fake_llm_call(prompt, max_tokens=1000):
+        return (
+            json.dumps(
+                {
+                    "type_kc": "conceptual",
+                    "lambda_decay": 0.02,
+                    "description": "le theoreme de Pythagore",
+                    "prerequisites": [],
+                    "tau": 0.5,
+                }
+            ),
+            "mock-model",
+        )
+
+    monkeypatch.setattr(kc_registry, "llm_call", fake_llm_call)
+    monkeypatch.setattr(db_module, "get_client", lambda: fake_supabase)
+
+    client = TestClient(main.app)
+    resp = client.post(
+        "/update_concept_state",
+        json={"user_id": "u1", "concept_label": "theoreme_de_pythagore", "partial_credit_score": 0.8},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["label"] == "theoreme_de_pythagore"
+    assert len(fake_supabase.tables["kernel.concept_nodes"]) == 1
+
+
+def test_update_concept_state_needs_a_concept(fake_supabase, monkeypatch):
+    monkeypatch.setattr(db_module, "get_client", lambda: fake_supabase)
+    client = TestClient(main.app)
+    resp = client.post(
+        "/update_concept_state", json={"user_id": "u1", "partial_credit_score": 0.5}
+    )
+    assert resp.status_code == 422  # neither concept_id nor concept_label
+
+
 def test_seed_kcs(fake_supabase, monkeypatch):
     monkeypatch.setattr(db_module, "get_client", lambda: fake_supabase)
     client = TestClient(main.app)

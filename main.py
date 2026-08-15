@@ -42,6 +42,7 @@ from models.schemas import (  # noqa: E402
 from services import analyze as analyze_pipeline  # noqa: E402
 from services import db  # noqa: E402
 from services.analyze import _persistence, _slip_estimate, _velocity  # noqa: E402
+from services.kc_registry import get_or_create_kc  # noqa: E402
 
 KERNEL_VERSION = os.getenv("KERNEL_VERSION", "1.0.0")
 
@@ -220,14 +221,25 @@ async def update_concept_state(
 ) -> UpdateConceptStateResponse:
     client = db.get_client()
 
-    node = next(
-        (n for n in db.load_concept_nodes(client) if n["id"] == req.concept_id),
-        None,
-    )
-    if node is None:
-        raise HTTPException(status_code=404, detail="concept_id not found")
+    # Resolve the KC: by UUID when the caller holds one, otherwise by label —
+    # canonicalized and created on the fly, the same path /analyze takes.
+    if req.concept_id:
+        node = next(
+            (n for n in db.load_concept_nodes(client) if n["id"] == req.concept_id),
+            None,
+        )
+        if node is None:
+            raise HTTPException(status_code=404, detail="concept_id not found")
+    else:
+        node = await get_or_create_kc(
+            label=req.concept_label,
+            subject=req.subject,
+            level=req.level,
+            supabase_client=client,
+        )
+    concept_id = node["id"]
 
-    state = db.load_student_concept_state(client, req.user_id, req.concept_id)
+    state = db.load_student_concept_state(client, req.user_id, concept_id)
     params = bkt.get_bkt_params(node)
     k_raw_prev = (state.get("mastery_score_raw") if state else None) or params["p_init"]
 
@@ -255,7 +267,7 @@ async def update_concept_state(
         client,
         {
             "user_id": req.user_id,
-            "concept_id": req.concept_id,
+            "concept_id": concept_id,
             "mastery_score_raw": round(k_raw, 4),
             "mastery_score_effective": round(k_raw, 4),
             "v_score": v_score,
@@ -267,7 +279,7 @@ async def update_concept_state(
             "last_strong_signal_at": now,
         },
     )
-    db.log_trajectory(client, req.user_id, req.concept_id, k_raw, k_raw)
+    db.log_trajectory(client, req.user_id, concept_id, k_raw, k_raw)
 
     k_eff = forgetting.compute_effective_mastery(
         k_raw, node.get("type_kc", "conceptual"), now,
@@ -276,11 +288,12 @@ async def update_concept_state(
     status = bkt.classify_status(k_eff, params["p_slip"], new_avg)
 
     # Fire-and-forget empirical recalibration for this KC in the background.
-    background.add_task(_recalibrate_kc, req.concept_id)
+    background.add_task(_recalibrate_kc, concept_id)
 
     return UpdateConceptStateResponse(
         user_id=req.user_id,
-        concept_id=req.concept_id,
+        concept_id=concept_id,
+        label=node.get("label", ""),
         k_raw=round(k_raw, 4),
         k_effective=round(k_eff, 4),
         p_score=p_score,
