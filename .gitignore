@@ -7,12 +7,11 @@ venv/
 env/
 .env
 .env.local
+.env.example
 *.log
 .DS_Store
 .idea/
 .vscode/
-# .env.example is deliberately NOT ignored: it holds no secrets and is the only
-# tracked record of what a deployment needs. The README's setup step copies it.
 
 # Local corporate-proxy CA bundle (machine-specific, not for the repo)
 .ca-bundle.pem

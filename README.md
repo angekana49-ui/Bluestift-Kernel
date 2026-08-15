@@ -74,12 +74,11 @@ Each KC, per student, carries a four-dimensional state (Luckin / corpus §1.2):
 │   ├── build_graph.py       # CLI: distill a KC graph from the LLMs
 │   ├── build_bridges.py     # CLI: generate cross-subject prerequisite bridges
 │   └── apply_migrations.py  # CLI: apply migrations via the Management API
-├── migrations/              # 9 numbered Supabase SQL migrations
+├── migrations/              # 10 numbered Supabase SQL migrations
 ├── conftest.py              # In-memory fake Supabase for tests
-├── test_kernel.py           # 31 tests
+├── test_kernel.py           # 51 tests
 ├── requirements.txt
-├── Procfile / railway.toml / render.yaml
-└── .env.example
+└── Procfile / railway.toml / render.yaml
 ```
 
 ---
@@ -133,11 +132,22 @@ source .venv/Scripts/activate     # Windows (Git Bash)
 # source .venv/bin/activate         # macOS / Linux
 pip install -r requirements.txt
 
-cp .env.example .env
-#   fill in SUPABASE_URL, SUPABASE_SERVICE_KEY, GROQ_API_KEY, GEMINI_API_KEY
-
 uvicorn main:app --reload --port 8000
 ```
+
+Create a `.env` (never committed — every env file is gitignored, including
+examples) with:
+
+| Variable | | |
+|---|---|---|
+| `SUPABASE_URL` | required | `https://<project-ref>.supabase.co` |
+| `SUPABASE_SERVICE_KEY` | required | the **service_role** key, never the anon key |
+| `GROQ_API_KEY` | required | primary LLM |
+| `GEMINI_API_KEY` | required | fallback LLM — set both in production, or one rate limit takes `/analyze` down |
+| `KERNEL_API_SECRET` | prod | shared secret for the 🔒 routes; must match the RAYA app's. Empty = auth disabled (local only) |
+| `KERNEL_VERSION` | optional | reported by `/health`; defaults to `1.0.0` |
+| `CORS_ORIGINS` | optional | comma-separated; defaults to the RAYA + schools domains and `localhost:3000` |
+| `SUPABASE_ACCESS_TOKEN` | migrations only | personal token (`sbp_...`) for `scripts/apply_migrations.py`; not needed by the running service |
 
 Open http://localhost:8000/health → `{"status":"ok", ...}`.
 
@@ -240,8 +250,8 @@ school curriculum layers, graph-builder validation, `get_or_create_kc`, and the
 
 ### Railway (primary)
 
-`railway.toml` (NIXPACKS, health check `/health`). Set the env vars from
-`.env.example`. Deployed via:
+`railway.toml` (NIXPACKS, health check `/health`). Set the env vars from the
+table above in the Railway dashboard — not from a file. Deployed via:
 
 ```bash
 railway up --detach --service bluestift-kernel
