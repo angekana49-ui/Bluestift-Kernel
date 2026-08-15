@@ -4,15 +4,31 @@
 # Run this after the Kernel has been left alone for a while, before trusting it
 # again. It checks liveness, deep DB access, and that auth is actually enforced.
 #
-#   KERNEL_API_SECRET=... scripts/check_prod.sh
+#   scripts/check_prod.sh                          # reads .env
 #   KERNEL_URL=https://staging... scripts/check_prod.sh
 #
-# Exit code is non-zero if any check fails, so CI or a cron can use it.
+# The secret is read from .env (gitignored, where it already lives) unless it is
+# already exported. Exit code is non-zero if any check fails, so CI or a cron can
+# use it — in CI, export KERNEL_API_SECRET instead of shipping a .env.
 
 set -uo pipefail
 
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Pull KERNEL_API_SECRET / KERNEL_URL from .env without sourcing the file: it is
+# a config file, not a script, and may legitimately contain characters that
+# would run as code. Only these two keys are read, and only if not already set.
+read_env() {
+  [ -f "$ROOT/.env" ] || return 0
+  local value
+  value="$(grep -E "^[[:space:]]*$1=" "$ROOT/.env" | tail -1 | cut -d= -f2- | sed 's/^["'\'']//; s/["'\'']$//')"
+  printf '%s' "$value"
+}
+
+KERNEL_API_SECRET="${KERNEL_API_SECRET:-$(read_env KERNEL_API_SECRET)}"
+KERNEL_URL="${KERNEL_URL:-$(read_env KERNEL_URL)}"
 KERNEL_URL="${KERNEL_URL:-https://bluestift-kernel-production.up.railway.app}"
-SECRET="${KERNEL_API_SECRET:-}"
+SECRET="$KERNEL_API_SECRET"
 FAILED=0
 
 say()  { printf '\n\033[1m%s\033[0m\n' "$1"; }
@@ -57,7 +73,7 @@ fi
 
 say "4. The secret this shell holds is the right one"
 if [ -z "$SECRET" ]; then
-  printf '  \033[33mskip\033[0m  KERNEL_API_SECRET not exported here; cannot check.\n'
+  printf '  \033[33mskip\033[0m  no KERNEL_API_SECRET in the environment or .env; cannot check.\n'
 else
   AUTHED="$(code_of -X POST "$KERNEL_URL/load_profile" \
     -H "authorization: Bearer $SECRET" -H 'content-type: application/json' \
