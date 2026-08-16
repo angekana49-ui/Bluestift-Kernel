@@ -1,15 +1,17 @@
+# Runtime dependencies only — this file is what the deployed image installs.
+# Test tooling lives in requirements-dev.txt so it never ships to production.
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
 pydantic==2.10.4
 networkx==3.4.2
 groq==0.13.1
-google-generativeai==0.8.3
 supabase==2.11.0
 PyJWT==2.13.0        # verify Supabase user tokens (scoped auth); also a supabase dep
 python-dotenv==1.0.1
-httpx==0.28.1
+httpx==0.28.1        # Groq's transport, and our direct Gemini REST calls
 truststore==0.10.4   # use the OS trust store for TLS (corporate proxy / Windows)
 
-# Dev / test
-pytest==8.3.4
-pytest-asyncio==0.25.0
+# Deliberately NOT here: google-generativeai. It was only ever used with
+# transport="rest", so it contributed grpc, protobuf and google-api-python-client
+# (~136 MB on disk, ~32 MB resident) for an HTTP call httpx already makes.
+# See services/llm.py::_gemini_generate.

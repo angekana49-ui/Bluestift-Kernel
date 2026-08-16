@@ -9,6 +9,7 @@ Run: pytest -q
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timedelta, timezone
 
@@ -23,6 +24,7 @@ from services import analyze as analyze_pipeline
 from services import db as db_module
 from services import graph_builder
 from services import kc_registry
+from services import llm
 
 
 # --------------------------------------------------------------------------- #
@@ -352,6 +354,113 @@ def test_group_trajectories_keeps_order_per_concept():
         {"concept_id": "a", "k_raw": None},  # skipped, not a data point
     ]
     assert analyze_pipeline._group_trajectories(rows) == {"a": [0.1, 0.4], "b": [0.7]}
+
+
+# --------------------------------------------------------------------------- #
+# LLM chain — Gemini over plain REST (no SDK)
+# --------------------------------------------------------------------------- #
+class _FakeResponse:
+    def __init__(self, payload, status=200):
+        self._payload = payload
+        self.status_code = status
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+
+class _FakeAsyncClient:
+    """Minimal httpx.AsyncClient stand-in that records the request."""
+
+    calls: list[dict] = []
+    response = _FakeResponse({})
+
+    def __init__(self, *_args, **_kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc):
+        return False
+
+    async def post(self, url, headers=None, json=None):
+        type(self).calls.append({"url": url, "headers": headers, "json": json})
+        return type(self).response
+
+
+@pytest.fixture
+def fake_httpx(monkeypatch):
+    import httpx
+
+    _FakeAsyncClient.calls = []
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-key")
+    return _FakeAsyncClient
+
+
+@pytest.mark.asyncio
+async def test_gemini_rest_call_shape(fake_httpx):
+    fake_httpx.response = _FakeResponse(
+        {"candidates": [{"content": {"parts": [{"text": "une "}, {"text": "reponse"}]}}]}
+    )
+    text = await llm.call_gemini("explique les derivees", max_tokens=500, temperature=0.3)
+
+    # Parts are concatenated, like the SDK's `.text` did.
+    assert text == "une reponse"
+    call = fake_httpx.calls[0]
+    assert call["url"].endswith(f"/models/{llm.GEMINI_MODEL}:generateContent")
+    # The key goes in the header, never the query string (it would land in logs).
+    assert call["headers"]["x-goog-api-key"] == "gemini-key"
+    assert "gemini-key" not in call["url"]
+    assert call["json"]["contents"][0]["parts"][0]["text"] == "explique les derivees"
+    assert call["json"]["generationConfig"] == {"maxOutputTokens": 500, "temperature": 0.3}
+
+
+@pytest.mark.asyncio
+async def test_gemini_blocked_response_raises(fake_httpx):
+    """A safety-blocked answer has no parts: raise so the caller's fallback sees it."""
+    fake_httpx.response = _FakeResponse({"candidates": [{"finishReason": "SAFETY"}]})
+    with pytest.raises(RuntimeError, match="SAFETY"):
+        await llm.call_gemini("...")
+
+    fake_httpx.response = _FakeResponse({"candidates": []})
+    with pytest.raises(RuntimeError, match="no candidates"):
+        await llm.call_gemini("...")
+
+
+@pytest.mark.asyncio
+async def test_llm_chain_falls_through_groq_to_gemini(fake_httpx, monkeypatch):
+    def groq_down(*_args, **_kwargs):  # _get_groq is sync: raise like a dead client
+        raise RuntimeError("groq 429")
+
+    real_sleep = asyncio.sleep  # capture before patching, or the lambda recurses
+    monkeypatch.setattr(llm, "_get_groq", groq_down)
+    monkeypatch.setattr(llm.asyncio, "sleep", lambda *_: real_sleep(0))  # no real backoff
+    fake_httpx.response = _FakeResponse(
+        {"candidates": [{"content": {"parts": [{"text": "reponse de secours"}]}}]}
+    )
+
+    text, model = await llm.llm_call("prompt")
+    assert text == "reponse de secours"
+    assert model == llm.GEMINI_MODEL
+
+
+@pytest.mark.asyncio
+async def test_llm_chain_raises_only_when_both_fail(fake_httpx, monkeypatch):
+    def groq_down(*_args, **_kwargs):  # _get_groq is sync: raise like a dead client
+        raise RuntimeError("groq 429")
+
+    real_sleep = asyncio.sleep  # capture before patching, or the lambda recurses
+    monkeypatch.setattr(llm, "_get_groq", groq_down)
+    monkeypatch.setattr(llm.asyncio, "sleep", lambda *_: real_sleep(0))
+    fake_httpx.response = _FakeResponse({}, status=500)
+
+    with pytest.raises(RuntimeError, match="All LLMs failed"):
+        await llm.llm_call("prompt")
 
 
 # --------------------------------------------------------------------------- #

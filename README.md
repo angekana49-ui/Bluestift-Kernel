@@ -63,7 +63,7 @@ Each KC, per student, carries a four-dimensional state (Luckin / corpus §1.2):
 │   ├── anomaly.py           # Pedagogical-safety anomaly detection
 │   └── curriculum.py        # School curriculum layers -> sequencing + objectives
 ├── services/
-│   ├── llm.py               # LLM chain: Groq primary -> Gemini fallback
+│   ├── llm.py               # LLM chain: Groq primary -> Gemini fallback (REST)
 │   ├── kc_registry.py       # get_or_create_kc() — dynamic KCs
 │   ├── db.py                # Supabase read/write (service_role)
 │   ├── analyze.py           # /analyze pipeline orchestration
@@ -76,8 +76,8 @@ Each KC, per student, carries a four-dimensional state (Luckin / corpus §1.2):
 │   └── apply_migrations.py  # CLI: apply migrations via the Management API
 ├── migrations/              # 10 numbered Supabase SQL migrations
 ├── conftest.py              # In-memory fake Supabase for tests
-├── test_kernel.py           # 51 tests
-├── requirements.txt
+├── test_kernel.py           # 60 tests
+├── requirements.txt / requirements-dev.txt
 └── Procfile / railway.toml / render.yaml
 ```
 
@@ -142,7 +142,7 @@ Requires **Python 3.11+** (3.12 pinned for deploy via `.python-version`).
 python -m venv .venv
 source .venv/Scripts/activate     # Windows (Git Bash)
 # source .venv/bin/activate         # macOS / Linux
-pip install -r requirements.txt
+pip install -r requirements.txt -r requirements-dev.txt
 
 uvicorn main:app --reload --port 8000
 ```
@@ -172,7 +172,7 @@ Open http://localhost:8000/health → `{"status":"ok", ...}`.
 ### LLM models
 
 - Primary (Groq): `openai/gpt-oss-120b`
-- Fallback (Gemini, REST transport): `gemini-3.1-flash-lite`
+- Fallback (Gemini, direct REST via httpx — no SDK): `gemini-3.1-flash-lite`
 
 The chain never crashes `/analyze`: Groq → Gemini, and only raises if both fail.
 
@@ -249,7 +249,7 @@ detector change needed; the convergence search crosses the bridge automatically.
 pytest -q
 ```
 
-51 tests. The suite mocks the LLM and uses an in-memory fake Supabase
+60 tests. The suite mocks the LLM and uses an in-memory fake Supabase
 (`conftest.py`), so **no network or real keys are required**. Coverage: BKT,
 forgetting, mindset, detector (convergence), calibration, the cognitive vector
 (V/P/slip), anomaly detectors (including temporal inconsistency and OOD),

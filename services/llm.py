@@ -28,8 +28,12 @@ except Exception:  # noqa: BLE001 - best effort; fall back to default CAs
 GROQ_MODEL = "openai/gpt-oss-120b"
 GEMINI_MODEL = "gemini-3.1-flash-lite"
 
+GEMINI_ENDPOINT = (
+    "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+)
+GEMINI_TIMEOUT = 60.0
+
 _groq_client = None
-_gemini_configured = False
 
 
 def _get_groq():
@@ -45,20 +49,53 @@ def _get_groq():
     return _groq_client
 
 
-def _ensure_gemini():
-    """Lazily configure the Gemini SDK."""
-    global _gemini_configured
-    if not _gemini_configured:
-        import google.generativeai as genai
+async def _gemini_generate(prompt: str, max_tokens: int, temperature: float) -> str:
+    """Call Gemini's REST API directly with httpx.
 
-        api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            raise RuntimeError("GEMINI_API_KEY is not set")
-        # REST transport (not grpc) so TLS goes through the stdlib ssl module,
-        # which truststore patches — grpc uses its own CA store and would fail
-        # behind a corporate TLS proxy.
-        genai.configure(api_key=api_key, transport="rest")
-        _gemini_configured = True
+    The `google-generativeai` SDK was only ever used with transport="rest", so it
+    contributed nothing but weight: it pulls grpc, protobuf and
+    google-api-python-client, which together cost ~136 MB on disk and ~32 MB of
+    resident memory — over half the Kernel's Python dependencies, for a code path
+    that never touched them. This is the same HTTP call the SDK was making.
+
+    Going through httpx also keeps every outbound call on the stdlib ssl module,
+    which `truststore` patches above — the reason the SDK was pinned to REST in
+    the first place.
+    """
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is not set")
+
+    import httpx
+
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "maxOutputTokens": max_tokens,
+            "temperature": temperature,
+        },
+    }
+    async with httpx.AsyncClient(timeout=GEMINI_TIMEOUT) as client:
+        response = await client.post(
+            GEMINI_ENDPOINT.format(model=GEMINI_MODEL),
+            headers={"x-goog-api-key": api_key, "content-type": "application/json"},
+            json=payload,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+    # Mirror the SDK's `.text`: concatenate the text parts of the first candidate.
+    # A response blocked by a safety filter has no parts at all, so this raises
+    # rather than silently returning "" — the caller's fallback should see it.
+    candidates = data.get("candidates") or []
+    if not candidates:
+        raise RuntimeError(f"Gemini returned no candidates: {str(data)[:200]}")
+    parts = (candidates[0].get("content") or {}).get("parts") or []
+    text = "".join(p.get("text", "") for p in parts)
+    if not text:
+        reason = candidates[0].get("finishReason", "unknown")
+        raise RuntimeError(f"Gemini returned no text (finishReason={reason})")
+    return text
 
 
 async def llm_call(prompt: str, max_tokens: int = 1000) -> tuple[str, str]:
@@ -92,13 +129,8 @@ async def llm_call(prompt: str, max_tokens: int = 1000) -> tuple[str, str]:
 
     # --- Fallback: Gemini ----------------------------------------------------
     try:
-        import google.generativeai as genai
-
-        _ensure_gemini()
-        model = genai.GenerativeModel(GEMINI_MODEL)
-        # Gemini SDK is sync; run it off the event loop.
-        response = await asyncio.to_thread(model.generate_content, prompt)
-        return response.text, GEMINI_MODEL
+        text = await _gemini_generate(prompt, max_tokens=max_tokens, temperature=0.1)
+        return text, GEMINI_MODEL
     except Exception as e:  # noqa: BLE001
         last_error = e
 
@@ -122,12 +154,7 @@ async def call_groq(prompt: str, max_tokens: int = 2000, temperature: float = 0.
 
 async def call_gemini(prompt: str, max_tokens: int = 2000, temperature: float = 0.2) -> str:
     """Call Gemini directly. Raises on failure (no fallback)."""
-    import google.generativeai as genai
-
-    _ensure_gemini()
-    model = genai.GenerativeModel(GEMINI_MODEL)
-    response = await asyncio.to_thread(model.generate_content, prompt)
-    return response.text
+    return await _gemini_generate(prompt, max_tokens=max_tokens, temperature=temperature)
 
 
 # Registry so the graph builder can iterate over available providers by name.
