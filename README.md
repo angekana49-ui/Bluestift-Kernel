@@ -94,9 +94,21 @@ Each KC, per student, carries a four-dimensional state (Luckin / corpus §1.2):
 | POST   | `/update_concept_state`  | 🔒   | Manual KC update on a strong signal (called by RAYA). |
 | POST   | `/seed_kcs`              | 🔒   | Seed starter Math KCs if the table is empty.       |
 
-🔒 = requires `KERNEL_API_SECRET` when set (via `Authorization: Bearer`,
-`X-Kernel-Secret`, or `X-API-Key`). Unset = open (dev). See [KERNEL_HANDOFF.md](KERNEL_HANDOFF.md)
-for the app-integration contract.
+🔒 = authenticated. Two tiers of caller:
+
+- **service** — presents `KERNEL_API_SECRET` (via `Authorization: Bearer`,
+  `X-Kernel-Secret`, or `X-API-Key`). A trusted backend acting for many
+  students: may touch any `user_id`, and is the only tier allowed to `/seed_kcs`.
+- **user** — presents a Supabase access token. Scoped to one student: the Kernel
+  checks the token's `sub` against the `user_id` in the body and returns **403**
+  for anyone else's. Requires `SUPABASE_JWT_SECRET`; without it this tier is
+  simply unavailable.
+
+Unrecognised or missing credentials → **401**. `KERNEL_API_SECRET` unset = open
+(dev only). This bounds *who may ask about whom*; it places no limit on what the
+Kernel can model — any student, any subject, KCs created on the fly.
+
+See [KERNEL_HANDOFF.md](KERNEL_HANDOFF.md) for the app-integration contract.
 
 Interactive docs at `/docs`.
 
@@ -144,7 +156,8 @@ examples) with:
 | `SUPABASE_SERVICE_KEY` | required | the **service_role** key, never the anon key |
 | `GROQ_API_KEY` | required | primary LLM |
 | `GEMINI_API_KEY` | required | fallback LLM — set both in production, or one rate limit takes `/analyze` down |
-| `KERNEL_API_SECRET` | prod | shared secret for the 🔒 routes; must match the RAYA app's. Empty = auth disabled (local only) |
+| `KERNEL_API_SECRET` | prod | service-tier secret for the 🔒 routes; must match the RAYA app's. Empty = auth disabled (local only) |
+| `SUPABASE_JWT_SECRET` | recommended | the Supabase project's JWT secret, enabling the user tier (per-student scoped tokens). Unset = only the service secret is accepted |
 | `KERNEL_VERSION` | optional | reported by `/health`; defaults to `1.0.0` |
 | `CORS_ORIGINS` | optional | comma-separated; defaults to the RAYA + schools domains and `localhost:3000` |
 | `SUPABASE_ACCESS_TOKEN` | migrations only | personal token (`sbp_...`) for `scripts/apply_migrations.py`; not needed by the running service |

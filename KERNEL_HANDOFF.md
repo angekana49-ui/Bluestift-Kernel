@@ -13,24 +13,45 @@
 - **Deep health:** `GET /ready` → `{ "read_ok", "write_ok", "status": "ok"|"degraded" }`
   returns **503** when the Kernel can't reach its DB schema (see §6). Open, no auth.
 
-### ⚠️ Auth is now REQUIRED
+### ⚠️ Auth: two tiers
+
 The protected routes (`/analyze`, `/load_profile`, `/update_concept_state`,
-`/seed_kcs`) now require a shared secret. Set the **same** value on both sides:
+`/seed_kcs`) require a credential. `/health` and `/ready` stay open.
+
+**Service tier — the shared secret.** Unchanged, and still what most calls use.
+Set the **same** value on both sides:
 
 - App `.env.local`: `KERNEL_API_SECRET=<secret>`
-- Kernel (Railway): `KERNEL_API_SECRET=<same secret>` (already set)
+- Kernel (Railway): `KERNEL_API_SECRET=<same secret>`
 
-The Kernel accepts the secret via **any** of these headers (use whichever the
-client already sends):
+Accepted via any of these headers, whichever the client already sends:
 ```
 Authorization: Bearer <secret>
 X-Kernel-Secret: <secret>
 X-API-Key: <secret>
 ```
-Missing/wrong secret → **401**. `/health` and `/ready` stay open.
 
-> **Action:** confirm `lib/kernel/client.ts` sends the secret in one of the above
-> headers, and that an "Analyze" call returns 200 (not 401).
+This secret can read and write **any** student's cognitive profile. It is the
+right credential for background work — a cache refresh, a fire-and-forget
+analysis after a chat turn — which has no live session to borrow from.
+
+**User tier — the student's own Supabase token.** Send the student's
+`access_token` as `Authorization: Bearer <token>` and the Kernel scopes the call
+to them: it checks the token's `sub` against the `user_id` in the body and
+returns **403** for anyone else's profile. `/seed_kcs` is service-only (403).
+
+Use it on any call that is about one student who is right there — the profile
+and analyze proxies. It means a leak of the service secret is not a skeleton key
+to every child's cognitive profile.
+
+> **Deployment order matters.** The Kernel only accepts user tokens once
+> `SUPABASE_JWT_SECRET` (the Supabase project's JWT secret) is set on Railway.
+> The app therefore gates this behind `KERNEL_USER_SCOPED_AUTH=1`, off by
+> default. Set the Kernel's variable **first**, then flip the app's — the other
+> order 401s every scoped call.
+
+Neither tier limits what the Kernel can model. Any student, any subject, any
+level, KCs created on the fly. This is only about who may ask about whom.
 
 ---
 

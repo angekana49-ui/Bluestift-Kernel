@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 
+import jwt
 import pytest
 from fastapi.testclient import TestClient
 
@@ -581,6 +582,121 @@ def test_auth_enforced_when_secret_set(client, fake_supabase, monkeypatch):
         {"Authorization": "Bearer s3cr3t"},
     ):
         assert client.post("/load_profile", json={"user_id": "u1"}, headers=headers).status_code == 200
+
+
+# Length matters: PyJWT warns below 32 bytes, and a real Supabase JWT secret
+# is far longer than that.
+JWT_SECRET = "test-jwt-secret-long-enough-for-hs256-0123456789"
+
+
+def _user_token(user_id: str, secret: str = JWT_SECRET, **overrides) -> str:
+    """Mint a Supabase-shaped access token for a student."""
+    claims = {
+        "sub": user_id,
+        "aud": "authenticated",
+        "exp": int((datetime.now(timezone.utc) + timedelta(hours=1)).timestamp()),
+        **overrides,
+    }
+    return jwt.encode(claims, secret, algorithm="HS256")
+
+
+def test_user_token_reaches_only_its_own_profile(client, fake_supabase, monkeypatch):
+    monkeypatch.setenv("KERNEL_API_SECRET", "s3cr3t")
+    monkeypatch.setenv("SUPABASE_JWT_SECRET", JWT_SECRET)
+    monkeypatch.setattr(db_module, "get_client", lambda: fake_supabase)
+
+    token = _user_token("student-a")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # Its own profile: allowed.
+    ok = client.post("/load_profile", json={"user_id": "student-a"}, headers=headers)
+    assert ok.status_code == 200
+
+    # Someone else's: refused, and 403 (authenticated, not authorised) rather
+    # than 401 — this is the skeleton-key case the tier exists to close.
+    denied = client.post("/load_profile", json={"user_id": "student-b"}, headers=headers)
+    assert denied.status_code == 403
+
+    # Same rule on the write routes.
+    assert client.post(
+        "/update_concept_state",
+        json={"user_id": "student-b", "concept_label": "fractions", "partial_credit_score": 0.5},
+        headers=headers,
+    ).status_code == 403
+    assert client.post(
+        "/analyze",
+        json={"user_id": "student-b", "conversation_history": [{"role": "user", "content": "hi"}]},
+        headers=headers,
+    ).status_code == 403
+
+
+def test_service_secret_still_acts_for_anyone(client, fake_supabase, monkeypatch):
+    monkeypatch.setenv("KERNEL_API_SECRET", "s3cr3t")
+    monkeypatch.setenv("SUPABASE_JWT_SECRET", JWT_SECRET)
+    monkeypatch.setattr(db_module, "get_client", lambda: fake_supabase)
+
+    # The app is a trusted backend acting for many students; unchanged.
+    for user_id in ("student-a", "student-b"):
+        resp = client.post(
+            "/load_profile", json={"user_id": user_id}, headers={"X-Kernel-Secret": "s3cr3t"}
+        )
+        assert resp.status_code == 200
+
+
+def test_bad_user_tokens_are_refused(client, fake_supabase, monkeypatch):
+    monkeypatch.setenv("KERNEL_API_SECRET", "s3cr3t")
+    monkeypatch.setenv("SUPABASE_JWT_SECRET", JWT_SECRET)
+    monkeypatch.setattr(db_module, "get_client", lambda: fake_supabase)
+
+    def post(token):
+        return client.post(
+            "/load_profile",
+            json={"user_id": "student-a"},
+            headers={"Authorization": f"Bearer {token}"},
+        ).status_code
+
+    # Signed with the wrong key — a forged token.
+    assert post(_user_token("student-a", secret="w" * 40)) == 401
+    # Expired.
+    expired = jwt.encode(
+        {"sub": "student-a", "aud": "authenticated",
+         "exp": int((datetime.now(timezone.utc) - timedelta(hours=1)).timestamp())},
+        JWT_SECRET, algorithm="HS256",
+    )
+    assert post(expired) == 401
+    # Wrong audience (e.g. a service token from another system).
+    assert post(_user_token("student-a", aud="something-else")) == 401
+    # Not a token at all.
+    assert post("garbage") == 401
+
+
+def test_user_token_cannot_seed_the_graph(client, fake_supabase, monkeypatch):
+    monkeypatch.setenv("KERNEL_API_SECRET", "s3cr3t")
+    monkeypatch.setenv("SUPABASE_JWT_SECRET", JWT_SECRET)
+    monkeypatch.setattr(db_module, "get_client", lambda: fake_supabase)
+
+    headers = {"Authorization": f"Bearer {_user_token('student-a')}"}
+    # Seeding rewrites the graph for everyone.
+    assert client.post("/seed_kcs", headers=headers).status_code == 403
+    assert client.post("/seed_kcs", headers={"X-Kernel-Secret": "s3cr3t"}).status_code == 200
+
+
+def test_user_tier_is_unavailable_without_the_jwt_secret(client, fake_supabase, monkeypatch):
+    """No SUPABASE_JWT_SECRET: the Kernel simply doesn't accept user tokens."""
+    monkeypatch.setenv("KERNEL_API_SECRET", "s3cr3t")
+    monkeypatch.delenv("SUPABASE_JWT_SECRET", raising=False)
+    monkeypatch.setattr(db_module, "get_client", lambda: fake_supabase)
+
+    resp = client.post(
+        "/load_profile",
+        json={"user_id": "student-a"},
+        headers={"Authorization": f"Bearer {_user_token('student-a')}"},
+    )
+    assert resp.status_code == 401
+    # The service tier is unaffected.
+    assert client.post(
+        "/load_profile", json={"user_id": "student-a"}, headers={"X-Kernel-Secret": "s3cr3t"}
+    ).status_code == 200
 
 
 @pytest.mark.asyncio

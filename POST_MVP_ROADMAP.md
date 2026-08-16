@@ -187,7 +187,11 @@ temporally stable, interpretable, works with ~10% of the training data.
 
 - **GitHub auto-deploy** — connect the repo in the Railway dashboard so pushes
   redeploy (current deploys are manual `railway up`).
-- **Auth** — JWT on the Kernel (deferred in v1; today it trusts the caller).
+- ~~**Auth** — JWT on the Kernel~~ — done. Two tiers: the service secret (a
+  trusted backend acting for anyone) and per-student Supabase tokens, verified
+  against the `user_id` in the body. What's left: HS256 only, so a project on
+  Supabase's asymmetric signing keys would need a JWKS fetch; and no rate
+  limiting or cost ceiling on `/analyze`, where each call is 2+ LLM calls.
 - **Monitoring/alerting dashboard** on top of `kernel_monitoring`.
 - **Offline-first** — sub-Saharan connectivity: deferred sync, state-conflict
   resolution (not addressed in the corpus; design needed).

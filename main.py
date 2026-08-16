@@ -17,8 +17,10 @@ import os
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
+import jwt
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -79,25 +81,104 @@ app.add_middleware(
 
 
 # --------------------------------------------------------------------------- #
-# Optional shared-secret auth
+# Auth — two tiers
 # --------------------------------------------------------------------------- #
-# If KERNEL_API_SECRET is set, protected routes require the caller to present it.
-# The secret is accepted via any common convention so it works with whatever the
-# client sends: `Authorization: Bearer <s>`, `X-Kernel-Secret: <s>`, `X-API-Key: <s>`.
-# When the env var is unset, auth is disabled (open) — backward compatible.
-async def require_auth(
+# The Kernel accepts two kinds of caller:
+#
+#   service — presents KERNEL_API_SECRET. A trusted backend (the RAYA app) acting
+#             on behalf of many students. May touch any user_id, and is the only
+#             tier allowed to seed the graph. Required for background work that
+#             outlives a student's request.
+#
+#   user    — presents a Supabase access token. Scoped to exactly one student:
+#             the Kernel checks the token's `sub` against the user_id in the body
+#             and refuses anything else (403).
+#
+# The point of the second tier is blast radius. The service secret is a skeleton
+# key to every student's cognitive profile — minors included, in a product whose
+# COPPA/GDPR/FERPA pages promise otherwise. Every call that already knows which
+# student it is about should carry that student's token instead, so the skeleton
+# key travels only where it is genuinely needed.
+#
+# This bounds *who may ask about whom*. It does not limit what the Kernel can
+# model: any student, any subject, any level, KCs created on the fly.
+#
+# When KERNEL_API_SECRET is unset, auth is disabled entirely and every caller is
+# treated as a service (local development) — unchanged from before.
+@dataclass(frozen=True)
+class Principal:
+    kind: str                  # "service" | "user"
+    user_id: str | None = None
+
+
+SERVICE = Principal("service")
+
+
+def _bearer(authorization: str | None) -> str | None:
+    if not authorization:
+        return None
+    if authorization.lower().startswith("bearer "):
+        return authorization[7:].strip()
+    return authorization.strip()
+
+
+def _verify_supabase_jwt(token: str) -> str | None:
+    """Return the student id in a valid Supabase access token, else None.
+
+    HS256 against SUPABASE_JWT_SECRET (the project's JWT secret). Projects using
+    asymmetric signing keys would need a JWKS fetch instead; unset the variable
+    and the user tier simply stays unavailable.
+    """
+    jwt_secret = os.getenv("SUPABASE_JWT_SECRET")
+    if not jwt_secret or token.count(".") != 2:
+        return None
+    try:
+        claims = jwt.decode(
+            token, jwt_secret, algorithms=["HS256"], audience="authenticated"
+        )
+    except Exception:  # noqa: BLE001 - expired, forged, wrong audience: all "not a user"
+        return None
+    sub = claims.get("sub")
+    return str(sub) if sub else None
+
+
+async def authenticate(
     authorization: str | None = Header(default=None),
     x_kernel_secret: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None),
-) -> None:
+) -> Principal:
+    """Resolve the caller. 401 when it presents nothing we recognise."""
     secret = os.getenv("KERNEL_API_SECRET")
+    bearer = _bearer(authorization)
+    # The secret is accepted via any common convention, so it works with whatever
+    # the client already sends.
+    provided = x_kernel_secret or x_api_key or bearer
+
     if not secret:
-        return  # auth disabled
-    provided = x_kernel_secret or x_api_key
-    if not provided and authorization:
-        provided = authorization[7:] if authorization.lower().startswith("bearer ") else authorization
-    if not provided or not hmac.compare_digest(provided, secret):
-        raise HTTPException(status_code=401, detail="Unauthorized")
+        return SERVICE  # auth disabled
+
+    # Service first: an exact match keeps the existing callers on their old path.
+    if provided and hmac.compare_digest(provided, secret):
+        return SERVICE
+
+    if bearer:
+        user_id = _verify_supabase_jwt(bearer)
+        if user_id:
+            return Principal("user", user_id)
+
+    raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def authorize_for(principal: Principal, user_id: str) -> None:
+    """A student's token may only ever reach that student's own profile."""
+    if principal.kind == "user" and principal.user_id != user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+
+def require_service(principal: Principal) -> None:
+    """Graph-wide operations are never a student's to perform."""
+    if principal.kind != "service":
+        raise HTTPException(status_code=403, detail="Forbidden")
 
 
 # --------------------------------------------------------------------------- #
@@ -128,8 +209,11 @@ async def ready() -> JSONResponse:
 # --------------------------------------------------------------------------- #
 # /analyze — main route
 # --------------------------------------------------------------------------- #
-@app.post("/analyze", response_model=AnalyzeResponse, dependencies=[Depends(require_auth)])
-async def analyze(req: AnalyzeRequest) -> AnalyzeResponse:
+@app.post("/analyze", response_model=AnalyzeResponse)
+async def analyze(
+    req: AnalyzeRequest, principal: Principal = Depends(authenticate)
+) -> AnalyzeResponse:
+    authorize_for(principal, req.user_id)
     request_id = str(uuid.uuid4())
     payload = req.model_dump(mode="json")
     client = db.get_client()
@@ -154,8 +238,11 @@ async def analyze(req: AnalyzeRequest) -> AnalyzeResponse:
 # --------------------------------------------------------------------------- #
 # /load_profile
 # --------------------------------------------------------------------------- #
-@app.post("/load_profile", response_model=LoadProfileResponse, dependencies=[Depends(require_auth)])
-async def load_profile(req: LoadProfileRequest) -> LoadProfileResponse:
+@app.post("/load_profile", response_model=LoadProfileResponse)
+async def load_profile(
+    req: LoadProfileRequest, principal: Principal = Depends(authenticate)
+) -> LoadProfileResponse:
+    authorize_for(principal, req.user_id)
     client = db.get_client()
 
     nodes = {n["id"]: n for n in db.load_concept_nodes(client)}
@@ -211,14 +298,13 @@ async def load_profile(req: LoadProfileRequest) -> LoadProfileResponse:
 # --------------------------------------------------------------------------- #
 # /update_concept_state — called by RAYA on a strong signal
 # --------------------------------------------------------------------------- #
-@app.post(
-    "/update_concept_state",
-    response_model=UpdateConceptStateResponse,
-    dependencies=[Depends(require_auth)],
-)
+@app.post("/update_concept_state", response_model=UpdateConceptStateResponse)
 async def update_concept_state(
-    req: UpdateConceptStateRequest, background: BackgroundTasks
+    req: UpdateConceptStateRequest,
+    background: BackgroundTasks,
+    principal: Principal = Depends(authenticate),
 ) -> UpdateConceptStateResponse:
+    authorize_for(principal, req.user_id)
     client = db.get_client()
 
     # Resolve the KC: by UUID when the caller holds one, otherwise by label —
@@ -321,8 +407,11 @@ def _recalibrate_kc(concept_id: str) -> None:
 # --------------------------------------------------------------------------- #
 # /seed_kcs
 # --------------------------------------------------------------------------- #
-@app.post("/seed_kcs", response_model=SeedResponse, dependencies=[Depends(require_auth)])
-async def seed_kcs() -> SeedResponse:
+@app.post("/seed_kcs", response_model=SeedResponse)
+async def seed_kcs(principal: Principal = Depends(authenticate)) -> SeedResponse:
+    # Seeding rewrites the shared graph for everyone — never a student's call.
+    require_service(principal)
+
     from seed.math_kcs import seed_math_kcs
 
     client = db.get_client()

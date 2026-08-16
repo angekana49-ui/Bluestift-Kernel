@@ -5,6 +5,7 @@ networkx==3.4.2
 groq==0.13.1
 google-generativeai==0.8.3
 supabase==2.11.0
+PyJWT==2.13.0        # verify Supabase user tokens (scoped auth); also a supabase dep
 python-dotenv==1.0.1
 httpx==0.28.1
 truststore==0.10.4   # use the OS trust store for TLS (corporate proxy / Windows)
