@@ -7,8 +7,9 @@ that turns learning interactions into **root-gap detection**. It is fully
 decoupled from every interface. RAYA (Next.js) calls it over HTTP — the Kernel
 knows nothing about React or client-side auth. It is autonomous.
 
-> **Status:** v1 — complete and deployed.
-> **Live:** https://bluestift-kernel-production.up.railway.app
+> **Status:** v1 complete. **Currently not deployed** — migrating hosts (see
+> [Deploy](#deploy)). The old Railway URL is dead; the graph and every student
+> state live in Supabase and are untouched.
 > See [POST_MVP_ROADMAP.md](POST_MVP_ROADMAP.md) for what comes next.
 
 ---
@@ -261,22 +262,30 @@ school curriculum layers, graph-builder validation, `get_or_create_kc`, and the
 
 ## Deploy
 
-### Railway (primary)
+### Render (primary)
 
-`railway.toml` (NIXPACKS, health check `/health`). Set the env vars from the
-table above in the Railway dashboard — not from a file. Deployed via:
+`render.yaml` defines the service. Connect the repo in the Render dashboard,
+pick this blueprint, then set the six `sync: false` secrets there — they are
+never committed.
 
-```bash
-railway up --detach --service bluestift-kernel
-```
+**Why a spin-down host.** The Kernel is called fire-and-forget, after a
+conversation, never in the chat's critical path; it does not need to be awake.
+Billing a container by the minute means paying for idle, which is what it spends
+almost all of its time doing. A free instance that sleeps and wakes on the next
+request fits the workload exactly, and the ~50s cold start costs no student
+anything. Pushing to the connected branch deploys — no manual CLI upload.
 
-Already live at https://bluestift-kernel-production.up.railway.app.
+### Railway (previous host)
 
-### Render (fallback)
+`railway.toml` (health check `/health`), deployed via
+`railway up --detach --service bluestift-kernel`.
 
-`render.yaml` defines the web service; set the secret env vars in the dashboard.
+Not in use. Railway bills an always-on container per minute; when the account's
+credit ran out it stopped the workload and removed the deployment, taking the
+service down silently. Kept here because the config still works if the account
+is ever on a plan that suits an always-on service.
 
-Both also work via the `Procfile`:
+Both hosts also work via the `Procfile`:
 
 ```
 web: uvicorn main:app --host 0.0.0.0 --port $PORT
