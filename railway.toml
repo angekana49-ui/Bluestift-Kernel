@@ -1,3 +1,19 @@
+# Railway deployment.
+#
+# Cost notes, because this service is billed per minute while it runs:
+#
+#   Serverless (app sleeping) is enabled in the dashboard, not here — Railway
+#   has no config key for it. It sleeps after 10 minutes with no OUTBOUND
+#   traffic, so nothing in this service may hold a connection open while idle:
+#   no database pooler, no realtime websocket, no telemetry. The Supabase client
+#   is HTTP-only and opens nothing at rest, which is what makes sleeping work.
+#   Do not add a background poller, and do not point an uptime monitor at
+#   /health — either would keep the container awake around the clock.
+#
+#   /analyze is rate-limited in the app (core/ratelimit.py): it costs two LLM
+#   calls and keeps the container busy, so a client stuck in a retry loop would
+#   otherwise burn both the credit balance and the LLM quota.
+
 [build]
 builder = "NIXPACKS"
 
@@ -5,4 +21,9 @@ builder = "NIXPACKS"
 startCommand = "uvicorn main:app --host 0.0.0.0 --port $PORT"
 healthcheckPath = "/health"
 healthcheckTimeout = 30
+
+# Restart a crashed container, but not forever: an unbootable deploy (a bad
+# env var, an unreachable database) would otherwise restart-loop indefinitely
+# and bill CPU the whole time for a service that can never serve a request.
 restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 5

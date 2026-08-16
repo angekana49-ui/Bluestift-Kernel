@@ -7,9 +7,10 @@ that turns learning interactions into **root-gap detection**. It is fully
 decoupled from every interface. RAYA (Next.js) calls it over HTTP — the Kernel
 knows nothing about React or client-side auth. It is autonomous.
 
-> **Status:** v1 complete. **Currently not deployed** — migrating hosts (see
-> [Deploy](#deploy)). The old Railway URL is dead; the graph and every student
-> state live in Supabase and are untouched.
+> **Status:** v1 complete. Hosted on Railway (Hobby) with Serverless enabled —
+> see [Deploy](#deploy) for the cost rules that keep it inside the plan's
+> included usage.
+> **Live:** https://bluestift-kernel-production.up.railway.app
 > See [POST_MVP_ROADMAP.md](POST_MVP_ROADMAP.md) for what comes next.
 
 ---
@@ -161,6 +162,8 @@ examples) with:
 | `SUPABASE_JWT_SECRET` | recommended | the Supabase project's JWT secret, enabling the user tier (per-student scoped tokens). Unset = only the service secret is accepted |
 | `KERNEL_VERSION` | optional | reported by `/health`; defaults to `1.0.0` |
 | `CORS_ORIGINS` | optional | comma-separated; defaults to the RAYA + schools domains and `localhost:3000` |
+| `ANALYZE_PER_USER_HOURLY` | optional | `/analyze` calls allowed per student per hour (default 30). Stops a client retry loop from burning credits and LLM quota |
+| `ANALYZE_GLOBAL_HOURLY` | optional | total `/analyze` calls per hour across everyone (default 300). The ceiling that catches a leaked service secret |
 | `SUPABASE_ACCESS_TOKEN` | migrations only | personal token (`sbp_...`) for `scripts/apply_migrations.py`; not needed by the running service |
 
 Open http://localhost:8000/health → `{"status":"ok", ...}`.
@@ -262,28 +265,41 @@ school curriculum layers, graph-builder validation, `get_or_create_kc`, and the
 
 ## Deploy
 
-### Render (primary)
+### Railway (primary)
 
-`render.yaml` defines the service. Connect the repo in the Render dashboard,
-pick this blueprint, then set the six `sync: false` secrets there — they are
-never committed.
+`railway.toml` (health check `/health`). Set the env vars from the table above
+in the Railway dashboard — not from a file. Deployed via:
 
-**Why a spin-down host.** The Kernel is called fire-and-forget, after a
-conversation, never in the chat's critical path; it does not need to be awake.
-Billing a container by the minute means paying for idle, which is what it spends
-almost all of its time doing. A free instance that sleeps and wakes on the next
-request fits the workload exactly, and the ~50s cold start costs no student
-anything. Pushing to the connected branch deploys — no manual CLI upload.
+```bash
+railway up --detach --service bluestift-kernel
+```
 
-### Railway (previous host)
+**Keeping it inside the plan.** Railway bills per minute while the container
+runs, so the service is built to spend as little time running as possible. The
+Kernel is called fire-and-forget after a conversation, never in the chat's
+critical path, so sleeping costs no student anything.
 
-`railway.toml` (health check `/health`), deployed via
-`railway up --detach --service bluestift-kernel`.
+- **Enable Serverless** on the service (dashboard — there is no config key for
+  it). Railway sleeps a service after 10 minutes with **no outbound traffic**.
+- **Nothing may hold a connection open at rest.** No database pooler, no
+  realtime websocket, no telemetry — any of them and the service never sleeps.
+  The Supabase client is HTTP-only and opens nothing when idle, which is what
+  makes this work. Verify before adding a dependency that keeps a socket.
+- **Never point an uptime monitor at `/health`.** A ping every few minutes keeps
+  the container awake around the clock and turns a ~$0.10/month service into a
+  ~$1/month one. `scripts/check_prod.sh` is for running by hand, not on a timer.
+- `/analyze` is rate-limited (see the env table): two LLM calls per request and
+  no ceiling was a way to burn both credits and LLM quota on a retry loop.
 
-Not in use. Railway bills an always-on container per minute; when the account's
-credit ran out it stopped the workload and removed the deployment, taking the
-service down silently. Kept here because the config still works if the account
-is ever on a plan that suits an always-on service.
+At ~57 MB resident, the service costs roughly $0.10/month asleep most of the day
+and under $1/month even if it never slept — inside the Hobby plan's included $5
+either way. It was the pre-slimming footprint, at ~100 MB, that could not fit the
+Free plan's $1 credit and got the deployment stopped.
+
+### Render (fallback)
+
+`render.yaml` is complete and current — blueprint, plan, region, and all six
+secrets declared. Usable as-is if Railway is ever the wrong answer.
 
 Both hosts also work via the `Procfile`:
 

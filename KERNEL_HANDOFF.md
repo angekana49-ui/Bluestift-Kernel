@@ -126,6 +126,14 @@ Identify the KC either way:
   `concept_id` and canonical `label`, so a caller can cache the id and skip
   resolution next time.
 
+> **`/analyze` is rate-limited.** Two LLM calls per request, on a host billed
+> by the minute, with no ceiling was a way to burn the credit balance and the
+> LLM quota at once. Limits: **30 calls per student per hour**, **300 per hour
+> overall** (both tunable). Over the limit → **429** with a `Retry-After`
+> header. Treat it as "come back later", never as a failure to retry
+> immediately — an immediate retry is what trips it. The fire-and-forget call
+> sites already swallow it harmlessly.
+
 > **Pairing it with `/analyze`:** send `commit_state: false` on the `/analyze`
 > call that follows graded updates. Otherwise the Kernel re-derives the same
 > attempts from the conversation and commits them *on top of* yours — the same

@@ -18,7 +18,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import main
-from core import anomaly, bkt, calibration, curriculum, detector, forgetting, mindset
+from core import anomaly, bkt, calibration, curriculum, detector, forgetting, mindset, ratelimit
 from core.graph import build_graph
 from services import analyze as analyze_pipeline
 from services import db as db_module
@@ -354,6 +354,97 @@ def test_group_trajectories_keeps_order_per_concept():
         {"concept_id": "a", "k_raw": None},  # skipped, not a data point
     ]
     assert analyze_pipeline._group_trajectories(rows) == {"a": [0.1, 0.4], "b": [0.7]}
+
+
+# --------------------------------------------------------------------------- #
+# Rate limiting — the cost guard on /analyze
+# --------------------------------------------------------------------------- #
+@pytest.fixture(autouse=True)
+def _clean_ratelimit():
+    ratelimit.reset()
+    yield
+    ratelimit.reset()
+
+
+def test_per_user_limit_stops_a_runaway_client(monkeypatch):
+    monkeypatch.setenv("ANALYZE_PER_USER_HOURLY", "3")
+    monkeypatch.setenv("ANALYZE_GLOBAL_HOURLY", "100")
+
+    for _ in range(3):
+        assert ratelimit.check_analyze("student-a")[0] is True
+
+    allowed, retry_after, scope = ratelimit.check_analyze("student-a")
+    assert allowed is False and scope == "user"
+    assert 0 < retry_after <= ratelimit.WINDOW_SECONDS + 1
+
+    # One student's loop must not lock everyone else out.
+    assert ratelimit.check_analyze("student-b")[0] is True
+
+
+def test_global_ceiling_catches_a_leaked_secret(monkeypatch):
+    monkeypatch.setenv("ANALYZE_PER_USER_HOURLY", "100")
+    monkeypatch.setenv("ANALYZE_GLOBAL_HOURLY", "3")
+
+    # Spread across different users, so only the global ceiling can catch it.
+    for i in range(3):
+        assert ratelimit.check_analyze(f"student-{i}")[0] is True
+
+    allowed, _retry, scope = ratelimit.check_analyze("student-99")
+    assert allowed is False and scope == "global"
+
+
+def test_a_rejected_call_consumes_no_budget(monkeypatch):
+    """A call refused per-user must not still count toward the global ceiling."""
+    monkeypatch.setenv("ANALYZE_PER_USER_HOURLY", "1")
+    monkeypatch.setenv("ANALYZE_GLOBAL_HOURLY", "10")
+
+    assert ratelimit.check_analyze("noisy")[0] is True
+    for _ in range(20):
+        assert ratelimit.check_analyze("noisy")[0] is False  # all rejected
+
+    # The global budget still has room for everyone else: 1 spent, not 21.
+    for i in range(9):
+        assert ratelimit.check_analyze(f"quiet-{i}")[0] is True
+
+
+def test_window_slides(monkeypatch):
+    monkeypatch.setenv("ANALYZE_PER_USER_HOURLY", "2")
+    monkeypatch.setenv("ANALYZE_GLOBAL_HOURLY", "100")
+    t0 = 1_000_000.0
+
+    assert ratelimit.check_analyze("s", now=t0)[0] is True
+    assert ratelimit.check_analyze("s", now=t0 + 10)[0] is True
+    assert ratelimit.check_analyze("s", now=t0 + 20)[0] is False
+    # Once the first events age out of the window, room returns.
+    assert ratelimit.check_analyze("s", now=t0 + ratelimit.WINDOW_SECONDS + 1)[0] is True
+
+
+def test_bad_limit_env_falls_back_to_the_default(monkeypatch):
+    monkeypatch.setenv("ANALYZE_PER_USER_HOURLY", "not-a-number")
+    monkeypatch.setenv("ANALYZE_GLOBAL_HOURLY", "-5")
+    # A typo in configuration must not disable the guard or block every call.
+    assert ratelimit._limit("ANALYZE_PER_USER_HOURLY", 30) == 30
+    assert ratelimit._limit("ANALYZE_GLOBAL_HOURLY", 300) == 300
+
+
+def test_analyze_route_returns_429_with_retry_after(fake_supabase, monkeypatch):
+    monkeypatch.setenv("ANALYZE_PER_USER_HOURLY", "1")
+    monkeypatch.setattr(db_module, "get_client", lambda: fake_supabase)
+
+    async def fake_llm_call(prompt, max_tokens=1000):
+        return (json.dumps({"kcs_mentioned": [], "attempts": [],
+                            "blocage_type": "none", "langue_interaction": "fr"}), "mock")
+
+    monkeypatch.setattr(analyze_pipeline, "llm_call", fake_llm_call)
+    client = TestClient(main.app)
+    payload = {"user_id": "u1", "conversation_history": [{"role": "user", "content": "salut"}]}
+
+    assert client.post("/analyze", json=payload).status_code == 200
+    blocked = client.post("/analyze", json=payload)
+    assert blocked.status_code == 429
+    assert int(blocked.headers["Retry-After"]) > 0
+    # A different student is unaffected.
+    assert client.post("/analyze", json={**payload, "user_id": "u2"}).status_code == 200
 
 
 # --------------------------------------------------------------------------- #

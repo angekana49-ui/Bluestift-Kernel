@@ -28,7 +28,7 @@ from fastapi.responses import JSONResponse
 
 load_dotenv()
 
-from core import bkt, forgetting  # noqa: E402
+from core import bkt, forgetting, ratelimit  # noqa: E402
 from core.calibration import compute_empirical_kc_params  # noqa: E402
 from core.mindset import classify_mindset  # noqa: E402
 from models.schemas import (  # noqa: E402
@@ -214,6 +214,25 @@ async def analyze(
     req: AnalyzeRequest, principal: Principal = Depends(authenticate)
 ) -> AnalyzeResponse:
     authorize_for(principal, req.user_id)
+
+    # /analyze is the expensive route: two LLM calls minimum, and it holds the
+    # container awake. Refuse past the budget rather than burn credits and LLM
+    # quota on a client stuck in a retry loop.
+    allowed, retry_after, scope = ratelimit.check_analyze(req.user_id)
+    if not allowed:
+        try:
+            db.log_monitoring(
+                db.get_client(), "warn", "analyze_rate_limited",
+                {"scope": scope, "user_id": req.user_id, "retry_after": retry_after},
+            )
+        except Exception:  # noqa: BLE001 - never let logging mask the 429
+            pass
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit reached ({scope}). Retry in {retry_after}s.",
+            headers={"Retry-After": str(retry_after)},
+        )
+
     request_id = str(uuid.uuid4())
     payload = req.model_dump(mode="json")
     client = db.get_client()
