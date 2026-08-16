@@ -8,6 +8,8 @@ Routes:
     POST /analyze
     POST /load_profile
     POST /update_concept_state
+    POST /load_alerts
+    POST /resolve_alert
     POST /seed_kcs
 """
 from __future__ import annotations
@@ -35,8 +37,12 @@ from models.schemas import (  # noqa: E402
     AnalyzeRequest,
     AnalyzeResponse,
     HealthResponse,
+    LoadAlertsRequest,
+    LoadAlertsResponse,
     LoadProfileRequest,
     LoadProfileResponse,
+    ResolveAlertRequest,
+    ResolveAlertResponse,
     SeedResponse,
     UpdateConceptStateRequest,
     UpdateConceptStateResponse,
@@ -421,6 +427,119 @@ def _recalibrate_kc(concept_id: str) -> None:
             db.log_monitoring(db.get_client(), "warn", "recalibration_failed", {"concept_id": concept_id, "error": str(e)})
         except Exception:
             pass
+
+
+# --------------------------------------------------------------------------- #
+# /load_alerts — the read side of the monitoring the Kernel already writes
+# --------------------------------------------------------------------------- #
+# The Kernel has been writing pedagogical-safety alerts to kernel_monitoring
+# since the anomaly layer landed, and nothing could read them back. Detecting
+# that a child has stopped trying and filing it where no adult will ever look is
+# not a safety feature.
+#
+# Two scopes, and the difference is not cosmetic:
+#
+#   user_id   — one student. A student's own token reaches their own alerts and
+#               nothing else, via the same authorize_for() as every other route.
+#
+#   school_id — every student of one school. Service-only, on purpose: the
+#               Kernel has no idea who teaches where. It cannot tell a teacher's
+#               token from a parent's from a student's, so it cannot decide who
+#               may read a class. The app owns that check — it knows its staff —
+#               and presents the service secret once it has made it. If the
+#               Kernel guessed here, one forged token would open a whole school.
+@app.post("/load_alerts", response_model=LoadAlertsResponse)
+async def load_alerts(
+    req: LoadAlertsRequest, principal: Principal = Depends(authenticate)
+) -> LoadAlertsResponse:
+    client = db.get_client()
+
+    if req.user_id:
+        authorize_for(principal, req.user_id)
+        scope, user_ids = "user", [req.user_id]
+    else:
+        require_service(principal)
+        scope = "school"
+        try:
+            user_ids = db.load_school_student_ids(client, req.school_id)
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(
+                status_code=503, detail=f"roster unavailable: {str(e)[:200]}"
+            ) from e
+
+    try:
+        rows = db.load_alerts(
+            client,
+            user_ids,
+            include_resolved=req.include_resolved,
+            severity=req.severity,
+            since=req.since.isoformat() if req.since else None,
+            limit=req.limit,
+        )
+    except Exception as e:  # noqa: BLE001 - never render a failed read as "all clear"
+        db.log_monitoring(client, "error", "alerts_read_failed", {"error": str(e)[:300]})
+        raise HTTPException(
+            status_code=503, detail=f"alerts unavailable: {str(e)[:200]}"
+        ) from e
+
+    # An alert stores a concept UUID; a dashboard needs the concept's name.
+    labels: dict[str, str] = {}
+    if any(r.get("concept_id") for r in rows):
+        labels = {n["id"]: n.get("label", "") for n in db.load_concept_nodes(client)}
+
+    alerts, by_type, by_severity = [], {}, {}
+    for row in rows:
+        alerts.append(
+            {**row, "concept_label": labels.get(row.get("concept_id") or "", "")}
+        )
+        a_type = row.get("alert_type") or "unknown"
+        a_sev = row.get("alert_severity") or "unknown"
+        by_type[a_type] = by_type.get(a_type, 0) + 1
+        by_severity[a_sev] = by_severity.get(a_sev, 0) + 1
+
+    return LoadAlertsResponse(
+        scope=scope,
+        user_id=req.user_id,
+        school_id=req.school_id,
+        students_in_scope=len(user_ids),
+        alerts=alerts,
+        counts_by_type=by_type,
+        counts_by_severity=by_severity,
+        truncated=len(rows) >= req.limit,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# /resolve_alert
+# --------------------------------------------------------------------------- #
+# Without this, `resolved` is a column nothing can ever set: the same alert
+# would sit at the top of the dashboard forever, and a list that never shrinks
+# is a list people stop reading. Service-only — acknowledging an alert is an
+# adult's act, and a student closing the alert raised about them is precisely
+# what the flag must not allow.
+@app.post("/resolve_alert", response_model=ResolveAlertResponse)
+async def resolve_alert(
+    req: ResolveAlertRequest, principal: Principal = Depends(authenticate)
+) -> ResolveAlertResponse:
+    require_service(principal)
+    client = db.get_client()
+
+    try:
+        row = db.set_alert_resolved(client, req.alert_id, req.resolved, req.resolved_by)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(
+            status_code=503, detail=f"alert update failed: {str(e)[:200]}"
+        ) from e
+
+    if row is None:
+        raise HTTPException(status_code=404, detail="alert not found")
+
+    return ResolveAlertResponse(
+        alert_id=req.alert_id,
+        resolved=bool(row.get("resolved")),
+        resolved_by=row.get("resolved_by"),
+        resolved_at=row.get("resolved_at"),
+    )
 
 
 # --------------------------------------------------------------------------- #

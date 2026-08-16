@@ -2,8 +2,9 @@
 
 The fake mirrors just enough of supabase-py's fluent query builder for the
 Kernel's data access: schema().table().select()/insert()/upsert()/update()
-with .eq()/.ilike()/.limit()/.execute(). It is deliberately small but faithful
-to the call shapes used in services/db.py and services/kc_registry.py.
+with .eq()/.ilike()/.in_()/.gte()/.order()/.limit()/.execute(). It is
+deliberately small but faithful to the call shapes used in services/db.py and
+services/kc_registry.py.
 """
 from __future__ import annotations
 
@@ -63,6 +64,14 @@ class _Query:
         self._filters.append((col, str(value).lower(), "ilike"))
         return self
 
+    def in_(self, col, values):
+        self._filters.append((col, list(values), "in"))
+        return self
+
+    def gte(self, col, value):
+        self._filters.append((col, value, "gte"))
+        return self
+
     def limit(self, n):
         self._limit = n
         return self
@@ -77,6 +86,13 @@ class _Query:
             cell = row.get(col)
             if kind == "ilike":
                 if str(cell).lower() != value:
+                    return False
+            elif kind == "in":
+                if cell not in value:
+                    return False
+            elif kind == "gte":
+                # Timestamps are compared as ISO strings, which sort chronologically.
+                if cell is None or str(cell) < str(value):
                     return False
             elif cell != value:
                 return False

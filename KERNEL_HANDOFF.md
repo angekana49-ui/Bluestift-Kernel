@@ -16,7 +16,8 @@
 ### ⚠️ Auth: two tiers
 
 The protected routes (`/analyze`, `/load_profile`, `/update_concept_state`,
-`/seed_kcs`) require a credential. `/health` and `/ready` stay open.
+`/load_alerts`, `/resolve_alert`, `/seed_kcs`) require a credential. `/health`
+and `/ready` stay open.
 
 **Service tier — the shared secret.** Unchanged, and still what most calls use.
 Set the **same** value on both sides:
@@ -38,7 +39,8 @@ analysis after a chat turn — which has no live session to borrow from.
 **User tier — the student's own Supabase token.** Send the student's
 `access_token` as `Authorization: Bearer <token>` and the Kernel scopes the call
 to them: it checks the token's `sub` against the `user_id` in the body and
-returns **403** for anyone else's profile. `/seed_kcs` is service-only (403).
+returns **403** for anyone else's profile. `/seed_kcs`, `/resolve_alert` and the
+school scope of `/load_alerts` are service-only (403).
 
 Use it on any call that is about one student who is right there — the profile
 and analyze proxies. It means a leak of the service secret is not a skeleton key
@@ -134,6 +136,60 @@ Identify the KC either way:
 > immediately — an immediate retry is what trips it. The fire-and-forget call
 > sites already swallow it harmlessly.
 
+### `POST /load_alerts` (new — the school dashboard's data source)
+
+The Kernel has been *writing* pedagogical-safety alerts all along; this is the
+first way to read them back. Exactly one scope per call:
+
+```json
+{ "user_id": "uuid" }              // one student — their own token works
+{ "school_id": "uuid" }            // every student of a school — service only
+```
+Optional: `include_resolved` (default false), `severity` (`low`/`medium`/`high`),
+`since` (ISO timestamp), `limit` (1–500, default 100).
+
+```json
+{
+  "scope": "school",
+  "school_id": "uuid",
+  "students_in_scope": 42,
+  "alerts": [{
+    "id": "uuid", "user_id": "uuid",
+    "concept_id": "uuid", "concept_label": "derivation_fonction",
+    "alert_type": "cognitive_overload", "alert_severity": "high",
+    "alert_details": {}, "inconsistency_rate": null, "volatility_score": null,
+    "interactions_count": null,
+    "resolved": false, "resolved_by": null, "resolved_at": null,
+    "created_at": "2026-08-14T09:12:00Z"
+  }],
+  "counts_by_type": { "cognitive_overload": 3 },
+  "counts_by_severity": { "high": 3 },
+  "truncated": false
+}
+```
+
+**The school scope is service-only, and that is your job to gate.** The Kernel
+cannot tell a teacher's token from a parent's or a student's — it has no staff
+directory. So it refuses to decide: the app checks that the caller really teaches
+at that school, then calls with the service secret. If you skip that check, one
+forged session opens a whole school's alerts.
+
+Three fields exist to keep a dashboard honest, please surface them:
+`students_in_scope` (a school expecting 300 and seeing 12 has a roster problem,
+not a quiet week), `truncated` (the limit cut the list — don't render it as
+"everything"), and the **503**: this route deliberately fails loudly instead of
+returning `[]`, because an empty list on a safety screen reads as "all clear".
+Show an error state, never an empty one.
+
+### `POST /resolve_alert`
+`{ alert_id, resolved_by, resolved }` → acknowledge an alert, or reopen it with
+`resolved: false`. Service-only: a student must not be able to close the alert
+raised about them. `resolved_by` is free text (the Kernel has no staff
+directory) — pass the teacher's id or name; you vouch for it. Unknown id → 404.
+
+Resolved alerts leave the default `/load_alerts` view, so the dashboard shrinks
+as staff work through it. A list that never shrinks is a list people stop reading.
+
 > **Pairing it with `/analyze`:** send `commit_state: false` on the `/analyze`
 > call that follows graded updates. Otherwise the Kernel re-derives the same
 > attempts from the conversation and commits them *on top of* yours — the same
@@ -176,6 +232,10 @@ Identify the KC either way:
 
 The last two read beyond a single conversation (trajectory history, population
 baselines), so they surface on students with some history rather than on turn one.
+
+Alerts arrive live in the `/analyze` response *and* are persisted. Read the
+history back with `/load_alerts` — that's what the school dashboard is built on —
+and close them with `/resolve_alert`.
 
 ---
 

@@ -94,13 +94,16 @@ Each KC, per student, carries a four-dimensional state (Luckin / corpus §1.2):
 | POST   | `/analyze`               | 🔒   | **Main route.** Conversation → root-gap + alerts.  |
 | POST   | `/load_profile`          | 🔒   | Full cognitive profile with K_effective recomputed. |
 | POST   | `/update_concept_state`  | 🔒   | Manual KC update on a strong signal (called by RAYA). |
+| POST   | `/load_alerts`           | 🔒   | Read pedagogical-safety alerts — one student, or a whole school. |
+| POST   | `/resolve_alert`         | 🔒   | Acknowledge an alert (or reopen it).               |
 | POST   | `/seed_kcs`              | 🔒   | Seed starter Math KCs if the table is empty.       |
 
 🔒 = authenticated. Two tiers of caller:
 
 - **service** — presents `KERNEL_API_SECRET` (via `Authorization: Bearer`,
   `X-Kernel-Secret`, or `X-API-Key`). A trusted backend acting for many
-  students: may touch any `user_id`, and is the only tier allowed to `/seed_kcs`.
+  students: may touch any `user_id`, and is the only tier allowed to `/seed_kcs`,
+  to the school scope of `/load_alerts`, and to `/resolve_alert`.
 - **user** — presents a Supabase access token. Scoped to one student: the Kernel
   checks the token's `sub` against the `user_id` in the body and returns **403**
   for anyone else's. Requires `SUPABASE_JWT_SECRET`; without it this tier is
@@ -259,7 +262,7 @@ forgetting, mindset, detector (convergence), calibration, the cognitive vector
 (V/P/slip), anomaly detectors (including temporal inconsistency and OOD),
 school curriculum layers, graph-builder validation, `get_or_create_kc`, and the
 `/health`, `/ready`, `/analyze`, `/load_profile`, `/update_concept_state`,
-`/seed_kcs` routes.
+`/load_alerts`, `/resolve_alert`, `/seed_kcs` routes.
 
 ---
 

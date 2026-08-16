@@ -353,6 +353,86 @@ def log_alert(client, user_id: str, alert: dict, concept_id: str | None = None) 
         pass
 
 
+# --------------------------------------------------------------------------- #
+# Monitoring reads (the alert dashboard)
+# --------------------------------------------------------------------------- #
+# Every other read in this file swallows its errors and returns an empty result,
+# because it feeds an enrichment: no school context, no history, no problem.
+# These three do the opposite and let the exception out. They feed a screen a
+# teacher reads to decide whether a child needs attention, and an empty list
+# there says "nothing wrong" — so a failed query would render as an all-clear.
+# A visible 503 is the only honest failure mode for a safety dashboard.
+ALERT_COLUMNS = (
+    "id, user_id, concept_id, alert_type, alert_severity, alert_details, "
+    "inconsistency_rate, volatility_score, interactions_count, "
+    "resolved, resolved_by, resolved_at, created_at"
+)
+
+
+def load_school_student_ids(client, school_id: str, limit: int = 2000) -> list[str]:
+    """Every student the app has registered under this school."""
+    res = (
+        _schools(client, "student_identities")
+        .select("user_id")
+        .eq("school_id", school_id)
+        .limit(limit)
+        .execute()
+    )
+    return [r["user_id"] for r in (res.data or []) if r.get("user_id")]
+
+
+def load_alerts(
+    client,
+    user_ids: list[str],
+    *,
+    include_resolved: bool = False,
+    severity: str | None = None,
+    since: str | None = None,
+    limit: int = 100,
+) -> list[dict]:
+    """Pedagogical-safety alerts for a set of students, newest first."""
+    if not user_ids:
+        return []
+    query = (
+        _kernel(client, "kernel_monitoring")
+        .select(ALERT_COLUMNS)
+        # `kernel_monitoring` also carries ordinary operational logs; only rows
+        # written by log_alert() are alerts.
+        .eq("level", "alert")
+        .in_("user_id", user_ids)
+    )
+    if not include_resolved:
+        query = query.eq("resolved", False)
+    if severity:
+        query = query.eq("alert_severity", severity)
+    if since:
+        query = query.gte("created_at", since)
+    res = query.order("created_at", desc=True).limit(limit).execute()
+    return res.data or []
+
+
+def set_alert_resolved(
+    client, alert_id: str, resolved: bool, resolved_by: str
+) -> dict | None:
+    """Acknowledge an alert, or reopen it. Returns the updated row, else None."""
+    res = (
+        _kernel(client, "kernel_monitoring")
+        .update(
+            {
+                "resolved": resolved,
+                "resolved_by": resolved_by if resolved else None,
+                "resolved_at": _now_iso() if resolved else None,
+            }
+        )
+        .eq("id", alert_id)
+        # Scoped to alert rows so this can never rewrite an operational log line.
+        .eq("level", "alert")
+        .execute()
+    )
+    rows = res.data or []
+    return rows[0] if rows else None
+
+
 def log_monitoring(client, level: str, event: str, detail: dict | None = None) -> None:
     """Best-effort monitoring write; swallow errors so it never breaks a flow."""
     try:

@@ -163,6 +163,87 @@ class UpdateConceptStateResponse(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# /load_alerts  /resolve_alert
+# --------------------------------------------------------------------------- #
+AlertSeverity = Literal["low", "medium", "high"]
+
+
+class LoadAlertsRequest(BaseModel):
+    """Read pedagogical-safety alerts, for one student or for a whole school.
+
+    Exactly one scope. `user_id` is the student's own view (and the only scope a
+    student's token can reach); `school_id` is the staff dashboard and is
+    service-only — see the route for why the Kernel cannot authorize a teacher
+    itself.
+    """
+
+    user_id: Optional[str] = None
+    school_id: Optional[str] = None
+    # Resolved alerts stay out by default: a dashboard's job is what still needs
+    # attention. Pass true to review history.
+    include_resolved: bool = False
+    severity: Optional[AlertSeverity] = None
+    since: Optional[datetime] = None
+    limit: int = Field(default=100, ge=1, le=500)
+
+    @model_validator(mode="after")
+    def _exactly_one_scope(self) -> "LoadAlertsRequest":
+        if bool(self.user_id) == bool(self.school_id):
+            raise ValueError("exactly one of user_id or school_id is required")
+        return self
+
+
+class AlertOut(BaseModel):
+    id: str
+    user_id: Optional[str] = None
+    concept_id: Optional[str] = None
+    # Resolved from the graph: an alert row stores a UUID, and no one can read a
+    # UUID. Empty when the alert isn't about a specific KC.
+    concept_label: str = ""
+    alert_type: str
+    alert_severity: str
+    alert_details: dict = Field(default_factory=dict)
+    inconsistency_rate: Optional[float] = None
+    volatility_score: Optional[float] = None
+    interactions_count: Optional[int] = None
+    resolved: bool = False
+    resolved_by: Optional[str] = None
+    resolved_at: Optional[datetime] = None
+    created_at: Optional[datetime] = None
+
+
+class LoadAlertsResponse(BaseModel):
+    scope: Literal["user", "school"]
+    user_id: Optional[str] = None
+    school_id: Optional[str] = None
+    # How many students the school scope actually covered. A school that expects
+    # 300 and sees 12 has a roster problem, not a quiet week.
+    students_in_scope: int = 1
+    alerts: list[AlertOut] = Field(default_factory=list)
+    counts_by_type: dict[str, int] = Field(default_factory=dict)
+    counts_by_severity: dict[str, int] = Field(default_factory=dict)
+    # True when the limit cut the list short — so a UI never implies it is
+    # showing everything when it isn't.
+    truncated: bool = False
+
+
+class ResolveAlertRequest(BaseModel):
+    alert_id: str
+    # Who acknowledged it. Free text (a teacher's name or id) because the Kernel
+    # has no staff directory — it records the claim, the app vouches for it.
+    resolved_by: str = Field(..., min_length=1, max_length=128)
+    # False reopens an alert closed by mistake.
+    resolved: bool = True
+
+
+class ResolveAlertResponse(BaseModel):
+    alert_id: str
+    resolved: bool
+    resolved_by: Optional[str] = None
+    resolved_at: Optional[datetime] = None
+
+
+# --------------------------------------------------------------------------- #
 # /seed_kcs
 # --------------------------------------------------------------------------- #
 class SeedResponse(BaseModel):

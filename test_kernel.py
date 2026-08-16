@@ -1147,3 +1147,234 @@ def test_seed_kcs(fake_supabase, monkeypatch):
     # Second call is a no-op because the table is now populated.
     resp2 = client.post("/seed_kcs")
     assert resp2.json()["seeded"] is False
+
+
+# --------------------------------------------------------------------------- #
+# Monitoring reads — /load_alerts and /resolve_alert
+# --------------------------------------------------------------------------- #
+def _seed_alerts(fake):
+    """Two students' alerts, one already resolved, plus an operational log row."""
+    fake.seed("kernel.concept_nodes", [{"id": "c1", "label": "derivees", "subject": "MATH"}])
+    fake.seed(
+        "kernel.kernel_monitoring",
+        [
+            {"id": "a1", "level": "alert", "user_id": "student-a", "concept_id": "c1",
+             "alert_type": "cognitive_overload", "alert_severity": "high",
+             "alert_details": {}, "resolved": False, "created_at": "2026-08-01T00:00:00Z"},
+            {"id": "a2", "level": "alert", "user_id": "student-a", "concept_id": None,
+             "alert_type": "fixed_mindset", "alert_severity": "medium",
+             "alert_details": {}, "resolved": False, "created_at": "2026-08-03T00:00:00Z"},
+            {"id": "a3", "level": "alert", "user_id": "student-a", "concept_id": None,
+             "alert_type": "false_mastery", "alert_severity": "low",
+             "alert_details": {}, "resolved": True, "created_at": "2026-07-01T00:00:00Z"},
+            {"id": "a4", "level": "alert", "user_id": "student-b", "concept_id": None,
+             "alert_type": "passive_dependency", "alert_severity": "high",
+             "alert_details": {}, "resolved": False, "created_at": "2026-08-02T00:00:00Z"},
+            # Not an alert: an ordinary operational log line.
+            {"id": "m1", "level": "info", "event": "readiness_probe", "detail": {}},
+        ],
+    )
+
+
+def test_load_alerts_returns_a_students_open_alerts(client, fake_supabase, monkeypatch):
+    monkeypatch.setenv("KERNEL_API_SECRET", "s3cr3t")
+    monkeypatch.setattr(db_module, "get_client", lambda: fake_supabase)
+    _seed_alerts(fake_supabase)
+
+    resp = client.post(
+        "/load_alerts", json={"user_id": "student-a"}, headers={"X-Kernel-Secret": "s3cr3t"}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+
+    # Only this student, only unresolved, only alert rows — never the info log.
+    assert [a["id"] for a in body["alerts"]] == ["a2", "a1"]  # newest first
+    assert body["scope"] == "user"
+    assert body["counts_by_type"] == {"fixed_mindset": 1, "cognitive_overload": 1}
+    assert body["counts_by_severity"] == {"medium": 1, "high": 1}
+    assert body["truncated"] is False
+    # The UUID stored on the row is useless to a human; the label is resolved.
+    assert next(a for a in body["alerts"] if a["id"] == "a1")["concept_label"] == "derivees"
+
+
+def test_resolved_alerts_come_back_only_when_asked(client, fake_supabase, monkeypatch):
+    monkeypatch.setenv("KERNEL_API_SECRET", "s3cr3t")
+    monkeypatch.setattr(db_module, "get_client", lambda: fake_supabase)
+    _seed_alerts(fake_supabase)
+
+    resp = client.post(
+        "/load_alerts",
+        json={"user_id": "student-a", "include_resolved": True},
+        headers={"X-Kernel-Secret": "s3cr3t"},
+    )
+    assert {a["id"] for a in resp.json()["alerts"]} == {"a1", "a2", "a3"}
+
+
+def test_alert_filters_narrow_by_severity_and_date(client, fake_supabase, monkeypatch):
+    monkeypatch.setenv("KERNEL_API_SECRET", "s3cr3t")
+    monkeypatch.setattr(db_module, "get_client", lambda: fake_supabase)
+    _seed_alerts(fake_supabase)
+    headers = {"X-Kernel-Secret": "s3cr3t"}
+
+    high = client.post(
+        "/load_alerts", json={"user_id": "student-a", "severity": "high"}, headers=headers
+    )
+    assert [a["id"] for a in high.json()["alerts"]] == ["a1"]
+
+    recent = client.post(
+        "/load_alerts",
+        json={"user_id": "student-a", "since": "2026-08-02T00:00:00Z"},
+        headers=headers,
+    )
+    assert [a["id"] for a in recent.json()["alerts"]] == ["a2"]
+
+
+def test_truncated_says_so_rather_than_implying_completeness(client, fake_supabase, monkeypatch):
+    monkeypatch.setenv("KERNEL_API_SECRET", "s3cr3t")
+    monkeypatch.setattr(db_module, "get_client", lambda: fake_supabase)
+    _seed_alerts(fake_supabase)
+
+    resp = client.post(
+        "/load_alerts",
+        json={"user_id": "student-a", "limit": 1},
+        headers={"X-Kernel-Secret": "s3cr3t"},
+    )
+    body = resp.json()
+    assert len(body["alerts"]) == 1 and body["truncated"] is True
+
+
+def test_a_student_reads_only_their_own_alerts(client, fake_supabase, monkeypatch):
+    monkeypatch.setenv("KERNEL_API_SECRET", "s3cr3t")
+    monkeypatch.setenv("SUPABASE_JWT_SECRET", JWT_SECRET)
+    monkeypatch.setattr(db_module, "get_client", lambda: fake_supabase)
+    _seed_alerts(fake_supabase)
+    headers = {"Authorization": f"Bearer {_user_token('student-a')}"}
+
+    assert client.post("/load_alerts", json={"user_id": "student-a"}, headers=headers).status_code == 200
+    assert client.post("/load_alerts", json={"user_id": "student-b"}, headers=headers).status_code == 403
+
+
+def test_school_scope_is_service_only_and_covers_the_roster(client, fake_supabase, monkeypatch):
+    monkeypatch.setenv("KERNEL_API_SECRET", "s3cr3t")
+    monkeypatch.setenv("SUPABASE_JWT_SECRET", JWT_SECRET)
+    monkeypatch.setattr(db_module, "get_client", lambda: fake_supabase)
+    _seed_alerts(fake_supabase)
+    fake_supabase.seed(
+        "schools.student_identities",
+        [
+            {"id": "i1", "user_id": "student-a", "school_id": "school-1"},
+            {"id": "i2", "user_id": "student-b", "school_id": "school-1"},
+            {"id": "i3", "user_id": "student-z", "school_id": "school-2"},
+        ],
+    )
+
+    # The Kernel can't tell a teacher's token from a student's, so it refuses to
+    # decide: a school view needs the app's own authorization, i.e. the service tier.
+    student = client.post(
+        "/load_alerts",
+        json={"school_id": "school-1"},
+        headers={"Authorization": f"Bearer {_user_token('student-a')}"},
+    )
+    assert student.status_code == 403
+
+    resp = client.post(
+        "/load_alerts", json={"school_id": "school-1"}, headers={"X-Kernel-Secret": "s3cr3t"}
+    )
+    body = resp.json()
+    assert resp.status_code == 200
+    assert body["scope"] == "school"
+    # Both students of this school, and nobody from school-2.
+    assert [a["id"] for a in body["alerts"]] == ["a2", "a4", "a1"]
+    # Surfaced so a school expecting 300 students notices it is only seeing 2.
+    assert body["students_in_scope"] == 2
+
+
+def test_alerts_need_exactly_one_scope(client, fake_supabase, monkeypatch):
+    monkeypatch.setenv("KERNEL_API_SECRET", "s3cr3t")
+    monkeypatch.setattr(db_module, "get_client", lambda: fake_supabase)
+    headers = {"X-Kernel-Secret": "s3cr3t"}
+
+    assert client.post("/load_alerts", json={}, headers=headers).status_code == 422
+    assert client.post(
+        "/load_alerts", json={"user_id": "student-a", "school_id": "school-1"}, headers=headers
+    ).status_code == 422
+
+
+def test_a_failed_read_is_a_503_never_an_empty_all_clear(client, fake_supabase, monkeypatch):
+    """The one failure mode a safety dashboard must not have.
+
+    Every other read in db.py degrades to []. Here that would render as "no
+    alerts" — telling a school that nothing is wrong precisely when the Kernel
+    can no longer tell.
+    """
+    monkeypatch.setenv("KERNEL_API_SECRET", "s3cr3t")
+    monkeypatch.setattr(db_module, "get_client", lambda: fake_supabase)
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("permission denied for table kernel_monitoring")
+
+    monkeypatch.setattr(db_module, "load_alerts", boom)
+    resp = client.post(
+        "/load_alerts", json={"user_id": "student-a"}, headers={"X-Kernel-Secret": "s3cr3t"}
+    )
+    assert resp.status_code == 503
+    assert "alerts unavailable" in resp.json()["detail"]
+
+
+def test_resolve_alert_closes_reopens_and_404s(client, fake_supabase, monkeypatch):
+    monkeypatch.setenv("KERNEL_API_SECRET", "s3cr3t")
+    monkeypatch.setattr(db_module, "get_client", lambda: fake_supabase)
+    _seed_alerts(fake_supabase)
+    headers = {"X-Kernel-Secret": "s3cr3t"}
+
+    done = client.post(
+        "/resolve_alert", json={"alert_id": "a1", "resolved_by": "mme-durand"}, headers=headers
+    )
+    assert done.status_code == 200
+    assert done.json()["resolved"] is True
+    assert done.json()["resolved_by"] == "mme-durand"
+
+    # It drops out of the dashboard's default view.
+    open_now = client.post("/load_alerts", json={"user_id": "student-a"}, headers=headers)
+    assert [a["id"] for a in open_now.json()["alerts"]] == ["a2"]
+
+    # Closed by mistake: reopening clears the acknowledgement too.
+    back = client.post(
+        "/resolve_alert",
+        json={"alert_id": "a1", "resolved_by": "mme-durand", "resolved": False},
+        headers=headers,
+    )
+    assert back.json()["resolved"] is False and back.json()["resolved_by"] is None
+
+    assert client.post(
+        "/resolve_alert", json={"alert_id": "nope", "resolved_by": "x"}, headers=headers
+    ).status_code == 404
+
+
+def test_resolving_never_touches_an_operational_log_row(client, fake_supabase, monkeypatch):
+    """`m1` is an info log, not an alert — /resolve_alert must not rewrite it."""
+    monkeypatch.setenv("KERNEL_API_SECRET", "s3cr3t")
+    monkeypatch.setattr(db_module, "get_client", lambda: fake_supabase)
+    _seed_alerts(fake_supabase)
+
+    resp = client.post(
+        "/resolve_alert", json={"alert_id": "m1", "resolved_by": "x"},
+        headers={"X-Kernel-Secret": "s3cr3t"},
+    )
+    assert resp.status_code == 404
+    row = next(r for r in fake_supabase.tables["kernel.kernel_monitoring"] if r["id"] == "m1")
+    assert "resolved" not in row
+
+
+def test_a_student_cannot_close_the_alert_raised_about_them(client, fake_supabase, monkeypatch):
+    monkeypatch.setenv("KERNEL_API_SECRET", "s3cr3t")
+    monkeypatch.setenv("SUPABASE_JWT_SECRET", JWT_SECRET)
+    monkeypatch.setattr(db_module, "get_client", lambda: fake_supabase)
+    _seed_alerts(fake_supabase)
+
+    resp = client.post(
+        "/resolve_alert",
+        json={"alert_id": "a1", "resolved_by": "student-a"},
+        headers={"Authorization": f"Bearer {_user_token('student-a')}"},
+    )
+    assert resp.status_code == 403
