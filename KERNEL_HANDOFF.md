@@ -143,8 +143,15 @@ first way to read them back. Exactly one scope per call:
 
 ```json
 { "user_id": "uuid" }              // one student — their own token works
+{ "user_ids": ["uuid", "uuid"] }   // an explicit roster — service only, max 500
 { "school_id": "uuid" }            // every student of a school — service only
 ```
+
+**Use `user_ids` for the teacher dashboard**, not `school_id`. Your staff are
+assigned to classes, not to establishments (`getProfClasses`), so a school-wide
+call would show a teacher children they don't teach. Resolve the roster from the
+teacher's classes and ask for exactly those. `school_id` is the head teacher's
+view.
 Optional: `include_resolved` (default false), `severity` (`low`/`medium`/`high`),
 `since` (ISO timestamp), `limit` (1–500, default 100).
 

@@ -1378,3 +1378,38 @@ def test_a_student_cannot_close_the_alert_raised_about_them(client, fake_supabas
         headers={"Authorization": f"Bearer {_user_token('student-a')}"},
     )
     assert resp.status_code == 403
+
+
+def test_roster_scope_answers_for_exactly_the_students_given(client, fake_supabase, monkeypatch):
+    """A teacher sees their assigned classes — never a whole establishment."""
+    monkeypatch.setenv("KERNEL_API_SECRET", "s3cr3t")
+    monkeypatch.setenv("SUPABASE_JWT_SECRET", JWT_SECRET)
+    monkeypatch.setattr(db_module, "get_client", lambda: fake_supabase)
+    _seed_alerts(fake_supabase)
+
+    resp = client.post(
+        "/load_alerts",
+        json={"user_ids": ["student-b", "student-b", "student-c"]},
+        headers={"X-Kernel-Secret": "s3cr3t"},
+    )
+    body = resp.json()
+    assert body["scope"] == "users"
+    assert [a["id"] for a in body["alerts"]] == ["a4"]
+    # student-a is not on the list, so their alerts stay out of this teacher's view.
+    assert all(a["user_id"] != "student-a" for a in body["alerts"])
+    # Duplicates in the request don't inflate the roster count.
+    assert body["students_in_scope"] == 2
+
+    # A student's token can't ask about a list, only about itself.
+    assert client.post(
+        "/load_alerts",
+        json={"user_ids": ["student-a"]},
+        headers={"Authorization": f"Bearer {_user_token('student-a')}"},
+    ).status_code == 403
+
+    # Still exactly one scope.
+    assert client.post(
+        "/load_alerts",
+        json={"user_id": "student-a", "user_ids": ["student-b"]},
+        headers={"X-Kernel-Secret": "s3cr3t"},
+    ).status_code == 422

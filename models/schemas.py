@@ -169,15 +169,25 @@ AlertSeverity = Literal["low", "medium", "high"]
 
 
 class LoadAlertsRequest(BaseModel):
-    """Read pedagogical-safety alerts, for one student or for a whole school.
+    """Read pedagogical-safety alerts, for one student, a class list, or a school.
 
-    Exactly one scope. `user_id` is the student's own view (and the only scope a
-    student's token can reach); `school_id` is the staff dashboard and is
-    service-only — see the route for why the Kernel cannot authorize a teacher
-    itself.
+    Exactly one scope:
+
+      user_id   the student's own view, and the only scope a student's token
+                can reach.
+      user_ids  an explicit roster. This is what a teacher dashboard actually
+                needs: staff are assigned to classes, not to whole schools, so
+                asking for a school would show a teacher children they don't
+                teach. The caller has already resolved which students it may
+                see; the Kernel just answers for those.
+      school_id the whole establishment — a head teacher's view.
+
+    The last two are service-only; see the route for why the Kernel cannot
+    authorize a teacher itself.
     """
 
     user_id: Optional[str] = None
+    user_ids: Optional[list[str]] = Field(default=None, min_length=1, max_length=500)
     school_id: Optional[str] = None
     # Resolved alerts stay out by default: a dashboard's job is what still needs
     # attention. Pass true to review history.
@@ -188,8 +198,9 @@ class LoadAlertsRequest(BaseModel):
 
     @model_validator(mode="after")
     def _exactly_one_scope(self) -> "LoadAlertsRequest":
-        if bool(self.user_id) == bool(self.school_id):
-            raise ValueError("exactly one of user_id or school_id is required")
+        given = sum(1 for s in (self.user_id, self.user_ids, self.school_id) if s)
+        if given != 1:
+            raise ValueError("exactly one of user_id, user_ids or school_id is required")
         return self
 
 
@@ -213,11 +224,11 @@ class AlertOut(BaseModel):
 
 
 class LoadAlertsResponse(BaseModel):
-    scope: Literal["user", "school"]
+    scope: Literal["user", "users", "school"]
     user_id: Optional[str] = None
     school_id: Optional[str] = None
-    # How many students the school scope actually covered. A school that expects
-    # 300 and sees 12 has a roster problem, not a quiet week.
+    # How many students the call actually covered. A teacher expecting 30 and
+    # seeing 2 has a roster problem, not a quiet week.
     students_in_scope: int = 1
     alerts: list[AlertOut] = Field(default_factory=list)
     counts_by_type: dict[str, int] = Field(default_factory=dict)

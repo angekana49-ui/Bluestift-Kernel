@@ -442,6 +442,12 @@ def _recalibrate_kc(concept_id: str) -> None:
 #   user_id   — one student. A student's own token reaches their own alerts and
 #               nothing else, via the same authorize_for() as every other route.
 #
+#   user_ids  — an explicit roster, service-only. Staff are assigned to classes,
+#               not to whole establishments, so a teacher dashboard asking for a
+#               school would show them children they don't teach. The app knows
+#               which classes a teacher has; it resolves the list and asks for
+#               exactly those.
+#
 #   school_id — every student of one school. Service-only, on purpose: the
 #               Kernel has no idea who teaches where. It cannot tell a teacher's
 #               token from a parent's from a student's, so it cannot decide who
@@ -457,6 +463,11 @@ async def load_alerts(
     if req.user_id:
         authorize_for(principal, req.user_id)
         scope, user_ids = "user", [req.user_id]
+    elif req.user_ids:
+        # The caller resolved the roster itself — a teacher's assigned classes,
+        # typically. It vouches for that list; the Kernel only answers for it.
+        require_service(principal)
+        scope, user_ids = "users", list(dict.fromkeys(req.user_ids))
     else:
         require_service(principal)
         scope = "school"
