@@ -147,6 +147,15 @@ first way to read them back. Exactly one scope per call:
 { "school_id": "uuid" }            // every student of a school — service only
 ```
 
+> **You share this database, so prefer reading it directly for dashboards.**
+> The RAYA app reads `kernel.kernel_monitoring` itself (`lib/kernel/risk.ts`)
+> rather than calling this route on every page view. Two reasons: the Kernel
+> sleeps on Railway, so each HTTP call is a billed wake-up, and a dashboard that
+> depends on the Kernel being awake breaks exactly when it is not. Filter on
+> `level = 'alert'` and `resolved = false` to match what this route returns.
+> Use the route when you *don't* share the DB, or for a one-off check. Writes
+> (`/resolve_alert`) should still go through the API.
+
 **Use `user_ids` for the teacher dashboard**, not `school_id`. Your staff are
 assigned to classes, not to establishments (`getProfClasses`), so a school-wide
 call would show a teacher children they don't teach. Resolve the roster from the
