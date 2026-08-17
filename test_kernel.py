@@ -1413,3 +1413,64 @@ def test_roster_scope_answers_for_exactly_the_students_given(client, fake_supaba
         json={"user_id": "student-a", "user_ids": ["student-b"]},
         headers={"X-Kernel-Secret": "s3cr3t"},
     ).status_code == 422
+
+
+# --------------------------------------------------------------------------- #
+# Calibration scheduling
+# --------------------------------------------------------------------------- #
+def test_a_never_calibrated_kc_is_always_due():
+    assert calibration.is_calibration_due({}) is True
+    assert calibration.is_calibration_due({"last_calibration_at": None}) is True
+
+
+def test_cooldown_keeps_a_busy_kc_from_being_rescanned():
+    now = datetime.now(timezone.utc)
+    fresh = {"last_calibration_at": (now - timedelta(hours=1)).isoformat()}
+    stale = {"last_calibration_at": (now - timedelta(hours=7)).isoformat()}
+    # Recalibration reads every student's state for the KC: a popular KC would
+    # otherwise be fully rescanned on every conversation that touches it.
+    assert calibration.is_calibration_due(fresh, now) is False
+    assert calibration.is_calibration_due(stale, now) is True
+
+
+def test_an_unreadable_timestamp_recalibrates_rather_than_skips():
+    # Losing a calibration is recoverable; silently never calibrating again
+    # because one row holds junk is not.
+    assert calibration.is_calibration_due({"last_calibration_at": "not-a-date"}) is True
+
+
+def test_analyze_schedules_recalibration_for_the_kcs_it_committed(monkeypatch):
+    """The evidence lands in /analyze, so calibration has to be triggered there."""
+    scheduled: list[str] = []
+
+    async def fake_run_analysis(_client, request_id, _payload):
+        return {
+            "request_id": request_id,
+            "user_id": "u1",
+            "root_gap": None,
+            "root_concept_id": None,
+            "detection_path": [],
+            "mastery_map": {},
+            "confidence": 0.0,
+            "summary": "",
+            "recommended_path": [],
+            "alerts": [],
+            "llm_used": "test",
+            "recalibrate_concept_ids": ["kc-a", "kc-b"],
+        }
+
+    monkeypatch.setattr(analyze_pipeline, "run_analysis", fake_run_analysis)
+    monkeypatch.setattr(main, "_recalibrate_kc", lambda cid: scheduled.append(cid))
+    monkeypatch.setattr(db_module, "get_client", lambda: object())
+    monkeypatch.setattr(db_module, "log_kernel_request", lambda *a, **k: None)
+    monkeypatch.delenv("KERNEL_API_SECRET", raising=False)
+
+    client = TestClient(main.app)
+    resp = client.post(
+        "/analyze",
+        json={"user_id": "u1", "conversation_history": [{"role": "user", "content": "hi"}]},
+    )
+    assert resp.status_code == 200
+    assert scheduled == ["kc-a", "kc-b"]
+    # The scheduling key is internal plumbing and must not leak into the contract.
+    assert "recalibrate_concept_ids" not in resp.json()

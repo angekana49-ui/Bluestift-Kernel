@@ -163,6 +163,10 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
     level = payload.get("level", "unknown")
     conversation = payload["conversation_history"]
     commit_state = payload.get("commit_state", True)
+    # KCs whose empirical parameters should be recomputed after this response
+    # goes out. A set: the same KC can be committed once per analysis, but this
+    # keeps that guarantee local rather than assumed.
+    recalibrate_ids: set[str] = set()
 
     # 1. LLM extraction of mentioned KCs + attempt evaluations. The existing KC
     #    vocabulary (across ALL subjects) is fed to the prompt to curb label drift,
@@ -246,6 +250,12 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
                 committed_slip = _persist_state(
                     client, user_id, concept_id, kc, k_before, k_raw, pc, attempt, state, lam, m_score
                 )
+                # This KC's evidence just changed, so its empirical parameters
+                # may have too. The node is already in memory, so the freshness
+                # check is free; the recalibration itself runs in the background
+                # after the response, and only for KCs actually past cooldown.
+                if calibration.is_calibration_due(kc):
+                    recalibrate_ids.add(concept_id)
             except Exception as e:  # noqa: BLE001 - degrade, still return the analysis
                 db.log_monitoring(client, "warn", "persist_state_failed", {"error": str(e)[:300]})
 
@@ -324,6 +334,10 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
         "recommended_path": rec_path,
         "alerts": [{"type": a["alert_type"], "severity": a["alert_severity"]} for a in alerts],
         "llm_used": llm_used if llm_used != "none" else summary_llm,
+        # Not part of the API contract: the route pops this and schedules the
+        # work after responding. It rides along because only this function knows
+        # which KCs it actually committed to.
+        "recalibrate_concept_ids": sorted(recalibrate_ids),
     }
 
     if not layers.is_empty:

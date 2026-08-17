@@ -233,6 +233,16 @@ python scripts/build_graph.py MATH cycle3 cycle4 lycee
 The LLM supplies the **structure** (nodes + edges); real student data later
 calibrates the **parameters** (difficulty, decay) — the flywheel.
 
+**When calibration actually fires.** Both `/analyze` (on every KC it commits to)
+and `/update_concept_state` schedule a background recalibration, throttled to
+once per KC per `CALIBRATION_COOLDOWN_HOURS` (6). But
+`compute_empirical_kc_params` refuses to run on thin data: a KC needs **10+
+students**, of whom at least one has **5+ interactions** on it. Below that it
+returns `None` and the KC keeps its literature priors — deliberately, since
+fitting difficulty to three pupils is worse than not fitting it. So expect
+`last_calibration_at` to stay null until a KC has real classroom traffic, and
+read a null there as "not enough evidence yet", never as a failure.
+
 ### Cross-subject bridges
 
 The graph spans subjects in one table, and the detector traverses any edge — so

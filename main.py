@@ -30,7 +30,7 @@ from fastapi.responses import JSONResponse
 
 load_dotenv()
 
-from core import bkt, forgetting, ratelimit  # noqa: E402
+from core import bkt, calibration, forgetting, ratelimit  # noqa: E402
 from core.calibration import compute_empirical_kc_params  # noqa: E402
 from core.mindset import classify_mindset  # noqa: E402
 from models.schemas import (  # noqa: E402
@@ -217,7 +217,9 @@ async def ready() -> JSONResponse:
 # --------------------------------------------------------------------------- #
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(
-    req: AnalyzeRequest, principal: Principal = Depends(authenticate)
+    req: AnalyzeRequest,
+    background: BackgroundTasks,
+    principal: Principal = Depends(authenticate),
 ) -> AnalyzeResponse:
     authorize_for(principal, req.user_id)
 
@@ -256,6 +258,17 @@ async def analyze(
         # like schema/constraint names leak to the caller). request_id correlates.
         db.log_monitoring(client, "error", "analyze_failed", {"request_id": request_id, "error": str(e)})
         raise HTTPException(status_code=500, detail=f"Analysis failed (request_id={request_id})") from e
+
+    # Recalibrate the KCs this analysis committed to, after the response is sent.
+    #
+    # /analyze is where almost all evidence actually lands — it runs on every
+    # conversation, while /update_concept_state only fires on a graded attempt.
+    # Hanging calibration off the graded route alone meant a KC could accumulate
+    # months of conversational evidence and still be scored on literature priors.
+    # The pipeline returns only KCs it committed to AND that are past their
+    # cooldown, so a busy KC is not rescanned on every turn.
+    for concept_id in output.pop("recalibrate_concept_ids", []):
+        background.add_task(_recalibrate_kc, concept_id)
 
     return AnalyzeResponse(kernel_version=KERNEL_VERSION, **output)
 
@@ -398,8 +411,12 @@ async def update_concept_state(
     )
     status = bkt.classify_status(k_eff, params["p_slip"], new_avg)
 
-    # Fire-and-forget empirical recalibration for this KC in the background.
-    background.add_task(_recalibrate_kc, concept_id)
+    # Fire-and-forget empirical recalibration, but only if this KC is past its
+    # cooldown: recalibration reads every student's state for the KC, and a
+    # class submitting the same exercise would otherwise trigger one full scan
+    # per pupil for an aggregate that barely moves between them.
+    if calibration.is_calibration_due(node):
+        background.add_task(_recalibrate_kc, concept_id)
 
     return UpdateConceptStateResponse(
         user_id=req.user_id,
