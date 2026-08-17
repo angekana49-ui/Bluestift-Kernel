@@ -14,8 +14,9 @@
 #   calls and keeps the container busy, so a client stuck in a retry loop would
 #   otherwise burn both the credit balance and the LLM quota.
 
-[build]
-builder = "NIXPACKS"
+# No [build] builder is pinned on purpose: the service is set to Railpack,
+# which is Railway's current default, and forcing Nixpacks here would silently
+# override the dashboard on the first deploy that actually reads this file.
 
 [deploy]
 startCommand = "uvicorn main:app --host 0.0.0.0 --port $PORT"
