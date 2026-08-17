@@ -9,6 +9,7 @@ These run in the background and never block /analyze.
 from __future__ import annotations
 
 import math
+from datetime import datetime, timedelta, timezone
 
 # Bounds for an observed lambda — values outside are treated as noise.
 LAMBDA_MIN = 0.001
@@ -21,6 +22,33 @@ PRIOR_WEIGHT = 0.3
 # Calibration gates.
 MIN_STUDENTS_FOR_KC_CALIBRATION = 10
 MIN_INTERACTIONS_PER_STUDENT = 5
+
+# How long a KC's calibration stays fresh. Recalibration reads every student's
+# state for that KC, so doing it on each interaction would turn a popular KC
+# into a full table scan per conversation, for an aggregate that barely moves
+# when one more student answers one more question.
+CALIBRATION_COOLDOWN_HOURS = 6
+
+
+def is_calibration_due(node: dict, now: datetime | None = None) -> bool:
+    """Whether this KC is worth recalibrating right now.
+
+    Takes the KC node the caller already holds, so the check costs no query —
+    it is meant to be called on the hot path before scheduling background work.
+    A KC that has never been calibrated is always due.
+    """
+    last = node.get("last_calibration_at")
+    if not last:
+        return True
+    if isinstance(last, str):
+        try:
+            last = datetime.fromisoformat(last.replace("Z", "+00:00"))
+        except ValueError:
+            return True  # unparseable timestamp: treat as never calibrated
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    now = now or datetime.now(timezone.utc)
+    return (now - last) >= timedelta(hours=CALIBRATION_COOLDOWN_HOURS)
 
 
 def calibrate_personal_lambda(

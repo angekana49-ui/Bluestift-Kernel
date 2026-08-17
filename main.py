@@ -8,6 +8,8 @@ Routes:
     POST /analyze
     POST /load_profile
     POST /update_concept_state
+    POST /load_alerts
+    POST /resolve_alert
     POST /seed_kcs
 """
 from __future__ import annotations
@@ -15,8 +17,12 @@ from __future__ import annotations
 import hmac
 import os
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
+import jwt
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,15 +30,19 @@ from fastapi.responses import JSONResponse
 
 load_dotenv()
 
-from core import bkt, forgetting  # noqa: E402
+from core import bkt, calibration, forgetting, ratelimit  # noqa: E402
 from core.calibration import compute_empirical_kc_params  # noqa: E402
 from core.mindset import classify_mindset  # noqa: E402
 from models.schemas import (  # noqa: E402
     AnalyzeRequest,
     AnalyzeResponse,
     HealthResponse,
+    LoadAlertsRequest,
+    LoadAlertsResponse,
     LoadProfileRequest,
     LoadProfileResponse,
+    ResolveAlertRequest,
+    ResolveAlertResponse,
     SeedResponse,
     UpdateConceptStateRequest,
     UpdateConceptStateResponse,
@@ -40,6 +50,7 @@ from models.schemas import (  # noqa: E402
 from services import analyze as analyze_pipeline  # noqa: E402
 from services import db  # noqa: E402
 from services.analyze import _persistence, _slip_estimate, _velocity  # noqa: E402
+from services.kc_registry import get_or_create_kc  # noqa: E402
 
 KERNEL_VERSION = os.getenv("KERNEL_VERSION", "1.0.0")
 
@@ -51,7 +62,20 @@ DEFAULT_CORS = [
 _cors_env = os.getenv("CORS_ORIGINS")
 CORS_ORIGINS = [o.strip() for o in _cors_env.split(",")] if _cors_env else DEFAULT_CORS
 
-app = FastAPI(title="Bluestift Cognitive Kernel", version=KERNEL_VERSION)
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """Log a clear alert if the Kernel boots without full DB access."""
+    try:
+        client = db.get_client()
+        status = db.check_db_access(client)
+        if not (status["read_ok"] and status["write_ok"]):
+            db.log_monitoring(client, "error", "startup_db_degraded", status)
+    except Exception:  # noqa: BLE001 - never block startup (e.g. tests without creds)
+        pass
+    yield
+
+
+app = FastAPI(title="Bluestift Cognitive Kernel", version=KERNEL_VERSION, lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -63,25 +87,104 @@ app.add_middleware(
 
 
 # --------------------------------------------------------------------------- #
-# Optional shared-secret auth
+# Auth — two tiers
 # --------------------------------------------------------------------------- #
-# If KERNEL_API_SECRET is set, protected routes require the caller to present it.
-# The secret is accepted via any common convention so it works with whatever the
-# client sends: `Authorization: Bearer <s>`, `X-Kernel-Secret: <s>`, `X-API-Key: <s>`.
-# When the env var is unset, auth is disabled (open) — backward compatible.
-async def require_auth(
+# The Kernel accepts two kinds of caller:
+#
+#   service — presents KERNEL_API_SECRET. A trusted backend (the RAYA app) acting
+#             on behalf of many students. May touch any user_id, and is the only
+#             tier allowed to seed the graph. Required for background work that
+#             outlives a student's request.
+#
+#   user    — presents a Supabase access token. Scoped to exactly one student:
+#             the Kernel checks the token's `sub` against the user_id in the body
+#             and refuses anything else (403).
+#
+# The point of the second tier is blast radius. The service secret is a skeleton
+# key to every student's cognitive profile — minors included, in a product whose
+# COPPA/GDPR/FERPA pages promise otherwise. Every call that already knows which
+# student it is about should carry that student's token instead, so the skeleton
+# key travels only where it is genuinely needed.
+#
+# This bounds *who may ask about whom*. It does not limit what the Kernel can
+# model: any student, any subject, any level, KCs created on the fly.
+#
+# When KERNEL_API_SECRET is unset, auth is disabled entirely and every caller is
+# treated as a service (local development) — unchanged from before.
+@dataclass(frozen=True)
+class Principal:
+    kind: str                  # "service" | "user"
+    user_id: str | None = None
+
+
+SERVICE = Principal("service")
+
+
+def _bearer(authorization: str | None) -> str | None:
+    if not authorization:
+        return None
+    if authorization.lower().startswith("bearer "):
+        return authorization[7:].strip()
+    return authorization.strip()
+
+
+def _verify_supabase_jwt(token: str) -> str | None:
+    """Return the student id in a valid Supabase access token, else None.
+
+    HS256 against SUPABASE_JWT_SECRET (the project's JWT secret). Projects using
+    asymmetric signing keys would need a JWKS fetch instead; unset the variable
+    and the user tier simply stays unavailable.
+    """
+    jwt_secret = os.getenv("SUPABASE_JWT_SECRET")
+    if not jwt_secret or token.count(".") != 2:
+        return None
+    try:
+        claims = jwt.decode(
+            token, jwt_secret, algorithms=["HS256"], audience="authenticated"
+        )
+    except Exception:  # noqa: BLE001 - expired, forged, wrong audience: all "not a user"
+        return None
+    sub = claims.get("sub")
+    return str(sub) if sub else None
+
+
+async def authenticate(
     authorization: str | None = Header(default=None),
     x_kernel_secret: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None),
-) -> None:
+) -> Principal:
+    """Resolve the caller. 401 when it presents nothing we recognise."""
     secret = os.getenv("KERNEL_API_SECRET")
+    bearer = _bearer(authorization)
+    # The secret is accepted via any common convention, so it works with whatever
+    # the client already sends.
+    provided = x_kernel_secret or x_api_key or bearer
+
     if not secret:
-        return  # auth disabled
-    provided = x_kernel_secret or x_api_key
-    if not provided and authorization:
-        provided = authorization[7:] if authorization.lower().startswith("bearer ") else authorization
-    if not provided or not hmac.compare_digest(provided, secret):
-        raise HTTPException(status_code=401, detail="Unauthorized")
+        return SERVICE  # auth disabled
+
+    # Service first: an exact match keeps the existing callers on their old path.
+    if provided and hmac.compare_digest(provided, secret):
+        return SERVICE
+
+    if bearer:
+        user_id = _verify_supabase_jwt(bearer)
+        if user_id:
+            return Principal("user", user_id)
+
+    raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def authorize_for(principal: Principal, user_id: str) -> None:
+    """A student's token may only ever reach that student's own profile."""
+    if principal.kind == "user" and principal.user_id != user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+
+def require_service(principal: Principal) -> None:
+    """Graph-wide operations are never a student's to perform."""
+    if principal.kind != "service":
+        raise HTTPException(status_code=403, detail="Forbidden")
 
 
 # --------------------------------------------------------------------------- #
@@ -109,23 +212,35 @@ async def ready() -> JSONResponse:
     return JSONResponse(status_code=200 if ok else 503, content=status)
 
 
-@app.on_event("startup")
-async def _startup_db_check() -> None:
-    """Log a clear alert if the Kernel boots without full DB access."""
-    try:
-        client = db.get_client()
-        status = db.check_db_access(client)
-        if not (status["read_ok"] and status["write_ok"]):
-            db.log_monitoring(client, "error", "startup_db_degraded", status)
-    except Exception:  # noqa: BLE001 - never block startup (e.g. tests without creds)
-        pass
-
-
 # --------------------------------------------------------------------------- #
 # /analyze — main route
 # --------------------------------------------------------------------------- #
-@app.post("/analyze", response_model=AnalyzeResponse, dependencies=[Depends(require_auth)])
-async def analyze(req: AnalyzeRequest) -> AnalyzeResponse:
+@app.post("/analyze", response_model=AnalyzeResponse)
+async def analyze(
+    req: AnalyzeRequest,
+    background: BackgroundTasks,
+    principal: Principal = Depends(authenticate),
+) -> AnalyzeResponse:
+    authorize_for(principal, req.user_id)
+
+    # /analyze is the expensive route: two LLM calls minimum, and it holds the
+    # container awake. Refuse past the budget rather than burn credits and LLM
+    # quota on a client stuck in a retry loop.
+    allowed, retry_after, scope = ratelimit.check_analyze(req.user_id)
+    if not allowed:
+        try:
+            db.log_monitoring(
+                db.get_client(), "warn", "analyze_rate_limited",
+                {"scope": scope, "user_id": req.user_id, "retry_after": retry_after},
+            )
+        except Exception:  # noqa: BLE001 - never let logging mask the 429
+            pass
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit reached ({scope}). Retry in {retry_after}s.",
+            headers={"Retry-After": str(retry_after)},
+        )
+
     request_id = str(uuid.uuid4())
     payload = req.model_dump(mode="json")
     client = db.get_client()
@@ -144,14 +259,28 @@ async def analyze(req: AnalyzeRequest) -> AnalyzeResponse:
         db.log_monitoring(client, "error", "analyze_failed", {"request_id": request_id, "error": str(e)})
         raise HTTPException(status_code=500, detail=f"Analysis failed (request_id={request_id})") from e
 
+    # Recalibrate the KCs this analysis committed to, after the response is sent.
+    #
+    # /analyze is where almost all evidence actually lands — it runs on every
+    # conversation, while /update_concept_state only fires on a graded attempt.
+    # Hanging calibration off the graded route alone meant a KC could accumulate
+    # months of conversational evidence and still be scored on literature priors.
+    # The pipeline returns only KCs it committed to AND that are past their
+    # cooldown, so a busy KC is not rescanned on every turn.
+    for concept_id in output.pop("recalibrate_concept_ids", []):
+        background.add_task(_recalibrate_kc, concept_id)
+
     return AnalyzeResponse(kernel_version=KERNEL_VERSION, **output)
 
 
 # --------------------------------------------------------------------------- #
 # /load_profile
 # --------------------------------------------------------------------------- #
-@app.post("/load_profile", response_model=LoadProfileResponse, dependencies=[Depends(require_auth)])
-async def load_profile(req: LoadProfileRequest) -> LoadProfileResponse:
+@app.post("/load_profile", response_model=LoadProfileResponse)
+async def load_profile(
+    req: LoadProfileRequest, principal: Principal = Depends(authenticate)
+) -> LoadProfileResponse:
+    authorize_for(principal, req.user_id)
     client = db.get_client()
 
     nodes = {n["id"]: n for n in db.load_concept_nodes(client)}
@@ -207,24 +336,34 @@ async def load_profile(req: LoadProfileRequest) -> LoadProfileResponse:
 # --------------------------------------------------------------------------- #
 # /update_concept_state — called by RAYA on a strong signal
 # --------------------------------------------------------------------------- #
-@app.post(
-    "/update_concept_state",
-    response_model=UpdateConceptStateResponse,
-    dependencies=[Depends(require_auth)],
-)
+@app.post("/update_concept_state", response_model=UpdateConceptStateResponse)
 async def update_concept_state(
-    req: UpdateConceptStateRequest, background: BackgroundTasks
+    req: UpdateConceptStateRequest,
+    background: BackgroundTasks,
+    principal: Principal = Depends(authenticate),
 ) -> UpdateConceptStateResponse:
+    authorize_for(principal, req.user_id)
     client = db.get_client()
 
-    node = next(
-        (n for n in db.load_concept_nodes(client) if n["id"] == req.concept_id),
-        None,
-    )
-    if node is None:
-        raise HTTPException(status_code=404, detail="concept_id not found")
+    # Resolve the KC: by UUID when the caller holds one, otherwise by label —
+    # canonicalized and created on the fly, the same path /analyze takes.
+    if req.concept_id:
+        node = next(
+            (n for n in db.load_concept_nodes(client) if n["id"] == req.concept_id),
+            None,
+        )
+        if node is None:
+            raise HTTPException(status_code=404, detail="concept_id not found")
+    else:
+        node = await get_or_create_kc(
+            label=req.concept_label,
+            subject=req.subject,
+            level=req.level,
+            supabase_client=client,
+        )
+    concept_id = node["id"]
 
-    state = db.load_student_concept_state(client, req.user_id, req.concept_id)
+    state = db.load_student_concept_state(client, req.user_id, concept_id)
     params = bkt.get_bkt_params(node)
     k_raw_prev = (state.get("mastery_score_raw") if state else None) or params["p_init"]
 
@@ -252,7 +391,7 @@ async def update_concept_state(
         client,
         {
             "user_id": req.user_id,
-            "concept_id": req.concept_id,
+            "concept_id": concept_id,
             "mastery_score_raw": round(k_raw, 4),
             "mastery_score_effective": round(k_raw, 4),
             "v_score": v_score,
@@ -264,7 +403,7 @@ async def update_concept_state(
             "last_strong_signal_at": now,
         },
     )
-    db.log_trajectory(client, req.user_id, req.concept_id, k_raw, k_raw)
+    db.log_trajectory(client, req.user_id, concept_id, k_raw, k_raw)
 
     k_eff = forgetting.compute_effective_mastery(
         k_raw, node.get("type_kc", "conceptual"), now,
@@ -272,12 +411,17 @@ async def update_concept_state(
     )
     status = bkt.classify_status(k_eff, params["p_slip"], new_avg)
 
-    # Fire-and-forget empirical recalibration for this KC in the background.
-    background.add_task(_recalibrate_kc, req.concept_id)
+    # Fire-and-forget empirical recalibration, but only if this KC is past its
+    # cooldown: recalibration reads every student's state for the KC, and a
+    # class submitting the same exercise would otherwise trigger one full scan
+    # per pupil for an aggregate that barely moves between them.
+    if calibration.is_calibration_due(node):
+        background.add_task(_recalibrate_kc, concept_id)
 
     return UpdateConceptStateResponse(
         user_id=req.user_id,
-        concept_id=req.concept_id,
+        concept_id=concept_id,
+        label=node.get("label", ""),
         k_raw=round(k_raw, 4),
         k_effective=round(k_eff, 4),
         p_score=p_score,
@@ -303,10 +447,137 @@ def _recalibrate_kc(concept_id: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# /load_alerts — the read side of the monitoring the Kernel already writes
+# --------------------------------------------------------------------------- #
+# The Kernel has been writing pedagogical-safety alerts to kernel_monitoring
+# since the anomaly layer landed, and nothing could read them back. Detecting
+# that a child has stopped trying and filing it where no adult will ever look is
+# not a safety feature.
+#
+# Two scopes, and the difference is not cosmetic:
+#
+#   user_id   — one student. A student's own token reaches their own alerts and
+#               nothing else, via the same authorize_for() as every other route.
+#
+#   user_ids  — an explicit roster, service-only. Staff are assigned to classes,
+#               not to whole establishments, so a teacher dashboard asking for a
+#               school would show them children they don't teach. The app knows
+#               which classes a teacher has; it resolves the list and asks for
+#               exactly those.
+#
+#   school_id — every student of one school. Service-only, on purpose: the
+#               Kernel has no idea who teaches where. It cannot tell a teacher's
+#               token from a parent's from a student's, so it cannot decide who
+#               may read a class. The app owns that check — it knows its staff —
+#               and presents the service secret once it has made it. If the
+#               Kernel guessed here, one forged token would open a whole school.
+@app.post("/load_alerts", response_model=LoadAlertsResponse)
+async def load_alerts(
+    req: LoadAlertsRequest, principal: Principal = Depends(authenticate)
+) -> LoadAlertsResponse:
+    client = db.get_client()
+
+    if req.user_id:
+        authorize_for(principal, req.user_id)
+        scope, user_ids = "user", [req.user_id]
+    elif req.user_ids:
+        # The caller resolved the roster itself — a teacher's assigned classes,
+        # typically. It vouches for that list; the Kernel only answers for it.
+        require_service(principal)
+        scope, user_ids = "users", list(dict.fromkeys(req.user_ids))
+    else:
+        require_service(principal)
+        scope = "school"
+        try:
+            user_ids = db.load_school_student_ids(client, req.school_id)
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(
+                status_code=503, detail=f"roster unavailable: {str(e)[:200]}"
+            ) from e
+
+    try:
+        rows = db.load_alerts(
+            client,
+            user_ids,
+            include_resolved=req.include_resolved,
+            severity=req.severity,
+            since=req.since.isoformat() if req.since else None,
+            limit=req.limit,
+        )
+    except Exception as e:  # noqa: BLE001 - never render a failed read as "all clear"
+        db.log_monitoring(client, "error", "alerts_read_failed", {"error": str(e)[:300]})
+        raise HTTPException(
+            status_code=503, detail=f"alerts unavailable: {str(e)[:200]}"
+        ) from e
+
+    # An alert stores a concept UUID; a dashboard needs the concept's name.
+    labels: dict[str, str] = {}
+    if any(r.get("concept_id") for r in rows):
+        labels = {n["id"]: n.get("label", "") for n in db.load_concept_nodes(client)}
+
+    alerts, by_type, by_severity = [], {}, {}
+    for row in rows:
+        alerts.append(
+            {**row, "concept_label": labels.get(row.get("concept_id") or "", "")}
+        )
+        a_type = row.get("alert_type") or "unknown"
+        a_sev = row.get("alert_severity") or "unknown"
+        by_type[a_type] = by_type.get(a_type, 0) + 1
+        by_severity[a_sev] = by_severity.get(a_sev, 0) + 1
+
+    return LoadAlertsResponse(
+        scope=scope,
+        user_id=req.user_id,
+        school_id=req.school_id,
+        students_in_scope=len(user_ids),
+        alerts=alerts,
+        counts_by_type=by_type,
+        counts_by_severity=by_severity,
+        truncated=len(rows) >= req.limit,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# /resolve_alert
+# --------------------------------------------------------------------------- #
+# Without this, `resolved` is a column nothing can ever set: the same alert
+# would sit at the top of the dashboard forever, and a list that never shrinks
+# is a list people stop reading. Service-only — acknowledging an alert is an
+# adult's act, and a student closing the alert raised about them is precisely
+# what the flag must not allow.
+@app.post("/resolve_alert", response_model=ResolveAlertResponse)
+async def resolve_alert(
+    req: ResolveAlertRequest, principal: Principal = Depends(authenticate)
+) -> ResolveAlertResponse:
+    require_service(principal)
+    client = db.get_client()
+
+    try:
+        row = db.set_alert_resolved(client, req.alert_id, req.resolved, req.resolved_by)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(
+            status_code=503, detail=f"alert update failed: {str(e)[:200]}"
+        ) from e
+
+    if row is None:
+        raise HTTPException(status_code=404, detail="alert not found")
+
+    return ResolveAlertResponse(
+        alert_id=req.alert_id,
+        resolved=bool(row.get("resolved")),
+        resolved_by=row.get("resolved_by"),
+        resolved_at=row.get("resolved_at"),
+    )
+
+
+# --------------------------------------------------------------------------- #
 # /seed_kcs
 # --------------------------------------------------------------------------- #
-@app.post("/seed_kcs", response_model=SeedResponse, dependencies=[Depends(require_auth)])
-async def seed_kcs() -> SeedResponse:
+@app.post("/seed_kcs", response_model=SeedResponse)
+async def seed_kcs(principal: Principal = Depends(authenticate)) -> SeedResponse:
+    # Seeding rewrites the shared graph for everyone — never a student's call.
+    require_service(principal)
+
     from seed.math_kcs import seed_math_kcs
 
     client = db.get_client()

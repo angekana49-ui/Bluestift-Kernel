@@ -7,11 +7,11 @@ venv/
 env/
 .env
 .env.local
+.env.example
 *.log
 .DS_Store
 .idea/
 .vscode/
-.env.example
 
 # Local corporate-proxy CA bundle (machine-specific, not for the repo)
 .ca-bundle.pem

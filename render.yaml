@@ -1,18 +1,62 @@
+# Render deployment (primary host).
+#
+# Chosen for a specific reason: the Kernel is called fire-and-forget, after a
+# conversation, never in the chat's critical path. It does not need to be awake.
+# A host that bills a container by the minute charges for idle time it never
+# uses — which is how the previous host ended up stopping the service when a
+# credit balance ran out. Render's free instance spins down when idle and wakes
+# on the next request, which is exactly the shape of this workload. The ~50s
+# cold start costs no student anything.
+#
+# Free instances are built from a connected Git repo, so pushing deploys —
+# no more manual CLI uploads.
+
 services:
   - type: web
     name: bluestift-kernel
-    env: python
+    runtime: python
+    plan: free
+    # Frankfurt: the Kernel processes minors' learning data and the product's
+    # GDPR pages are written accordingly. Free instances are region-limited —
+    # pick the closest available if this one isn't offered.
+    region: frankfurt
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
+    autoDeploy: true
+
     envVars:
+      # --- Database (required) ---
       - key: SUPABASE_URL
         sync: false
-      - key: SUPABASE_SERVICE_KEY
+      - key: SUPABASE_SERVICE_KEY      # service_role key — never the anon key
         sync: false
+
+      # --- LLM chain (required) ---
+      # Set BOTH: with a single provider, one rate limit takes /analyze down.
       - key: GROQ_API_KEY
         sync: false
       - key: GEMINI_API_KEY
         sync: false
+
+      # --- Auth (required in production) ---
+      # Service tier. Must match KERNEL_API_SECRET in the RAYA app.
+      # Missing here = the protected routes are OPEN to anyone with the URL.
+      - key: KERNEL_API_SECRET
+        sync: false
+      # User tier: the Supabase project's JWT secret, so a student's own token
+      # reaches only their own profile. Unset = that tier stays unavailable and
+      # only the service secret is accepted.
+      - key: SUPABASE_JWT_SECRET
+        sync: false
+
+      # --- Optional ---
       - key: KERNEL_VERSION
         value: 1.0.0
+      # Pin the interpreter to match .python-version.
+      - key: PYTHON_VERSION
+        value: 3.12.0
+      # Defaults to the RAYA + schools domains and localhost:3000. Override only
+      # if the app moves.
+      # - key: CORS_ORIGINS
+      #   sync: false

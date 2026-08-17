@@ -22,7 +22,7 @@ Shipped and verified live:
   validation).
 - Dynamic KCs for any subject; runtime label canonicalization.
 - **Pedagogical-safety anomaly detection** → `kernel_monitoring` + `/analyze` alerts.
-- 8 migrations, 30 tests, deployed on Railway.
+- 9 migrations, 45 tests, deployed on Railway.
 
 ### Shipped beyond the original v1 spec
 
@@ -65,35 +65,75 @@ updates state, and changes RAYA's next move.
 ## 2. School → AI → Student channel
 
 The corpus calls this the strongest **differentiator** (§4.1): the school does
-not just read reports — it actively calibrates the Kernel and RAYA. The
-`schools.school_curriculum_layers` table exists but no logic consumes it.
+not just read reports — it actively calibrates the Kernel and RAYA.
 
-- Ingest active layers into the analysis context:
-  - `curriculum` → constrain/seed the KC graph to the national program (MINESEC).
-  - `kc_priorities` → weight multipliers feeding the sequencing decision.
-  - `objectives` → mastery targets + deadlines surfaced on the dashboard.
-  - `custom_rules` → instructions injected into RAYA's prompt (layers 3/4).
-- Teacher override of Kernel inferences (scalable oversight, Amodei) — validate a
-  sample, extrapolate the rest.
-- An institutional dashboard exposing K/V/P/M per student per KC, the
-  `kernel_monitoring` alerts, behavioural/dropout risk, and equity (K
-  distribution per KC). Pitch line: *"audit what RAYA tells your students."*
+**Ingestion — shipped.** `schools.school_curriculum_layers` had a name and a list
+of concept ids and nothing read it. Migration 010 gives it a `layer_type` and a
+per-type `payload`, and `/analyze` now consumes the active layers for a student's
+school (via `schools.student_identities`), returning a `curriculum` block:
+
+- `curriculum` → the program's concepts; the response reports whether the
+  detected root gap is inside the program (`root_gap_in_program`).
+- `kc_priorities` → weight multipliers that reorder `recommended_path`. Bounded
+  to [0.1, 5.0] and applied *only* between concepts that are already valid next
+  steps: a school says what to reach for first, it cannot ask for a concept
+  before its prerequisites.
+- `objectives` → targets with deadlines, reported against real mastery as
+  `met` / `at_risk` / `overdue` / `pending` / `unknown`. A concept with no
+  evidence is reported `unknown` rather than counted as failure.
+- `custom_rules` → passed through for RAYA's prompt (the app already merges
+  `class_instructions` + `school_directives` into its soft nudges).
+
+A student with no school, or a school with malformed JSON, gets exactly the
+analysis they'd get with no school at all — the whole path is best-effort.
+
+Still open here:
+
+- **Constrain graph *construction*** to the national program (MINESEC). Today the
+  curriculum layer annotates and sequences; it does not stop the open graph from
+  creating off-program KCs.
+- **Teacher override of Kernel inferences** (scalable oversight, Amodei) —
+  validate a sample, extrapolate the rest. Nothing built.
+- **The institutional dashboard** — K/V/P/M per student per KC, the
+  `kernel_monitoring` alerts (now including the stability metrics), dropout risk,
+  and equity (K distribution per KC). This is app-side work; the Kernel exposes
+  what it needs. Pitch line: *"audit what RAYA tells your students."*
 
 ---
 
-## 3. Finish the anomaly / monitoring layer
+## 3. Finish the anomaly / monitoring layer — **shipped**
 
-Two detectors were deferred because they need population baselines or history:
+The two deferred detectors are in, both reading beyond a single conversation:
 
-- **`ood_distribution`** — distributional shift detection. All KT priors come
-  from North-American/Estonian data; a sub-Saharan deployment risks silent
-  failure (Goodhart, Amodei). Flag when a student's patterns diverge from the
-  calibrated distribution; trigger local recalibration once N > threshold.
-- **`inconsistency_high`** — temporal inconsistency > 0.40 over 20 interactions
-  (Hooshyar), plus `volatility_score`. Compute from `learning_trajectories`
-  once enough snapshots exist; this is the stability metric for the dashboard.
-- Wire richer anomaly signals back into the selective-update gate's `anomalous`
-  flag (currently a simple high-mastery-failure heuristic).
+- **`inconsistency_high`** — temporal inconsistency (Hooshyar) over the last 20
+  `learning_trajectories` snapshots, alongside `volatility_score`. Inconsistency
+  is total variation vs net displacement: a monotonic climb scores 0, an estimate
+  that swings and ends where it began scores 1. Fires above 0.40. The corpus
+  specifies a 20-interaction window; we compute from 6 snapshots up over whatever
+  part of the window exists, and carry `interactions_count` in the alert — waiting
+  for a full 20 would leave the first cohort unprotected.
+- **`ood_distribution`** — compares the student against the *local* population
+  baseline each KC accumulates (`empirical_difficulty`), not against the imported
+  priors. A large signed mean deviation across 3+ calibrated KCs means the
+  parameters don't describe this student. Direction is reported:
+  `below_population` is the silent-failure case (Goodhart, Amodei) and is raised
+  at high severity. KCs that haven't been calibrated carry no baseline and are
+  skipped — the neutral 0.5 placeholder a new KC is created with would otherwise
+  manufacture divergence out of nothing.
+- The selective-update gate's `anomalous` flag now also fires on an unstable
+  history, not only on failing a KC that looked mastered: when the estimate is
+  already oscillating, holding an update back keeps an unreliable value on the
+  books, so that is precisely where fresh evidence should count.
+- Alerts write `inconsistency_rate`, `volatility_score` and `interactions_count`
+  into their own `kernel_monitoring` columns (migration 008 already defined them),
+  so the dashboard can filter and chart without parsing the details JSON.
+
+Still open here:
+
+- **Trigger local recalibration** once a population's N passes threshold, instead
+  of only flagging the divergence.
+- Calibrate the thresholds (0.40 inconsistency, 0.4 OOD deviation, the 6-snapshot
+  floor) against real outcomes — they are reasoned defaults, not measured ones.
 
 ---
 
@@ -147,7 +187,11 @@ temporally stable, interpretable, works with ~10% of the training data.
 
 - **GitHub auto-deploy** — connect the repo in the Railway dashboard so pushes
   redeploy (current deploys are manual `railway up`).
-- **Auth** — JWT on the Kernel (deferred in v1; today it trusts the caller).
+- ~~**Auth** — JWT on the Kernel~~ — done. Two tiers: the service secret (a
+  trusted backend acting for anyone) and per-student Supabase tokens, verified
+  against the `user_id` in the body. What's left: HS256 only, so a project on
+  Supabase's asymmetric signing keys would need a JWKS fetch; and no rate
+  limiting or cost ceiling on `/analyze`, where each call is 2+ LLM calls.
 - **Monitoring/alerting dashboard** on top of `kernel_monitoring`.
 - **Offline-first** — sub-Saharan connectivity: deferred sync, state-conflict
   resolution (not addressed in the corpus; design needed).
@@ -160,9 +204,13 @@ temporally stable, interpretable, works with ~10% of the training data.
 
 ## Suggested order
 
-1. **RAYA integration** — turn on the flywheel (nothing else matters without it).
-2. **School channel + dashboard** — the differentiator, and what institutions buy.
-3. **Finish anomaly layer (OOD, inconsistency)** — pedagogical-safety story.
+1. ~~**RAYA integration**~~ — done: RAYA calls `/analyze` (chat, challenges,
+   assignments), reacts to alerts, and sends graded attempts to
+   `/update_concept_state` with their real partial credit.
+2. ~~**Finish anomaly layer (OOD, inconsistency)**~~ — done (§3); thresholds still
+   want calibrating against real outcomes.
+3. **School channel** — layer ingestion is in (§2); the institutional dashboard,
+   teacher override, and program-constrained graph construction are what's left.
 4. **Data-gated work** — confidence calibration, per-population params,
    Responsible-DKT — once real interactions accumulate.
 5. **GraphRAG, offline, multilingual, auth** — as scale and context demand.

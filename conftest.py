@@ -2,8 +2,9 @@
 
 The fake mirrors just enough of supabase-py's fluent query builder for the
 Kernel's data access: schema().table().select()/insert()/upsert()/update()
-with .eq()/.ilike()/.limit()/.execute(). It is deliberately small but faithful
-to the call shapes used in services/db.py and services/kc_registry.py.
+with .eq()/.ilike()/.in_()/.gte()/.order()/.limit()/.execute(). It is
+deliberately small but faithful to the call shapes used in services/db.py and
+services/kc_registry.py.
 """
 from __future__ import annotations
 
@@ -30,6 +31,7 @@ class _Query:
         self._on_conflict = None
         self._limit = None
         self._count = None
+        self._order = None
 
     # --- terminal-ish builders ------------------------------------------- #
     def select(self, *_args, count=None):
@@ -62,8 +64,20 @@ class _Query:
         self._filters.append((col, str(value).lower(), "ilike"))
         return self
 
+    def in_(self, col, values):
+        self._filters.append((col, list(values), "in"))
+        return self
+
+    def gte(self, col, value):
+        self._filters.append((col, value, "gte"))
+        return self
+
     def limit(self, n):
         self._limit = n
+        return self
+
+    def order(self, col, desc=False):
+        self._order = (col, desc)
         return self
 
     # --- helpers --------------------------------------------------------- #
@@ -72,6 +86,13 @@ class _Query:
             cell = row.get(col)
             if kind == "ilike":
                 if str(cell).lower() != value:
+                    return False
+            elif kind == "in":
+                if cell not in value:
+                    return False
+            elif kind == "gte":
+                # Timestamps are compared as ISO strings, which sort chronologically.
+                if cell is None or str(cell) < str(value):
                     return False
             elif cell != value:
                 return False
@@ -86,6 +107,11 @@ class _Query:
     def execute(self) -> _Result:
         if self._op == "select":
             rows = [r for r in self._rows if self._matches(r)]
+            if self._order is not None:
+                col, desc = self._order
+                # Sort before the limit, as PostgREST does — a limit applied to
+                # unordered rows would silently return the wrong window.
+                rows = sorted(rows, key=lambda r: (r.get(col) is None, r.get(col)), reverse=desc)
             if self._limit is not None:
                 rows = rows[: self._limit]
             return _Result(data=[dict(r) for r in rows], count=len(rows))

@@ -7,7 +7,9 @@ that turns learning interactions into **root-gap detection**. It is fully
 decoupled from every interface. RAYA (Next.js) calls it over HTTP — the Kernel
 knows nothing about React or client-side auth. It is autonomous.
 
-> **Status:** v1 — complete and deployed.
+> **Status:** v1 complete. Hosted on Railway (Hobby) with Serverless enabled —
+> see [Deploy](#deploy) for the cost rules that keep it inside the plan's
+> included usage.
 > **Live:** https://bluestift-kernel-production.up.railway.app
 > See [POST_MVP_ROADMAP.md](POST_MVP_ROADMAP.md) for what comes next.
 
@@ -60,9 +62,10 @@ Each KC, per student, carries a four-dimensional state (Luckin / corpus §1.2):
 │   ├── mindset.py           # Mindset score M (sigmoid blend)
 │   ├── detector.py          # DFS root-cause by convergence
 │   ├── calibration.py       # Self-calibration of living parameters
-│   └── anomaly.py           # Pedagogical-safety anomaly detection
+│   ├── anomaly.py           # Pedagogical-safety anomaly detection
+│   └── curriculum.py        # School curriculum layers -> sequencing + objectives
 ├── services/
-│   ├── llm.py               # LLM chain: Groq primary -> Gemini fallback
+│   ├── llm.py               # LLM chain: Groq primary -> Gemini fallback (REST)
 │   ├── kc_registry.py       # get_or_create_kc() — dynamic KCs
 │   ├── db.py                # Supabase read/write (service_role)
 │   ├── analyze.py           # /analyze pipeline orchestration
@@ -73,12 +76,11 @@ Each KC, per student, carries a four-dimensional state (Luckin / corpus §1.2):
 │   ├── build_graph.py       # CLI: distill a KC graph from the LLMs
 │   ├── build_bridges.py     # CLI: generate cross-subject prerequisite bridges
 │   └── apply_migrations.py  # CLI: apply migrations via the Management API
-├── migrations/              # 9 numbered Supabase SQL migrations
+├── migrations/              # 10 numbered Supabase SQL migrations
 ├── conftest.py              # In-memory fake Supabase for tests
-├── test_kernel.py           # 31 tests
-├── requirements.txt
-├── Procfile / railway.toml / render.yaml
-└── .env.example
+├── test_kernel.py           # 60 tests
+├── requirements.txt / requirements-dev.txt
+└── Procfile / railway.toml / render.yaml
 ```
 
 ---
@@ -92,11 +94,26 @@ Each KC, per student, carries a four-dimensional state (Luckin / corpus §1.2):
 | POST   | `/analyze`               | 🔒   | **Main route.** Conversation → root-gap + alerts.  |
 | POST   | `/load_profile`          | 🔒   | Full cognitive profile with K_effective recomputed. |
 | POST   | `/update_concept_state`  | 🔒   | Manual KC update on a strong signal (called by RAYA). |
+| POST   | `/load_alerts`           | 🔒   | Read pedagogical-safety alerts — one student, or a whole school. |
+| POST   | `/resolve_alert`         | 🔒   | Acknowledge an alert (or reopen it).               |
 | POST   | `/seed_kcs`              | 🔒   | Seed starter Math KCs if the table is empty.       |
 
-🔒 = requires `KERNEL_API_SECRET` when set (via `Authorization: Bearer`,
-`X-Kernel-Secret`, or `X-API-Key`). Unset = open (dev). See [KERNEL_HANDOFF.md](KERNEL_HANDOFF.md)
-for the app-integration contract.
+🔒 = authenticated. Two tiers of caller:
+
+- **service** — presents `KERNEL_API_SECRET` (via `Authorization: Bearer`,
+  `X-Kernel-Secret`, or `X-API-Key`). A trusted backend acting for many
+  students: may touch any `user_id`, and is the only tier allowed to `/seed_kcs`,
+  to the school scope of `/load_alerts`, and to `/resolve_alert`.
+- **user** — presents a Supabase access token. Scoped to one student: the Kernel
+  checks the token's `sub` against the `user_id` in the body and returns **403**
+  for anyone else's. Requires `SUPABASE_JWT_SECRET`; without it this tier is
+  simply unavailable.
+
+Unrecognised or missing credentials → **401**. `KERNEL_API_SECRET` unset = open
+(dev only). This bounds *who may ask about whom*; it places no limit on what the
+Kernel can model — any student, any subject, KCs created on the fly.
+
+See [KERNEL_HANDOFF.md](KERNEL_HANDOFF.md) for the app-integration contract.
 
 Interactive docs at `/docs`.
 
@@ -130,13 +147,27 @@ Requires **Python 3.11+** (3.12 pinned for deploy via `.python-version`).
 python -m venv .venv
 source .venv/Scripts/activate     # Windows (Git Bash)
 # source .venv/bin/activate         # macOS / Linux
-pip install -r requirements.txt
-
-cp .env.example .env
-#   fill in SUPABASE_URL, SUPABASE_SERVICE_KEY, GROQ_API_KEY, GEMINI_API_KEY
+pip install -r requirements.txt -r requirements-dev.txt
 
 uvicorn main:app --reload --port 8000
 ```
+
+Create a `.env` (never committed — every env file is gitignored, including
+examples) with:
+
+| Variable | | |
+|---|---|---|
+| `SUPABASE_URL` | required | `https://<project-ref>.supabase.co` |
+| `SUPABASE_SERVICE_KEY` | required | the **service_role** key, never the anon key |
+| `GROQ_API_KEY` | required | primary LLM |
+| `GEMINI_API_KEY` | required | fallback LLM — set both in production, or one rate limit takes `/analyze` down |
+| `KERNEL_API_SECRET` | prod | service-tier secret for the 🔒 routes; must match the RAYA app's. Empty = auth disabled (local only) |
+| `SUPABASE_JWT_SECRET` | recommended | the Supabase project's JWT secret, enabling the user tier (per-student scoped tokens). Unset = only the service secret is accepted |
+| `KERNEL_VERSION` | optional | reported by `/health`; defaults to `1.0.0` |
+| `CORS_ORIGINS` | optional | comma-separated; defaults to the RAYA + schools domains and `localhost:3000` |
+| `ANALYZE_PER_USER_HOURLY` | optional | `/analyze` calls allowed per student per hour (default 30). Stops a client retry loop from burning credits and LLM quota |
+| `ANALYZE_GLOBAL_HOURLY` | optional | total `/analyze` calls per hour across everyone (default 300). The ceiling that catches a leaked service secret |
+| `SUPABASE_ACCESS_TOKEN` | migrations only | personal token (`sbp_...`) for `scripts/apply_migrations.py`; not needed by the running service |
 
 Open http://localhost:8000/health → `{"status":"ok", ...}`.
 
@@ -148,13 +179,13 @@ Open http://localhost:8000/health → `{"status":"ok", ...}`.
 ### LLM models
 
 - Primary (Groq): `openai/gpt-oss-120b`
-- Fallback (Gemini, REST transport): `gemini-3.1-flash-lite`
+- Fallback (Gemini, direct REST via httpx — no SDK): `gemini-3.1-flash-lite`
 
 The chain never crashes `/analyze`: Groq → Gemini, and only raises if both fail.
 
 ### Database migrations
 
-Apply the nine SQL files **in order** in the Supabase SQL editor (or via the
+Apply the ten SQL files **in order** in the Supabase SQL editor (or via the
 Management API with `scripts/apply_migrations.py`):
 
 ```
@@ -167,6 +198,7 @@ Management API with `scripts/apply_migrations.py`):
 007_rls_policies.sql         # full RLS policy set
 008_kernel_monitoring_alerts.sql  # pedagogical-safety alert schema
 009_shared_db_hardening.sql       # re-assert exposed schemas + grants (shared DB)
+010_school_curriculum_layers.sql  # school layer types + payloads (School -> AI -> Student)
 ```
 
 > **Shared DB:** the Kernel shares its Supabase project with the RAYA app. If the
@@ -201,6 +233,16 @@ python scripts/build_graph.py MATH cycle3 cycle4 lycee
 The LLM supplies the **structure** (nodes + edges); real student data later
 calibrates the **parameters** (difficulty, decay) — the flywheel.
 
+**When calibration actually fires.** Both `/analyze` (on every KC it commits to)
+and `/update_concept_state` schedule a background recalibration, throttled to
+once per KC per `CALIBRATION_COOLDOWN_HOURS` (6). But
+`compute_empirical_kc_params` refuses to run on thin data: a KC needs **10+
+students**, of whom at least one has **5+ interactions** on it. Below that it
+returns `None` and the KC keeps its literature priors — deliberately, since
+fitting difficulty to three pupils is worse than not fitting it. So expect
+`last_calibration_at` to stay null until a KC has real classroom traffic, and
+read a null there as "not enough evidence yet", never as a failure.
+
 ### Cross-subject bridges
 
 The graph spans subjects in one table, and the detector traverses any edge — so
@@ -224,11 +266,13 @@ detector change needed; the convergence search crosses the bridge automatically.
 pytest -q
 ```
 
-31 tests. The suite mocks the LLM and uses an in-memory fake Supabase
+60 tests. The suite mocks the LLM and uses an in-memory fake Supabase
 (`conftest.py`), so **no network or real keys are required**. Coverage: BKT,
 forgetting, mindset, detector (convergence), calibration, the cognitive vector
-(V/P/slip), anomaly detectors, graph-builder validation, `get_or_create_kc`, and
-the `/health`, `/analyze`, `/load_profile`, `/seed_kcs` routes.
+(V/P/slip), anomaly detectors (including temporal inconsistency and OOD),
+school curriculum layers, graph-builder validation, `get_or_create_kc`, and the
+`/health`, `/ready`, `/analyze`, `/load_profile`, `/update_concept_state`,
+`/load_alerts`, `/resolve_alert`, `/seed_kcs` routes.
 
 ---
 
@@ -236,20 +280,41 @@ the `/health`, `/analyze`, `/load_profile`, `/seed_kcs` routes.
 
 ### Railway (primary)
 
-`railway.toml` (NIXPACKS, health check `/health`). Set the env vars from
-`.env.example`. Deployed via:
+`railway.toml` (health check `/health`). Set the env vars from the table above
+in the Railway dashboard — not from a file. Deployed via:
 
 ```bash
 railway up --detach --service bluestift-kernel
 ```
 
-Already live at https://bluestift-kernel-production.up.railway.app.
+**Keeping it inside the plan.** Railway bills per minute while the container
+runs, so the service is built to spend as little time running as possible. The
+Kernel is called fire-and-forget after a conversation, never in the chat's
+critical path, so sleeping costs no student anything.
+
+- **Enable Serverless** on the service (dashboard — there is no config key for
+  it). Railway sleeps a service after 10 minutes with **no outbound traffic**.
+- **Nothing may hold a connection open at rest.** No database pooler, no
+  realtime websocket, no telemetry — any of them and the service never sleeps.
+  The Supabase client is HTTP-only and opens nothing when idle, which is what
+  makes this work. Verify before adding a dependency that keeps a socket.
+- **Never point an uptime monitor at `/health`.** A ping every few minutes keeps
+  the container awake around the clock and turns a ~$0.10/month service into a
+  ~$1/month one. `scripts/check_prod.sh` is for running by hand, not on a timer.
+- `/analyze` is rate-limited (see the env table): two LLM calls per request and
+  no ceiling was a way to burn both credits and LLM quota on a retry loop.
+
+At ~57 MB resident, the service costs roughly $0.10/month asleep most of the day
+and under $1/month even if it never slept — inside the Hobby plan's included $5
+either way. It was the pre-slimming footprint, at ~100 MB, that could not fit the
+Free plan's $1 credit and got the deployment stopped.
 
 ### Render (fallback)
 
-`render.yaml` defines the web service; set the secret env vars in the dashboard.
+`render.yaml` is complete and current — blueprint, plan, region, and all six
+secrets declared. Usable as-is if Railway is ever the wrong answer.
 
-Both also work via the `Procfile`:
+Both hosts also work via the `Procfile`:
 
 ```
 web: uvicorn main:app --host 0.0.0.0 --port $PORT

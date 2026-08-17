@@ -9,7 +9,7 @@ from __future__ import annotations
 from collections import Counter
 from datetime import datetime, timezone
 
-from core import anomaly, bkt, calibration, detector, forgetting, mindset
+from core import anomaly, bkt, calibration, curriculum, detector, forgetting, mindset
 from core.graph import build_graph, node_id
 from services import db
 from services.kc_registry import get_or_create_kc
@@ -162,6 +162,11 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
     subject = payload.get("subject", "MATH")
     level = payload.get("level", "unknown")
     conversation = payload["conversation_history"]
+    commit_state = payload.get("commit_state", True)
+    # KCs whose empirical parameters should be recomputed after this response
+    # goes out. A set: the same KC can be committed once per analysis, but this
+    # keeps that guarantee local rather than assumed.
+    recalibrate_ids: set[str] = set()
 
     # 1. LLM extraction of mentioned KCs + attempt evaluations. The existing KC
     #    vocabulary (across ALL subjects) is fed to the prompt to curb label drift,
@@ -187,6 +192,11 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
     # 3. Load existing student states for this user.
     states_rows = db.load_student_concept_states(client, user_id)
     states_by_concept = {s["concept_id"]: s for s in states_rows}
+
+    # 3a. Mastery history, one query for the whole student, grouped per KC. Feeds
+    #     the temporal-inconsistency detector and — because it is loaded before
+    #     the BKT loop — the selective-update gate below.
+    trajectories = _group_trajectories(db.load_recent_trajectories(client, user_id))
 
     # 3b. Mindset M from the conversation (needed to modulate P during the loop).
     m_score = _update_mindset(client, user_id, extraction.get("mindset_signals"))
@@ -215,10 +225,13 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
 
         attempt = attempts_by_label.get(label)
         committed_slip = None
+        history = trajectories.get(concept_id, [])
         # Selective-update gate: commit a BKT update only on a strong signal —
         # the first contact (bootstrap), 3+ attempts this session, a large
         # partial-credit shift, or an anomaly. Avoids overreacting to noise.
-        if attempt and _should_commit(attempt, state, attempt_counts.get(label, 1)):
+        if attempt and commit_state and _should_commit(
+            attempt, state, attempt_counts.get(label, 1), history
+        ):
             pc = attempt.get("partial_credit")
             if attempt.get("is_assisted"):
                 pc = min(pc if pc is not None else 0.9, 0.9)
@@ -237,13 +250,27 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
                 committed_slip = _persist_state(
                     client, user_id, concept_id, kc, k_before, k_raw, pc, attempt, state, lam, m_score
                 )
+                # This KC's evidence just changed, so its empirical parameters
+                # may have too. The node is already in memory, so the freshness
+                # check is free; the recalibration itself runs in the background
+                # after the response, and only for KCs actually past cooldown.
+                if calibration.is_calibration_due(kc):
+                    recalibrate_ids.add(concept_id)
             except Exception as e:  # noqa: BLE001 - degrade, still return the analysis
                 db.log_monitoring(client, "warn", "persist_state_failed", {"error": str(e)[:300]})
 
         p_slip = committed_slip or (state.get("p_slip_personal") if state else None) or bkt.get_bkt_params(kc)["p_slip"]
         pc_avg = (state.get("partial_credit_avg") if state else None) or 0.5
         status = bkt.classify_status(k_eff, p_slip, pc_avg)
-        kc_records.append({"label": label, "k_effective": k_eff, "p_slip": p_slip})
+        kc_records.append(
+            {
+                "label": label,
+                "k_effective": k_eff,
+                "p_slip": p_slip,
+                "trajectory": history,
+                "population_difficulty": _population_baseline(kc),
+            }
+        )
 
         mastery_map[label] = {
             "k_raw": round(k_raw, 4),
@@ -283,7 +310,13 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
     confidence = detection["confidence"]
 
     root_concept_id = node_id(graph, root_gap) if root_gap else None
-    rec_path = detector.recommended_path(graph, root_gap)
+
+    # 7b. School layer: if the student belongs to a school, its curriculum layers
+    #     shape the sequencing and its objectives are reported against real state.
+    #     Best-effort throughout — no school, or a school with bad JSON, must land
+    #     the student on exactly the analysis they'd get without one.
+    layers = _load_curriculum_layers(client, user_id, subject, level)
+    rec_path = detector.recommended_path(graph, root_gap, priorities=layers.weights)
 
     # 8. Natural-language summary.
     surface = detection_path[0] if detection_path else (failing[0] if failing else "")
@@ -301,7 +334,25 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
         "recommended_path": rec_path,
         "alerts": [{"type": a["alert_type"], "severity": a["alert_severity"]} for a in alerts],
         "llm_used": llm_used if llm_used != "none" else summary_llm,
+        # Not part of the API contract: the route pops this and schedules the
+        # work after responding. It rides along because only this function knows
+        # which KCs it actually committed to.
+        "recalibrate_concept_ids": sorted(recalibrate_ids),
     }
+
+    if not layers.is_empty:
+        output["curriculum"] = {
+            "school_id": layers.school_id,
+            "layers_applied": layers.applied(),
+            "objectives": curriculum.objective_report(layers.objectives, effective_states),
+            # Whether the detected root gap is part of the school's program. A
+            # gap outside it is still the truth and still reported — the school
+            # just knows it is looking at something off-program.
+            "root_gap_in_program": (
+                root_gap in layers.concepts if (root_gap and layers.concepts) else None
+            ),
+            "rules": layers.rules,
+        }
 
     # 9. Persist output + insight (request was already logged by the caller).
     db.log_kernel_output(client, request_id, user_id, output)
@@ -310,18 +361,79 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
     return output
 
 
-def _should_commit(attempt: dict, prev_state: dict | None, attempts_this_session: int) -> bool:
+def _load_curriculum_layers(client, user_id: str, subject: str, level: str):
+    """Load and parse the student's school layers; empty when they have no school.
+
+    Wrapped whole: a student's analysis must not depend on their school's data
+    being present or well-formed.
+    """
+    try:
+        school_id = db.load_school_id(client, user_id)
+        if not school_id:
+            return curriculum.CurriculumLayers()
+        rows = db.load_curriculum_layers(client, school_id, subject, level)
+        return curriculum.parse_layers(rows, school_id=school_id)
+    except Exception as e:  # noqa: BLE001 - degrade to no school context
+        db.log_monitoring(client, "warn", "curriculum_layers_failed", {"error": str(e)[:300]})
+        return curriculum.CurriculumLayers()
+
+
+def _group_trajectories(rows: list[dict]) -> dict[str, list[float]]:
+    """Group trajectory snapshots into a k_raw series per concept, oldest first.
+
+    The query already orders by snapshot_at, so append order is chronological.
+    """
+    series: dict[str, list[float]] = {}
+    for row in rows:
+        concept_id = row.get("concept_id")
+        k_raw = row.get("k_raw")
+        if concept_id is None or k_raw is None:
+            continue
+        series.setdefault(concept_id, []).append(float(k_raw))
+    return series
+
+
+def _population_baseline(kc: dict) -> float | None:
+    """The KC's calibrated empirical difficulty, or None if it has none yet.
+
+    New KCs are created with a neutral 0.5 placeholder, so the value alone can't
+    say whether a baseline exists. `last_calibration_at` is what distinguishes a
+    real, population-derived difficulty from that default — comparing a student
+    against the placeholder would manufacture out-of-distribution signal from
+    nothing.
+    """
+    if not kc.get("last_calibration_at"):
+        return None
+    difficulty = kc.get("empirical_difficulty")
+    return float(difficulty) if difficulty is not None else None
+
+
+def _should_commit(
+    attempt: dict,
+    prev_state: dict | None,
+    attempts_this_session: int,
+    trajectory: list[float] | None = None,
+) -> bool:
     """Selective-update gate (Corbett-style strong-signal rule).
 
     First contact bootstraps the state; afterwards a BKT update commits only on a
     strong signal: 3+ attempts on the KC this session, a partial-credit shift
     > 0.3 vs the stored average, or a flagged anomaly.
+
+    The anomaly arm reads two signals. The first is the classic one: failing a KC
+    that looked mastered. The second is an unstable history — when the estimate
+    is already oscillating, holding an update back keeps a stale, unreliable
+    value on the books, so a wobbling KC is exactly where fresh evidence counts.
     """
     if prev_state is None:
         return True  # bootstrap the very first observation
     pc = attempt.get("partial_credit")
     prev_avg = prev_state.get("partial_credit_avg")
-    anomalous = attempt.get("outcome") == "failure" and (prev_state.get("mastery_score_raw") or 0) >= 0.8
+    failed_a_mastered_kc = (
+        attempt.get("outcome") == "failure" and (prev_state.get("mastery_score_raw") or 0) >= 0.8
+    )
+    unstable = anomaly.detect_inconsistency_high("", trajectory or []) is not None
+    anomalous = failed_a_mastered_kc or unstable
     return bkt.should_update_bkt(attempts_this_session, pc if pc is not None else 0.0, prev_avg, anomalous)
 
 

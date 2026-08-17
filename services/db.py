@@ -168,6 +168,27 @@ def log_trajectory(client, user_id: str, concept_id: str, k_raw: float, k_effect
         pass
 
 
+def load_recent_trajectories(client, user_id: str, limit: int = 400) -> list[dict]:
+    """Recent mastery snapshots for one student, across every KC.
+
+    One query for the whole user rather than one per KC: /analyze touches a
+    handful of KCs and the caller groups the rows in memory. Ordered oldest
+    first so a series can be read as-is; the limit caps a long history.
+    """
+    try:
+        res = (
+            _kernel(client, "learning_trajectories")
+            .select("concept_id, k_raw, snapshot_at")
+            .eq("user_id", user_id)
+            .order("snapshot_at", desc=False)
+            .limit(limit)
+            .execute()
+        )
+        return res.data or []
+    except Exception:  # noqa: BLE001 - history is an enrichment, never a blocker
+        return []
+
+
 def upsert_mindset(client, user_id: str, m_score: float, detected: str) -> None:
     _kernel(client, "student_mindset_state").upsert(
         {
@@ -178,6 +199,55 @@ def upsert_mindset(client, user_id: str, m_score: float, detected: str) -> None:
         },
         on_conflict="user_id",
     ).execute()
+
+
+# --------------------------------------------------------------------------- #
+# School curriculum layers (School -> AI -> Student channel)
+# --------------------------------------------------------------------------- #
+def _schools(client, table: str):
+    return client.schema("schools").table(table)
+
+
+def load_school_id(client, user_id: str) -> str | None:
+    """The school a student belongs to, or None for an independent learner.
+
+    `schools.student_identities` is owned by the app; the Kernel only reads it.
+    Most students have no school, so this failing or returning nothing is an
+    ordinary outcome, not an error.
+    """
+    try:
+        res = (
+            _schools(client, "student_identities")
+            .select("school_id")
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        )
+        return (res.data[0].get("school_id") if res.data else None) or None
+    except Exception:  # noqa: BLE001 - no school context is a normal state
+        return None
+
+
+def load_curriculum_layers(client, school_id: str, subject: str, level: str) -> list[dict]:
+    """Active curriculum layers for a school, for this subject.
+
+    Level is matched permissively: a layer set for the whole subject (level
+    `'*'` or empty) applies to every level, so a school doesn't have to restate
+    its program per class.
+    """
+    try:
+        res = (
+            _schools(client, "school_curriculum_layers")
+            .select("layer_type, payload, concept_ids, level")
+            .eq("school_id", school_id)
+            .eq("is_active", True)
+            .eq("subject", subject)
+            .execute()
+        )
+        rows = res.data or []
+    except Exception:  # noqa: BLE001 - school context is an enrichment, never a blocker
+        return []
+    return [r for r in rows if r.get("level") in (level, "*", "", None)]
 
 
 # --------------------------------------------------------------------------- #
@@ -259,22 +329,108 @@ def check_db_access(client) -> dict:
 
 def log_alert(client, user_id: str, alert: dict, concept_id: str | None = None) -> None:
     """Persist a pedagogical-safety alert to kernel_monitoring (best-effort)."""
+    details = alert.get("alert_details", {}) or {}
+    row = {
+        "level": "alert",
+        "event": alert["alert_type"],
+        "user_id": user_id,
+        "concept_id": concept_id,
+        "alert_type": alert["alert_type"],
+        "alert_severity": alert["alert_severity"],
+        "alert_details": details,
+        "resolved": False,
+        "created_at": _now_iso(),
+    }
+    # Stability metrics get their own columns (migration 008) so a dashboard can
+    # filter and chart them without digging through the details JSON.
+    for column in ("inconsistency_rate", "volatility_score", "interactions_count"):
+        if details.get(column) is not None:
+            row[column] = details[column]
+
     try:
-        _kernel(client, "kernel_monitoring").insert(
-            {
-                "level": "alert",
-                "event": alert["alert_type"],
-                "user_id": user_id,
-                "concept_id": concept_id,
-                "alert_type": alert["alert_type"],
-                "alert_severity": alert["alert_severity"],
-                "alert_details": alert.get("alert_details", {}),
-                "resolved": False,
-                "created_at": _now_iso(),
-            }
-        ).execute()
+        _kernel(client, "kernel_monitoring").insert(row).execute()
     except Exception:  # noqa: BLE001 - monitoring must never break a flow
         pass
+
+
+# --------------------------------------------------------------------------- #
+# Monitoring reads (the alert dashboard)
+# --------------------------------------------------------------------------- #
+# Every other read in this file swallows its errors and returns an empty result,
+# because it feeds an enrichment: no school context, no history, no problem.
+# These three do the opposite and let the exception out. They feed a screen a
+# teacher reads to decide whether a child needs attention, and an empty list
+# there says "nothing wrong" — so a failed query would render as an all-clear.
+# A visible 503 is the only honest failure mode for a safety dashboard.
+ALERT_COLUMNS = (
+    "id, user_id, concept_id, alert_type, alert_severity, alert_details, "
+    "inconsistency_rate, volatility_score, interactions_count, "
+    "resolved, resolved_by, resolved_at, created_at"
+)
+
+
+def load_school_student_ids(client, school_id: str, limit: int = 2000) -> list[str]:
+    """Every student the app has registered under this school."""
+    res = (
+        _schools(client, "student_identities")
+        .select("user_id")
+        .eq("school_id", school_id)
+        .limit(limit)
+        .execute()
+    )
+    return [r["user_id"] for r in (res.data or []) if r.get("user_id")]
+
+
+def load_alerts(
+    client,
+    user_ids: list[str],
+    *,
+    include_resolved: bool = False,
+    severity: str | None = None,
+    since: str | None = None,
+    limit: int = 100,
+) -> list[dict]:
+    """Pedagogical-safety alerts for a set of students, newest first."""
+    if not user_ids:
+        return []
+    query = (
+        _kernel(client, "kernel_monitoring")
+        .select(ALERT_COLUMNS)
+        # `kernel_monitoring` also carries ordinary operational logs; only rows
+        # written by log_alert() are alerts.
+        .eq("level", "alert")
+        .in_("user_id", user_ids)
+    )
+    if not include_resolved:
+        query = query.eq("resolved", False)
+    if severity:
+        query = query.eq("alert_severity", severity)
+    if since:
+        query = query.gte("created_at", since)
+    res = query.order("created_at", desc=True).limit(limit).execute()
+    return res.data or []
+
+
+def set_alert_resolved(
+    client, alert_id: str, resolved: bool, resolved_by: str
+) -> dict | None:
+    """Acknowledge an alert, or reopen it. Returns the updated row, else None."""
+    res = (
+        _kernel(client, "kernel_monitoring")
+        .update(
+            {
+                "resolved": resolved,
+                "resolved_by": resolved_by if resolved else None,
+                "resolved_at": _now_iso() if resolved else None,
+            }
+        )
+        .eq("id", alert_id)
+        # Scoped to alert rows so this can never rewrite an operational log line.
+        .eq("level", "alert")
+        .execute()
+    )
+    rows = res.data or []
+    return rows[0] if rows else None
 
 
 def log_monitoring(client, level: str, event: str, detail: dict | None = None) -> None:
