@@ -78,9 +78,9 @@ Each KC, per student, carries a four-dimensional state (Luckin / corpus §1.2):
 │   └── apply_migrations.py  # CLI: apply migrations via the Management API
 ├── migrations/              # 10 numbered Supabase SQL migrations
 ├── conftest.py              # In-memory fake Supabase for tests
-├── test_kernel.py           # 60 tests
+├── test_kernel.py           # 82 tests
 ├── requirements.txt / requirements-dev.txt
-└── Procfile / railway.toml / render.yaml
+└── railway.toml            # Deploy config + the cost rules that keep it cheap
 ```
 
 ---
@@ -309,16 +309,18 @@ and under $1/month even if it never slept — inside the Hobby plan's included $
 either way. It was the pre-slimming footprint, at ~100 MB, that could not fit the
 Free plan's $1 credit and got the deployment stopped.
 
-### Render (fallback)
+### Moving hosts
 
-`render.yaml` is complete and current — blueprint, plan, region, and all six
-secrets declared. Usable as-is if Railway is ever the wrong answer.
-
-Both hosts also work via the `Procfile`:
+Nothing here is Railway-specific beyond `railway.toml`. The service is a plain
+ASGI app: any host that can run
 
 ```
-web: uvicorn main:app --host 0.0.0.0 --port $PORT
+uvicorn main:app --host 0.0.0.0 --port $PORT
 ```
+
+with the environment variables from the table above will serve it. A stale
+blueprint for a host we don't use is worse than none — it drifts, and someone
+eventually trusts it — so write one when a move actually happens.
 
 ---
 
@@ -332,6 +334,6 @@ web: uvicorn main:app --host 0.0.0.0 --port $PORT
 - **Strict Pydantic validation** on all inputs/outputs.
 - **Living parameters** — priors from the literature, refined from real data.
 - **Pedagogical safety** — anomalies flagged to `kernel_monitoring` and returned to RAYA.
-- **Free tier only** — Supabase, Groq, Gemini, Railway/Render.
+- **Cheapest viable tier** — Supabase and the LLMs on free tiers; Railway Hobby ($5) because a container that can never start is not a saving.
 
 See [POST_MVP_ROADMAP.md](POST_MVP_ROADMAP.md) for everything beyond v1.
