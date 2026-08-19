@@ -303,6 +303,23 @@ critical path, so sleeping costs no student anything.
   ~$1/month one. `scripts/check_prod.sh` is for running by hand, not on a timer.
 - `/analyze` is rate-limited (see the env table): two LLM calls per request and
   no ceiling was a way to burn both credits and LLM quota on a retry loop.
+- **Boot does no network work.** The lifespan handler is empty on purpose. A
+  service that sleeps boots several times a day, on a caller's latency budget,
+  so anything added there is paid on every wake. The startup DB probe that used
+  to live there is available on demand at `/ready` instead. Two tests lock this
+  down: `test_boot_touches_no_network` and
+  `test_no_background_thread_or_timer_is_started`.
+- **The only work outside a request** is the post-response recalibration
+  scheduled by `/analyze` and `/update_concept_state`, and it is gated by
+  `CALIBRATION_COOLDOWN_HOURS` so a busy KC is not rescanned per conversation.
+
+On the app side the same discipline applies, because a caller can keep the
+Kernel awake just as easily as the Kernel can keep itself awake. The profile
+cache (`lib/kernel/profile-cache.ts`) refreshes when the Kernel has actually
+committed something — both mutation paths call `invalidateProfile()` — plus a
+6-hour floor for pure forgetting drift. It used to refresh whenever the
+in-process cache was cold, which on Vercel meant nearly every chat turn woke a
+sleeping container to warm a cache, and usually timed out doing it.
 
 At ~57 MB resident, the service costs roughly $0.10/month asleep most of the day
 and under $1/month even if it never slept — inside the Hobby plan's included $5

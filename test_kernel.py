@@ -1474,3 +1474,40 @@ def test_analyze_schedules_recalibration_for_the_kcs_it_committed(monkeypatch):
     assert scheduled == ["kc-a", "kc-b"]
     # The scheduling key is internal plumbing and must not leak into the contract.
     assert "recalibrate_concept_ids" not in resp.json()
+
+
+# --------------------------------------------------------------------------- #
+# Sleep discipline: the Kernel works only when asked
+# --------------------------------------------------------------------------- #
+def test_boot_touches_no_network(monkeypatch):
+    """Starting up must not talk to anything.
+
+    The service sleeps and is woken by a request, so a boot happens on the
+    caller's latency budget — several times a day, not once a month. Any network
+    call added to the lifespan is paid on every single wake, and any background
+    timer would stop the container from ever sleeping again.
+    """
+    calls: list[str] = []
+    monkeypatch.setattr(db_module, "get_client", lambda: calls.append("get_client"))
+    monkeypatch.setattr(db_module, "check_db_access", lambda *_: calls.append("probe"))
+    monkeypatch.setattr(db_module, "log_monitoring", lambda *a, **k: calls.append("log"))
+
+    # Entering the TestClient context runs the lifespan startup.
+    with TestClient(main.app) as c:
+        assert c.get("/health").status_code == 200
+    assert calls == [], f"boot reached the network: {calls}"
+
+
+def test_no_background_thread_or_timer_is_started():
+    """Nothing may keep the process busy between requests.
+
+    Railway sleeps the service after ten minutes with no outbound traffic. A
+    poller, a scheduler or a keep-alive would silently turn a $0.12/month
+    service into an always-on one, and the symptom is only ever the invoice.
+    """
+    import threading
+
+    before = threading.active_count()
+    with TestClient(main.app) as c:
+        c.get("/health")
+    assert threading.active_count() <= before

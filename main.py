@@ -64,14 +64,21 @@ CORS_ORIGINS = [o.strip() for o in _cors_env.split(",")] if _cors_env else DEFAU
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    """Log a clear alert if the Kernel boots without full DB access."""
-    try:
-        client = db.get_client()
-        status = db.check_db_access(client)
-        if not (status["read_ok"] and status["write_ok"]):
-            db.log_monitoring(client, "error", "startup_db_degraded", status)
-    except Exception:  # noqa: BLE001 - never block startup (e.g. tests without creds)
-        pass
+    """Boot without touching the network — deliberately.
+
+    This used to probe the database on startup and log a warning when the
+    Kernel came up degraded. That made sense for a service that starts once and
+    runs for weeks. This one sleeps and is woken by a request, so "startup" is
+    something that happens on an ordinary Tuesday afternoon whenever a student
+    finishes a conversation, and the probe cost two network round trips before
+    the app would accept traffic — on the cold-start path the caller is already
+    timing, plus a monitoring row written per wake that nobody reads.
+
+    The same probe is available on demand at /ready, which is where a check
+    belongs: run by something that wants an answer, not by the act of waking
+    up. Nothing here may grow network calls, background tasks, or timers — the
+    Kernel is only allowed to work when an upper layer asks it something.
+    """
     yield
 
 
