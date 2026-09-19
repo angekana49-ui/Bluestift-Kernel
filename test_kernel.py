@@ -1826,3 +1826,24 @@ def test_the_graph_is_paged_so_it_is_never_silently_half_loaded(fake_supabase):
         [{"id": f"kc-{i}", "label": f"c{i}", "subject": "MATH"} for i in range(total)],
     )
     assert len(db_module.load_concept_nodes(fake_supabase)) == total
+
+
+def test_the_extraction_prompt_does_not_close_the_list_of_subjects():
+    """Subject coverage was capped by a closed enum in the prompt.
+
+    It offered MATH | ENGLISH | PHYSICS | HISTORY | CHEMISTRY | BIOLOGY | OTHER,
+    so geography, philosophy, economics and the rest all collapsed onto OTHER.
+    That is not cosmetic: a school's curriculum layers are matched BY SUBJECT
+    (load_curriculum_layers), so a GEOGRAPHY layer could never reach KCs filed
+    as OTHER, and the per-subject vocabulary budget would treat every unnamed
+    discipline as one blob.
+    """
+    prompt = analyze_pipeline.EXTRACTION_PROMPT
+    # The closed enum is gone: no `| "OTHER"` alternation on the subject field.
+    assert '| "OTHER"' not in prompt
+    assert '"ENGLISH" |' not in prompt
+    # And the model is told, in words, to name the subject instead.
+    assert "mot-cle LIBRE" in prompt
+    assert 'N\'utilise PAS "OTHER"' in prompt
+    # The examples stay, as examples — they must not read as the whole set.
+    assert "GEOGRAPHY" in prompt and "PHILOSOPHY" in prompt

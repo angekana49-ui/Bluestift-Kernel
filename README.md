@@ -79,7 +79,7 @@ Each KC, per student, carries a four-dimensional state (Luckin / corpus §1.2):
 │   └── apply_migrations.py  # CLI: apply migrations via the Management API
 ├── migrations/              # 10 numbered Supabase SQL migrations
 ├── conftest.py              # In-memory fake Supabase for tests
-├── test_kernel.py           # 100 tests
+├── test_kernel.py           # 101 tests
 ├── requirements.txt / requirements-dev.txt
 └── railway.toml            # Deploy config + the cost rules that keep it cheap
 ```
@@ -267,10 +267,20 @@ curl -X POST http://localhost:8000/seed_kcs
 | MATH | 56 | 89 |
 | HISTORY | 10 | 10 |
 | **MATH → PHYSICS** | — | **50 bridges** |
+| **MATH → HISTORY** | — | **4 bridges** |
 
-So it is really a *two-subject* graph — maths feeding physics — plus a
-ten-node history island with no bridge in or out. Nothing in the code limits
-this: KCs are created on the fly for any subject, the detector traverses any
+Maths feeds physics heavily and history lightly. The four history bridges are
+deliberately few: `nombres_entiers_naturels` and `addition_soustraction_entiers`
+under `chronologie` (a timeline is an ordering of integers; a duration is a
+subtraction), and `repere_2d` and `pourcentages_et_proportions` under
+`principes_de_cartographie` (a map *is* a coordinate system; a scale *is* a
+proportion). The other six history KCs — `causalité_historique`,
+`sources_historiques`, `systeme_federal` and the rest — got no bridge, because
+they have no genuine mathematical prerequisite. Inventing one would send a
+student to numeracy remediation for a gap in historical reasoning, which is the
+"weak generic link" failure mode the roadmap warns about.
+
+Nothing in the code limits subjects: KCs are created on the fly for any subject, the detector traverses any
 edge, and `/prerequisite_gaps` walks whatever is there. Only these three have
 been built. Adding a subject is a run of the builder, not a change to the
 Kernel:
@@ -282,8 +292,13 @@ python scripts/build_bridges.py CHEMISTRY PHYSICS                # connect it
 ```
 
 A subject without bridges is an island: root-cause detection can never leave
-it, which is exactly what HISTORY does today. Build the bridges, or the new
-subject buys you nodes and no reasoning.
+it, which is what HISTORY was until its four bridges were added. Build the
+bridges, or the new subject buys you nodes and no reasoning.
+
+`python scripts/visualize_graph.py` renders the whole thing as one interactive
+page — nodes coloured by subject and sized by how many concepts depend on them,
+cross-subject bridges in red. It is the fastest way to see whether a new
+subject actually connected to anything.
 
 Two things were fixed so a wider graph actually works, because both failed
 silently:

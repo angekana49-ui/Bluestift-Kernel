@@ -34,7 +34,7 @@ Reponds UNIQUEMENT en JSON valide, sans markdown, sans explication :
   "kcs_mentioned": [
     {{
       "label": "nom_du_concept_en_snake_case",
-      "subject": "MATH" | "ENGLISH" | "PHYSICS" | "HISTORY" | "CHEMISTRY" | "BIOLOGY" | "OTHER",
+      "subject": "MATH",
       "level": "cycle3" | "cycle4" | "lycee" | "college" | "unknown"
     }}
   ],
@@ -65,6 +65,11 @@ Pour mindset_signals (chaque valeur entre 0.0 et 1.0, juge depuis la conversatio
 
 Note : les KCs peuvent etre dans n'importe quelle matiere scolaire.
 Si le sujet traite n'est pas {subject}, ajuste le champ subject en consequence.
+
+Le champ "subject" est un mot-cle LIBRE, en MAJUSCULES et sans accent
+(MATH, PHYSICS, HISTORY, CHEMISTRY, BIOLOGY, GEOGRAPHY, PHILOSOPHY,
+ECONOMICS, ENGLISH, FRENCH, ...). N'utilise PAS "OTHER" : nomme la matiere.
+Reutilise exactement le mot-cle deja employe pour cette matiere s'il existe.
 """
 
 SUMMARY_PROMPT = """\
