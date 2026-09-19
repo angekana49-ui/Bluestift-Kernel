@@ -8,6 +8,7 @@ Routes:
     POST /analyze
     POST /load_profile
     POST /update_concept_state
+    POST /prerequisite_gaps
     POST /load_alerts
     POST /resolve_alert
     POST /seed_kcs
@@ -30,8 +31,9 @@ from fastapi.responses import JSONResponse
 
 load_dotenv()
 
-from core import bkt, calibration, forgetting, ratelimit  # noqa: E402
+from core import bkt, calibration, forgetting, prerequisites, ratelimit  # noqa: E402
 from core.calibration import compute_empirical_kc_params  # noqa: E402
+from core.graph import build_graph  # noqa: E402
 from core.mindset import classify_mindset  # noqa: E402
 from models.schemas import (  # noqa: E402
     AnalyzeRequest,
@@ -41,6 +43,8 @@ from models.schemas import (  # noqa: E402
     LoadAlertsResponse,
     LoadProfileRequest,
     LoadProfileResponse,
+    PrerequisiteGapsRequest,
+    PrerequisiteGapsResponse,
     ResolveAlertRequest,
     ResolveAlertResponse,
     SeedResponse,
@@ -50,7 +54,7 @@ from models.schemas import (  # noqa: E402
 from services import analyze as analyze_pipeline  # noqa: E402
 from services import db  # noqa: E402
 from services.analyze import _persistence, _slip_estimate, _velocity  # noqa: E402
-from services.kc_registry import get_or_create_kc  # noqa: E402
+from services.kc_registry import _normalize_label, get_or_create_kc  # noqa: E402
 
 KERNEL_VERSION = os.getenv("KERNEL_VERSION", "1.0.0")
 
@@ -297,15 +301,11 @@ async def load_profile(
     last_update = None
     for s in states:
         node = nodes.get(s["concept_id"], {})
-        k_raw = s.get("mastery_score_raw") or 0.0
+        # One definition of "how is this student doing on this KC", shared with
+        # /prerequisite_gaps. Two copies of a mastery rule drift, and the drift
+        # shows up as two screens disagreeing about the same child.
+        eff = bkt.effective_state(node, s)
         last_at = s.get("last_strong_signal_at")
-        lam = forgetting.get_lambda(node, s)
-        k_eff = forgetting.compute_effective_mastery(
-            k_raw, node.get("type_kc", "conceptual"), last_at, lambda_override=lam
-        )
-        p_slip = s.get("p_slip_personal") or bkt.get_bkt_params(node)["p_slip"]
-        pc_avg = s.get("partial_credit_avg") or 0.5
-        status = bkt.classify_status(k_eff, p_slip, pc_avg)
 
         if last_at and (last_update is None or str(last_at) > str(last_update)):
             last_update = last_at
@@ -314,11 +314,11 @@ async def load_profile(
             {
                 "concept_id": s["concept_id"],
                 "label": node.get("label", "unknown"),
-                "k_raw": round(k_raw, 4),
-                "k_effective": round(k_eff, 4),
+                "k_raw": eff["k_raw"],
+                "k_effective": eff["k_effective"],
                 "v_score": s.get("v_score") or 0.5,
                 "p_score": s.get("p_score") or 0.5,
-                "status": status,
+                "status": eff["status"],
                 "last_interaction_at": last_at,
             }
         )
@@ -451,6 +451,100 @@ def _recalibrate_kc(concept_id: str) -> None:
             db.log_monitoring(db.get_client(), "warn", "recalibration_failed", {"concept_id": concept_id, "error": str(e)})
         except Exception:
             pass
+
+
+# --------------------------------------------------------------------------- #
+# /prerequisite_gaps — the graph half of GraphRAG
+# --------------------------------------------------------------------------- #
+# The question vector search cannot answer: *which prerequisites of this concept
+# has THIS student not yet mastered?* Similarity finds passages that look like a
+# concept. Only the graph knows what `derivation_fonction` rests on, and only the
+# student's state says which of those is actually missing. Retrieval comes last,
+# and only for the concepts the graph selected — that ordering is the whole
+# point, and it is why this is GraphRAG rather than RAG with extra steps.
+#
+# Scoped to the student like every other per-student route: a student's own
+# token reaches their own gaps and nobody else's.
+@app.post("/prerequisite_gaps", response_model=PrerequisiteGapsResponse)
+async def prerequisite_gaps(
+    req: PrerequisiteGapsRequest, principal: Principal = Depends(authenticate)
+) -> PrerequisiteGapsResponse:
+    authorize_for(principal, req.user_id)
+    client = db.get_client()
+
+    nodes = db.load_concept_nodes(client)
+    edges = db.load_concept_edges(client)
+    graph = build_graph(nodes, edges)
+
+    # Resolve the target. A question must not invent graph nodes, so an unknown
+    # concept is a 404 here — unlike /update_concept_state, which is reporting
+    # evidence and may legitimately create the KC it is about.
+    if req.concept_id:
+        node = next((n for n in nodes if n["id"] == req.concept_id), None)
+        if node is None:
+            raise HTTPException(status_code=404, detail="concept_id not found")
+        target = node["label"]
+    else:
+        target = _normalize_label(req.concept_label or "")
+        if target not in graph:
+            raise HTTPException(status_code=404, detail=f"unknown concept: {target}")
+
+    id_by_label = {n["label"]: n["id"] for n in nodes}
+    state_by_concept = {
+        s["concept_id"]: s for s in db.load_student_concept_states(client, req.user_id)
+    }
+    # One pass over the graph's nodes: the walk needs a status for any concept it
+    # might reach, not only the ones the student has a row for.
+    detail_by_label = {
+        n["label"]: bkt.effective_state(n, state_by_concept.get(n["id"])) for n in nodes
+    }
+    status_by_label = {lbl: d["status"] for lbl, d in detail_by_label.items()}
+
+    report = prerequisites.gap_report(graph, target, status_by_label, req.max_hops)
+
+    # Retrieval, last and only for what the graph chose.
+    chunks_by_concept: dict[str, list[dict]] = {}
+    if req.include_resources and report["gaps"]:
+        gap_ids = [
+            id_by_label[g["label"]] for g in report["gaps"] if g["label"] in id_by_label
+        ]
+        class_id = db.load_student_class_id(client, req.user_id)
+        for chunk in db.load_chunks_for_concepts(client, gap_ids, req.user_id, class_id):
+            chunks_by_concept.setdefault(chunk["concept_id"], []).append(chunk)
+
+    gaps = []
+    for gap in report["gaps"]:
+        label = gap["label"]
+        concept_id = id_by_label.get(label)
+        detail = detail_by_label.get(label, {})
+        gaps.append(
+            {
+                "label": label,
+                "concept_id": concept_id,
+                "hops": gap["hops"],
+                "k_effective": detail.get("k_effective"),
+                "status": detail.get("status", "unknown"),
+                "resources": chunks_by_concept.get(concept_id, []),
+            }
+        )
+
+    return PrerequisiteGapsResponse(
+        user_id=req.user_id,
+        target=target,
+        target_concept_id=id_by_label.get(target),
+        gaps=gaps,
+        frontier=[
+            {
+                "label": item["label"],
+                "concept_id": id_by_label.get(item["label"]),
+                "hops": item["hops"],
+            }
+            for item in report["frontier"]
+        ],
+        max_hops=report["max_hops"],
+        truncated=report["truncated"],
+        resources_available=bool(chunks_by_concept),
+    )
 
 
 # --------------------------------------------------------------------------- #

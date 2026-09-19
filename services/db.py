@@ -251,6 +251,74 @@ def load_curriculum_layers(client, school_id: str, subject: str, level: str) -> 
 
 
 # --------------------------------------------------------------------------- #
+# Content retrieval (the RAG half of GraphRAG)
+# --------------------------------------------------------------------------- #
+def _rag(client, table: str):
+    return client.schema("rag").table(table)
+
+
+def load_student_class_id(client, user_id: str) -> str | None:
+    """The class a student belongs to, or None. App-owned table, read-only."""
+    try:
+        res = (
+            _schools(client, "student_identities")
+            .select("class_id")
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        )
+        return (res.data[0].get("class_id") if res.data else None) or None
+    except Exception:  # noqa: BLE001 - no class is an ordinary state
+        return None
+
+
+def load_chunks_for_concepts(
+    client,
+    concept_ids: list[str],
+    user_id: str,
+    class_id: str | None = None,
+    limit: int = 30,
+) -> list[dict]:
+    """Teaching material attached to these concepts, scoped to one student.
+
+    The graph decides WHICH concepts are worth retrieving for; this fetches what
+    exists for them. `rag_chunks` already carries a `concept_id`, so no
+    similarity search is needed to answer "explain this concept" — the link is
+    exact.
+
+    Scoping is the whole risk here. A chunk may be global curriculum material,
+    a student's own uploaded document, or a class's. A student may see the
+    first two and their own class's, never another student's and never another
+    class's. The filter fails closed: with no class resolved, class-scoped
+    material is simply not returned.
+    """
+    if not concept_ids:
+        return []
+    # "Global" means owned by nobody at all. Testing user_id alone is not
+    # enough and was a real leak: a chunk belonging to another CLASS also has a
+    # null user_id, so it read as public curriculum material and would have been
+    # handed to a child in a different class.
+    scopes = [
+        "and(user_id.is.null,class_id.is.null,assignment_id.is.null)",
+        f"user_id.eq.{user_id}",
+    ]
+    if class_id:
+        scopes.append(f"class_id.eq.{class_id}")
+    try:
+        res = (
+            _rag(client, "rag_chunks")
+            .select("id, concept_id, content, source_type, source_id")
+            .in_("concept_id", concept_ids)
+            .or_(",".join(scopes))
+            .limit(limit)
+            .execute()
+        )
+        return res.data or []
+    except Exception:  # noqa: BLE001 - no corpus yet; the gap report stands alone
+        return []
+
+
+# --------------------------------------------------------------------------- #
 # Logging — requests, outputs, insights, monitoring
 # --------------------------------------------------------------------------- #
 def log_kernel_request(client, request_id: str, user_id: str, payload: dict) -> None:

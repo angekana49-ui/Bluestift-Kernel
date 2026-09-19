@@ -18,7 +18,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 import main
-from core import anomaly, bkt, calibration, curriculum, detector, forgetting, mindset, ratelimit
+from core import (
+    anomaly, bkt, calibration, curriculum, detector, forgetting, mindset,
+    prerequisites, ratelimit,
+)
 from core.graph import build_graph
 from services import analyze as analyze_pipeline
 from services import db as db_module
@@ -1511,3 +1514,255 @@ def test_no_background_thread_or_timer_is_started():
     with TestClient(main.app) as c:
         c.get("/health")
     assert threading.active_count() <= before
+
+
+# --------------------------------------------------------------------------- #
+# GraphRAG — multi-hop prerequisite reasoning
+# --------------------------------------------------------------------------- #
+def _chain_graph():
+    """calcul_litteral -> variable -> fonction -> derivation, plus limite -> derivation."""
+    import networkx as nx
+
+    g = nx.DiGraph()
+    for prereq, concept in [
+        ("calcul_litteral", "notion_de_variable"),
+        ("notion_de_variable", "notion_de_fonction"),
+        ("notion_de_fonction", "derivation_fonction"),
+        ("notion_de_limite", "derivation_fonction"),
+    ]:
+        g.add_edge(prereq, concept)
+    return g
+
+
+def test_a_mastered_prerequisite_is_a_wall_not_a_door():
+    """The rule that makes the answer short enough to act on.
+
+    A student who holds notion_de_fonction demonstrably carries what it rests
+    on. Listing those anyway would bury the one real gap under foundations they
+    already have.
+    """
+    g = _chain_graph()
+    report = prerequisites.gap_report(g, "derivation_fonction", {"notion_de_fonction": "mastered"})
+
+    assert [x["label"] for x in report["gaps"]] == ["notion_de_limite"]
+    # And it says WHERE it stopped, so the short list is evidently short by
+    # reason rather than by the walk giving up.
+    assert [x["label"] for x in report["frontier"]] == ["notion_de_fonction"]
+
+
+def test_unknown_is_expanded_but_never_counted_as_mastered():
+    # Never having been asked is not the same as having failed — and it is
+    # certainly not the same as having understood.
+    g = _chain_graph()
+    report = prerequisites.gap_report(g, "derivation_fonction", {})
+    labels = [x["label"] for x in report["gaps"]]
+    assert "calcul_litteral" in labels  # three hops away, still reached
+    assert report["frontier"] == []
+
+
+def test_gaps_come_back_in_teaching_order_deepest_first():
+    """Topology is the hard constraint; depth breaks the ties it leaves open."""
+    g = _chain_graph()
+    report = prerequisites.gap_report(g, "derivation_fonction", {})
+    order = [x["label"] for x in report["gaps"]]
+
+    # Nothing before what it rests on.
+    assert order.index("calcul_litteral") < order.index("notion_de_variable")
+    assert order.index("notion_de_variable") < order.index("notion_de_fonction")
+    # Between independent branches, the deeper foundation leads: that is the
+    # Kernel's thesis, not a cosmetic choice.
+    assert order[0] == "calcul_litteral"
+
+
+def test_depth_limit_reports_that_it_cut_the_list():
+    g = _chain_graph()
+    cut = prerequisites.gap_report(g, "derivation_fonction", {}, max_hops=1)
+    assert cut["truncated"] is True
+    assert {x["label"] for x in cut["gaps"]} == {"notion_de_fonction", "notion_de_limite"}
+
+    # A walk that simply ran out of graph is NOT truncation: claiming otherwise
+    # would make "nothing else is missing" unsayable.
+    whole = prerequisites.gap_report(g, "derivation_fonction", {})
+    assert whole["truncated"] is False
+
+
+def test_an_unknown_target_yields_nothing_rather_than_raising():
+    assert prerequisites.gap_report(_chain_graph(), "pas_un_concept", {})["gaps"] == []
+
+
+def test_a_cycle_does_not_take_the_report_down():
+    import networkx as nx
+
+    g = nx.DiGraph()
+    g.add_edge("a", "b")
+    g.add_edge("b", "a")
+    g.add_edge("b", "target")
+    report = prerequisites.gap_report(g, "target", {})
+    assert {x["label"] for x in report["gaps"]} == {"a", "b"}
+
+
+def _seed_graph_and_student(fake, *, mastered_fonction=False):
+    """The maths chain, one student who is shaky on derivatives."""
+    nodes = [
+        {"id": "kc-calc", "label": "calcul_litteral", "subject": "MATH", "type_kc": "procedural"},
+        {"id": "kc-var", "label": "notion_de_variable", "subject": "MATH", "type_kc": "conceptual"},
+        {"id": "kc-fonc", "label": "notion_de_fonction", "subject": "MATH", "type_kc": "conceptual"},
+        {"id": "kc-lim", "label": "notion_de_limite", "subject": "MATH", "type_kc": "conceptual"},
+        {"id": "kc-deriv", "label": "derivation_fonction", "subject": "MATH", "type_kc": "conceptual"},
+    ]
+    edges = [
+        {"id": "e1", "prerequisite_id": "kc-calc", "concept_id": "kc-var"},
+        {"id": "e2", "prerequisite_id": "kc-var", "concept_id": "kc-fonc"},
+        {"id": "e3", "prerequisite_id": "kc-fonc", "concept_id": "kc-deriv"},
+        {"id": "e4", "prerequisite_id": "kc-lim", "concept_id": "kc-deriv"},
+    ]
+    fake.seed("kernel.concept_nodes", nodes)
+    fake.seed("kernel.concept_edges", edges)
+    if mastered_fonction:
+        fake.seed(
+            "kernel.student_concept_state",
+            [{
+                "id": "s1", "user_id": "student-a", "concept_id": "kc-fonc",
+                "mastery_score_raw": 0.95, "partial_credit_avg": 0.85,
+                "p_slip_personal": 0.05,
+                "last_strong_signal_at": datetime.now(timezone.utc).isoformat(),
+            }],
+        )
+
+
+def test_prerequisite_gaps_answers_what_vector_search_cannot(client, fake_supabase, monkeypatch):
+    monkeypatch.setenv("KERNEL_API_SECRET", "s3cr3t")
+    monkeypatch.setattr(db_module, "get_client", lambda: fake_supabase)
+    _seed_graph_and_student(fake_supabase, mastered_fonction=True)
+
+    resp = client.post(
+        "/prerequisite_gaps",
+        json={"user_id": "student-a", "concept_label": "derivation_fonction"},
+        headers={"X-Kernel-Secret": "s3cr3t"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+
+    # The student holds notion_de_fonction, so the walk stops there and the
+    # answer is the one thing actually missing — not every ancestor in the graph.
+    assert [g["label"] for g in body["gaps"]] == ["notion_de_limite"]
+    assert [f["label"] for f in body["frontier"]] == ["notion_de_fonction"]
+    assert body["gaps"][0]["concept_id"] == "kc-lim"
+    assert body["gaps"][0]["hops"] == 1
+    assert body["gaps"][0]["status"] == "unknown"
+    assert body["truncated"] is False
+
+
+def test_a_label_the_graph_does_not_know_is_a_404_not_a_new_node(client, fake_supabase, monkeypatch):
+    """A question must not create graph nodes.
+
+    /update_concept_state may invent a KC because it is reporting evidence about
+    one. Asking what a concept rests on is a read, and a read that writes would
+    let any caller grow the shared graph by typing.
+    """
+    monkeypatch.setenv("KERNEL_API_SECRET", "s3cr3t")
+    monkeypatch.setattr(db_module, "get_client", lambda: fake_supabase)
+    _seed_graph_and_student(fake_supabase)
+
+    resp = client.post(
+        "/prerequisite_gaps",
+        json={"user_id": "student-a", "concept_label": "chimie_organique"},
+        headers={"X-Kernel-Secret": "s3cr3t"},
+    )
+    assert resp.status_code == 404
+    assert fake_supabase.tables["kernel.concept_nodes"].__len__() == 5  # nothing created
+
+
+def test_a_student_reads_only_their_own_prerequisite_gaps(client, fake_supabase, monkeypatch):
+    monkeypatch.setenv("KERNEL_API_SECRET", "s3cr3t")
+    monkeypatch.setenv("SUPABASE_JWT_SECRET", JWT_SECRET)
+    monkeypatch.setattr(db_module, "get_client", lambda: fake_supabase)
+    _seed_graph_and_student(fake_supabase)
+    headers = {"Authorization": f"Bearer {_user_token('student-a')}"}
+
+    ok = client.post(
+        "/prerequisite_gaps",
+        json={"user_id": "student-a", "concept_label": "derivation_fonction"},
+        headers=headers,
+    )
+    assert ok.status_code == 200
+    denied = client.post(
+        "/prerequisite_gaps",
+        json={"user_id": "student-b", "concept_label": "derivation_fonction"},
+        headers=headers,
+    )
+    assert denied.status_code == 403
+
+
+def test_teaching_material_never_crosses_between_students_or_classes(fake_supabase):
+    """The leak surface of the retrieval half.
+
+    A chunk may be global curriculum material, one student's own upload, or a
+    class's. A student may see the first two and their own class's — never
+    another child's document, never another class's.
+    """
+    fake_supabase.seed(
+        "schools.student_identities",
+        [{"id": "i1", "user_id": "student-a", "class_id": "class-1"}],
+    )
+    fake_supabase.seed(
+        "rag.rag_chunks",
+        [
+            {"id": "c-global", "concept_id": "kc-lim", "content": "cours public",
+             "user_id": None, "class_id": None, "source_type": "curriculum"},
+            {"id": "c-mine", "concept_id": "kc-lim", "content": "ma fiche",
+             "user_id": "student-a", "class_id": None, "source_type": "upload"},
+            {"id": "c-my-class", "concept_id": "kc-lim", "content": "poly de la classe",
+             "user_id": None, "class_id": "class-1", "source_type": "school"},
+            {"id": "c-other-student", "concept_id": "kc-lim", "content": "fiche de Tom",
+             "user_id": "student-b", "class_id": None, "source_type": "upload"},
+            {"id": "c-other-class", "concept_id": "kc-lim", "content": "poly 3e B",
+             "user_id": None, "class_id": "class-9", "source_type": "school"},
+        ],
+    )
+
+    class_id = db_module.load_student_class_id(fake_supabase, "student-a")
+    assert class_id == "class-1"
+    got = {
+        c["id"]
+        for c in db_module.load_chunks_for_concepts(
+            fake_supabase, ["kc-lim"], "student-a", class_id
+        )
+    }
+    assert got == {"c-global", "c-mine", "c-my-class"}
+
+
+def test_with_no_class_resolved_class_material_is_left_out(fake_supabase):
+    """Fails closed: an unresolved class must not widen the scope."""
+    fake_supabase.seed(
+        "rag.rag_chunks",
+        [
+            {"id": "c-global", "concept_id": "kc-lim", "content": "x",
+             "user_id": None, "class_id": None},
+            {"id": "c-some-class", "concept_id": "kc-lim", "content": "y",
+             "user_id": None, "class_id": "class-1"},
+        ],
+    )
+    got = {
+        c["id"]
+        for c in db_module.load_chunks_for_concepts(fake_supabase, ["kc-lim"], "student-a", None)
+    }
+    assert got == {"c-global"}
+
+
+def test_an_empty_corpus_says_so_instead_of_pretending(client, fake_supabase, monkeypatch):
+    """resources_available is false because nothing is written yet — not because
+    these concepts are undocumented. The distinction is the whole reason the
+    field exists."""
+    monkeypatch.setenv("KERNEL_API_SECRET", "s3cr3t")
+    monkeypatch.setattr(db_module, "get_client", lambda: fake_supabase)
+    _seed_graph_and_student(fake_supabase)
+
+    body = client.post(
+        "/prerequisite_gaps",
+        json={"user_id": "student-a", "concept_label": "derivation_fonction"},
+        headers={"X-Kernel-Secret": "s3cr3t"},
+    ).json()
+    assert body["resources_available"] is False
+    assert all(g["resources"] == [] for g in body["gaps"])
+    assert len(body["gaps"]) == 4  # the reasoning stands on its own without a corpus

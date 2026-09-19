@@ -163,6 +163,75 @@ class UpdateConceptStateResponse(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# /prerequisite_gaps  (GraphRAG: the graph decides what is worth retrieving)
+# --------------------------------------------------------------------------- #
+class PrerequisiteGapsRequest(BaseModel):
+    """What does this student still need before they can hold this concept?
+
+    Identify the concept by `concept_id` or by `concept_label`. Unlike
+    /update_concept_state, an unknown label is a 404 rather than a new KC: this
+    is a question, and a question must not silently invent graph nodes.
+    """
+
+    user_id: str
+    concept_id: Optional[str] = None
+    concept_label: Optional[str] = Field(default=None, max_length=128)
+    max_hops: int = Field(default=4, ge=1, le=8)
+    # Attach teaching material for each gap. Off when the caller only wants the
+    # reasoning, which is also the cheaper call.
+    include_resources: bool = True
+
+    @model_validator(mode="after")
+    def _require_a_concept(self) -> "PrerequisiteGapsRequest":
+        if not self.concept_id and not (self.concept_label or "").strip():
+            raise ValueError("either concept_id or concept_label is required")
+        return self
+
+
+class ResourceOut(BaseModel):
+    id: str
+    content: str
+    source_type: Optional[str] = None
+    source_id: Optional[str] = None
+
+
+class PrerequisiteGapOut(BaseModel):
+    label: str
+    concept_id: Optional[str] = None
+    # Distance from the target. 1 = a direct prerequisite.
+    hops: int
+    k_effective: Optional[float] = None
+    status: KCStatus
+    resources: list[ResourceOut] = Field(default_factory=list)
+
+
+class FrontierItemOut(BaseModel):
+    """A concept the walk stopped at because the student already holds it."""
+
+    label: str
+    concept_id: Optional[str] = None
+    hops: int
+
+
+class PrerequisiteGapsResponse(BaseModel):
+    user_id: str
+    target: str
+    target_concept_id: Optional[str] = None
+    # In teaching order: deepest foundation first, and never a concept before
+    # something it rests on.
+    gaps: list[PrerequisiteGapOut] = Field(default_factory=list)
+    # Where the walk stopped, and why the list above is short.
+    frontier: list[FrontierItemOut] = Field(default_factory=list)
+    max_hops: int
+    # The walk hit its depth limit with somewhere left to go. Never render a
+    # truncated list as "nothing else is missing".
+    truncated: bool = False
+    # False when no teaching material exists for any gap — which today means
+    # the corpus is empty, not that these concepts are undocumented.
+    resources_available: bool = False
+
+
+# --------------------------------------------------------------------------- #
 # /load_alerts  /resolve_alert
 # --------------------------------------------------------------------------- #
 AlertSeverity = Literal["low", "medium", "high"]

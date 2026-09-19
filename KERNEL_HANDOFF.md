@@ -16,8 +16,8 @@
 ### ⚠️ Auth: two tiers
 
 The protected routes (`/analyze`, `/load_profile`, `/update_concept_state`,
-`/load_alerts`, `/resolve_alert`, `/seed_kcs`) require a credential. `/health`
-and `/ready` stay open.
+`/prerequisite_gaps`, `/load_alerts`, `/resolve_alert`, `/seed_kcs`) require a
+credential. `/health` and `/ready` stay open.
 
 **Service tier — the shared secret.** Unchanged, and still what most calls use.
 Set the **same** value on both sides:
@@ -135,6 +135,51 @@ Identify the KC either way:
 > header. Treat it as "come back later", never as a failure to retry
 > immediately — an immediate retry is what trips it. The fire-and-forget call
 > sites already swallow it harmlessly.
+
+### `POST /prerequisite_gaps` (new — GraphRAG)
+
+*What does this student still need before they can hold this concept?*
+
+```json
+{ "user_id": "uuid",
+  "concept_label": "derivation_fonction",   // or concept_id
+  "max_hops": 4,                            // 1–8, default 4
+  "include_resources": true }
+```
+```json
+{
+  "target": "derivation_fonction",
+  "gaps": [
+    { "label": "notion_de_variable", "concept_id": "uuid", "hops": 2,
+      "k_effective": 0.31, "status": "gap", "resources": [] }
+  ],
+  "frontier": [{ "label": "notion_de_fonction", "hops": 1 }],
+  "max_hops": 4, "truncated": false, "resources_available": false
+}
+```
+
+`gaps` is already in **teaching order**: never a concept before what it rests
+on, deepest foundation first. Render it top to bottom and you have a remediation
+sequence — no re-sorting, and don't sort by `hops`, that would break it.
+
+`frontier` is where the walk stopped because the student already holds the
+concept. Worth showing: it is the evidence that a two-item list is short for a
+reason rather than because the Kernel gave up.
+
+`truncated` means the depth limit cut the list. Never render a cut list as
+"nothing else is missing" — drop `max_hops` or say the list is partial.
+
+`resources_available: false` means **the corpus is empty**, not that these
+concepts are undocumented. Nothing writes `rag.rag_chunks` today. When something
+does, attach the chunk's `concept_id` and material appears here automatically —
+the Kernel scopes it to global material, the student's own, and their class,
+never another child's or another class's.
+
+An unknown `concept_label` is a **404**, unlike `/update_concept_state` which
+creates the KC: a question must not grow the shared graph by being asked.
+
+Use it for "explain why I'm stuck" and for a remediation plan. It is a pure read
+— no LLM call, no state written — so it is cheap and safe to call on demand.
 
 ### `POST /load_alerts` (new — the school dashboard's data source)
 

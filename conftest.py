@@ -2,7 +2,7 @@
 
 The fake mirrors just enough of supabase-py's fluent query builder for the
 Kernel's data access: schema().table().select()/insert()/upsert()/update()
-with .eq()/.ilike()/.in_()/.gte()/.order()/.limit()/.execute(). It is
+with .eq()/.ilike()/.in_()/.gte()/.or_()/.order()/.limit()/.execute(). It is
 deliberately small but faithful to the call shapes used in services/db.py and
 services/kc_registry.py.
 """
@@ -12,6 +12,55 @@ import uuid
 from dataclasses import dataclass, field
 
 import pytest
+
+
+def _split_top_level(expression: str) -> list[str]:
+    """Split on commas that are not inside parentheses."""
+    parts, depth, current = [], 0, ""
+    for ch in expression:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        if ch == "," and depth == 0:
+            parts.append(current)
+            current = ""
+        else:
+            current += ch
+    if current:
+        parts.append(current)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _parse_or(expression: str) -> list:
+    """Each disjunct is either one clause or an and(...) group of them."""
+    disjuncts = []
+    for part in _split_top_level(expression):
+        if part.startswith("and(") and part.endswith(")"):
+            disjuncts.append([_clause(c) for c in _split_top_level(part[4:-1])])
+        else:
+            disjuncts.append([_clause(part)])
+    return disjuncts
+
+
+def _clause(text: str):
+    bits = text.split(".", 2)
+    return tuple(bits) if len(bits) == 3 else (bits[0], "is", "null")
+
+
+def _or_clause_matches(row: dict, conjunction) -> bool:
+    """A disjunct matches only when every clause in it does."""
+    for col, op, target in conjunction:
+        cell = row.get(col)
+        if op == "is":
+            ok = cell is None if target == "null" else cell == target
+        elif op == "eq":
+            ok = str(cell) == str(target)
+        else:
+            ok = False  # an operator the fake does not model must not pass
+        if not ok:
+            return False
+    return True
 
 
 @dataclass
@@ -72,6 +121,14 @@ class _Query:
         self._filters.append((col, value, "gte"))
         return self
 
+    def or_(self, expression):
+        # PostgREST "or=(a.eq.x,and(b.is.null,c.is.null))": a row matches if ANY
+        # top-level disjunct does, and an and(...) group only when all of its
+        # clauses do. Splitting on bare commas would tear those groups apart —
+        # which is precisely the scoping bug this fake has to be able to catch.
+        self._filters.append((None, _parse_or(expression), "or"))
+        return self
+
     def limit(self, n):
         self._limit = n
         return self
@@ -83,12 +140,15 @@ class _Query:
     # --- helpers --------------------------------------------------------- #
     def _matches(self, row) -> bool:
         for col, value, kind in self._filters:
-            cell = row.get(col)
+            cell = row.get(col) if col is not None else None
             if kind == "ilike":
                 if str(cell).lower() != value:
                     return False
             elif kind == "in":
                 if cell not in value:
+                    return False
+            elif kind == "or":
+                if not any(_or_clause_matches(row, c) for c in value):
                     return False
             elif kind == "gte":
                 # Timestamps are compared as ISO strings, which sort chronologically.

@@ -63,7 +63,8 @@ Each KC, per student, carries a four-dimensional state (Luckin / corpus §1.2):
 │   ├── detector.py          # DFS root-cause by convergence
 │   ├── calibration.py       # Self-calibration of living parameters
 │   ├── anomaly.py           # Pedagogical-safety anomaly detection
-│   └── curriculum.py        # School curriculum layers -> sequencing + objectives
+│   ├── curriculum.py        # School curriculum layers -> sequencing + objectives
+│   └── prerequisites.py     # Multi-hop prerequisite walk (graph half of GraphRAG)
 ├── services/
 │   ├── llm.py               # LLM chain: Groq primary -> Gemini fallback (REST)
 │   ├── kc_registry.py       # get_or_create_kc() — dynamic KCs
@@ -78,7 +79,7 @@ Each KC, per student, carries a four-dimensional state (Luckin / corpus §1.2):
 │   └── apply_migrations.py  # CLI: apply migrations via the Management API
 ├── migrations/              # 10 numbered Supabase SQL migrations
 ├── conftest.py              # In-memory fake Supabase for tests
-├── test_kernel.py           # 84 tests
+├── test_kernel.py           # 96 tests
 ├── requirements.txt / requirements-dev.txt
 └── railway.toml            # Deploy config + the cost rules that keep it cheap
 ```
@@ -94,6 +95,7 @@ Each KC, per student, carries a four-dimensional state (Luckin / corpus §1.2):
 | POST   | `/analyze`               | 🔒   | **Main route.** Conversation → root-gap + alerts.  |
 | POST   | `/load_profile`          | 🔒   | Full cognitive profile with K_effective recomputed. |
 | POST   | `/update_concept_state`  | 🔒   | Manual KC update on a strong signal (called by RAYA). |
+| POST   | `/prerequisite_gaps`     | 🔒   | **GraphRAG.** What this student still needs before a concept, multi-hop. |
 | POST   | `/load_alerts`           | 🔒   | Read pedagogical-safety alerts — one student, or a whole school. |
 | POST   | `/resolve_alert`         | 🔒   | Acknowledge an alert (or reopen it).               |
 | POST   | `/seed_kcs`              | 🔒   | Seed starter Math KCs if the table is empty.       |
@@ -136,6 +138,45 @@ Interactive docs at `/docs`.
 Returns `root_gap`, `detection_path` (surface → root chain), `mastery_map`,
 `confidence`, `summary`, `recommended_path`, `alerts` (pedagogical-safety flags),
 plus `kernel_version` and `llm_used`.
+
+---
+
+## GraphRAG — why the graph comes first
+
+`/prerequisite_gaps` answers the one question similarity search cannot: *which
+prerequisites of this concept has THIS student not yet mastered?* Vector search
+finds passages that look like a concept. Only the graph knows what
+`derivation_fonction` rests on, and only the student's state says which of those
+is missing. Retrieval runs **last**, and only for the concepts the graph picked —
+that ordering is what makes it GraphRAG rather than RAG with extra steps.
+
+Three rules do the pedagogical work (`core/prerequisites.py`):
+
+1. **A mastered prerequisite is a wall, not a door.** The walk stops there. A
+   student who holds `notion_de_fonction` carries what it rests on; listing
+   those would bury the real gap under foundations they demonstrably have.
+2. **Unknown is not mastered.** A concept never touched is walked through but
+   reported as unknown. Treating silence as mastery is how a tutor walks a child
+   past the hole they are standing in.
+3. **Order by foundation, not by distance.** Topological order is the hard
+   constraint; ties are broken deepest-first, because working the root is the
+   Kernel's whole thesis.
+
+On the live 154-node graph a student with no history gets a median of **6** gaps
+per target concept. The extreme is instructive: `rendement_cyclique`
+(thermodynamics) reaches 29, pulling in `derivation_fonction`, `repere_2d` and
+`etude_variations_fonction` — *maths* gaps under a *physics* concept. That
+cross-subject chain is exactly what vector retrieval cannot construct.
+
+Lower `max_hops` for a tighter list; `truncated` says when the depth limit cut
+one short, so a caller never reads a cut list as "nothing else is missing".
+
+**The retrieval half has no corpus yet.** `rag.rag_chunks` carries a
+`concept_id`, so no similarity search is needed to attach material to a concept
+— the link is exact. But the table is empty and nothing writes to it today, so
+`resources_available` comes back `false`. That means *the corpus is empty*, not
+that these concepts are undocumented. The reasoning stands on its own until
+someone fills it.
 
 ---
 

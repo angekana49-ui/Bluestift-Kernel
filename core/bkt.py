@@ -148,3 +148,37 @@ def classify_status(
     if k_effective < PARTIAL_THRESHOLD:
         return "partial"
     return "mastered"
+
+
+def effective_state(concept_node: dict, student_state: dict | None) -> dict:
+    """One KC's current standing for one student: decayed mastery and status.
+
+    The same three lines used to sit in /load_profile and would have had to be
+    copied into every route that asks "how is this student doing on this
+    concept". Two copies of a mastery rule drift, and the drift shows up as two
+    screens disagreeing about whether a child has understood something.
+
+    A student with no row for the KC is `unknown`, never `gap`: never having
+    been asked is not the same as having failed.
+    """
+    from core import forgetting  # local: forgetting is a leaf, this keeps it one
+
+    if not student_state:
+        return {"k_raw": None, "k_effective": None, "p_slip": None, "status": "unknown"}
+
+    k_raw = student_state.get("mastery_score_raw") or 0.0
+    last_at = student_state.get("last_strong_signal_at")
+    k_effective = forgetting.compute_effective_mastery(
+        k_raw,
+        concept_node.get("type_kc", "conceptual"),
+        last_at,
+        lambda_override=forgetting.get_lambda(concept_node, student_state),
+    )
+    p_slip = student_state.get("p_slip_personal") or get_bkt_params(concept_node)["p_slip"]
+    pc_avg = student_state.get("partial_credit_avg") or 0.5
+    return {
+        "k_raw": round(k_raw, 4),
+        "k_effective": round(k_effective, 4),
+        "p_slip": p_slip,
+        "status": classify_status(k_effective, p_slip, pc_avg),
+    }
