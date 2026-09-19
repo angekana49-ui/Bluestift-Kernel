@@ -1766,3 +1766,63 @@ def test_an_empty_corpus_says_so_instead_of_pretending(client, fake_supabase, mo
     assert body["resources_available"] is False
     assert all(g["resources"] == [] for g in body["gaps"])
     assert len(body["gaps"]) == 4  # the reasoning stands on its own without a corpus
+
+
+# --------------------------------------------------------------------------- #
+# Carrying more than two subjects
+# --------------------------------------------------------------------------- #
+def test_the_vocabulary_budget_serves_the_subject_being_analysed():
+    """Label drift is how a graph fragments as subjects are added.
+
+    The budget used to be filled in database order across every subject. Past
+    it, the subject the student is actually working on could be barely present,
+    the model would stop seeing its canonical labels, and it would invent
+    variants — creating near-duplicate KCs exactly when the vocabulary matters
+    most.
+    """
+    rows = (
+        [{"label": f"hist_{i}", "subject": "HISTORY"} for i in range(500)]
+        + [{"label": f"math_{i}", "subject": "MATH"} for i in range(200)]
+    )
+    rendered = analyze_pipeline._format_vocabulary(rows, "MATH")
+    sent = set(rendered.split(", "))
+
+    # Every maths label fits and is sent: the home subject is served first.
+    assert {f"math_{i}" for i in range(200)} <= sent
+    # And history is not squeezed out — a maths conversation must still be able
+    # to name a concept from elsewhere.
+    assert any(lbl.startswith("hist_") for lbl in sent)
+    assert len(sent) <= analyze_pipeline.VOCABULARY_BUDGET
+
+
+def test_a_large_foreign_vocabulary_cannot_crowd_out_the_home_subject():
+    rows = (
+        [{"label": f"phys_{i}", "subject": "PHYSICS"} for i in range(1000)]
+        + [{"label": f"math_{i}", "subject": "MATH"} for i in range(50)]
+    )
+    sent = set(analyze_pipeline._format_vocabulary(rows, "MATH").split(", "))
+    assert {f"math_{i}" for i in range(50)} <= sent
+    # The home subject only needed 50 of its share; the rest goes to the others
+    # rather than being wasted.
+    assert len(sent) == analyze_pipeline.VOCABULARY_BUDGET
+
+
+def test_a_small_graph_is_sent_whole_regardless_of_subject():
+    rows = [{"label": "a", "subject": "MATH"}, {"label": "b", "subject": "PHYSICS"}]
+    assert analyze_pipeline._format_vocabulary(rows, "MATH") == "a, b"
+
+
+def test_the_graph_is_paged_so_it_is_never_silently_half_loaded(fake_supabase):
+    """A truncated graph is not a partial read, it is a wrong answer.
+
+    PostgREST caps rows per response. A graph cut at that cap would make the
+    detector walk a subgraph and name a root that isn't one, and
+    /prerequisite_gaps would report a student has nothing left to learn because
+    the rest of the graph was never sent.
+    """
+    total = db_module.GRAPH_PAGE_SIZE * 2 + 37
+    fake_supabase.seed(
+        "kernel.concept_nodes",
+        [{"id": f"kc-{i}", "label": f"c{i}", "subject": "MATH"} for i in range(total)],
+    )
+    assert len(db_module.load_concept_nodes(fake_supabase)) == total

@@ -2,7 +2,8 @@
 
 The fake mirrors just enough of supabase-py's fluent query builder for the
 Kernel's data access: schema().table().select()/insert()/upsert()/update()
-with .eq()/.ilike()/.in_()/.gte()/.or_()/.order()/.limit()/.execute(). It is
+with .eq()/.ilike()/.in_()/.gte()/.or_()/.order()/.limit()/.range()/.execute().
+It is
 deliberately small but faithful to the call shapes used in services/db.py and
 services/kc_registry.py.
 """
@@ -81,6 +82,7 @@ class _Query:
         self._limit = None
         self._count = None
         self._order = None
+        self._range = None
 
     # --- terminal-ish builders ------------------------------------------- #
     def select(self, *_args, count=None):
@@ -133,6 +135,11 @@ class _Query:
         self._limit = n
         return self
 
+    def range(self, start, end):
+        # PostgREST range is inclusive on both ends.
+        self._range = (start, end)
+        return self
+
     def order(self, col, desc=False):
         self._order = (col, desc)
         return self
@@ -172,6 +179,9 @@ class _Query:
                 # Sort before the limit, as PostgREST does — a limit applied to
                 # unordered rows would silently return the wrong window.
                 rows = sorted(rows, key=lambda r: (r.get(col) is None, r.get(col)), reverse=desc)
+            if self._range is not None:
+                start, end = self._range
+                rows = rows[start : end + 1]
             if self._limit is not None:
                 rows = rows[: self._limit]
             return _Result(data=[dict(r) for r in rows], count=len(rows))

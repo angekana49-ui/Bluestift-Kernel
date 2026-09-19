@@ -59,12 +59,33 @@ def _now_iso() -> str:
 # --------------------------------------------------------------------------- #
 # Graph reads
 # --------------------------------------------------------------------------- #
+# PostgREST caps how many rows one response may carry (Supabase's `max-rows`,
+# commonly 1000). Below that a plain select looks fine; above it the response is
+# silently short. For the graph that is not a partial read, it is a WRONG graph:
+# the detector would walk a subgraph and confidently name a root that isn't one,
+# and /prerequisite_gaps would report a student has nothing left to learn because
+# the rest of the graph was never sent. So the graph is always paged.
+GRAPH_PAGE_SIZE = 1000
+
+
+def _load_all(make_query) -> list[dict]:
+    """Page a table to the end. `make_query` returns a fresh query each call."""
+    rows: list[dict] = []
+    start = 0
+    while True:
+        page = make_query().range(start, start + GRAPH_PAGE_SIZE - 1).execute().data or []
+        rows.extend(page)
+        if len(page) < GRAPH_PAGE_SIZE:
+            return rows
+        start += GRAPH_PAGE_SIZE
+
+
 def load_concept_nodes(client) -> list[dict]:
-    return _kernel(client, "concept_nodes").select("*").execute().data or []
+    return _load_all(lambda: _kernel(client, "concept_nodes").select("*"))
 
 
 def load_concept_edges(client) -> list[dict]:
-    return _kernel(client, "concept_edges").select("*").execute().data or []
+    return _load_all(lambda: _kernel(client, "concept_edges").select("*"))
 
 
 def count_concept_nodes(client) -> int:
@@ -83,6 +104,18 @@ def load_all_labels(client) -> list[str]:
     physics conversation referencing math reuses the canonical math labels."""
     res = _kernel(client, "concept_nodes").select("label").execute()
     return [r["label"] for r in (res.data or []) if r.get("label")]
+
+
+def load_labels_by_subject(client) -> list[dict]:
+    """Every KC label with the subject it belongs to.
+
+    The extraction prompt can only carry so much vocabulary, so the caller has
+    to choose WHICH labels to send once the graph outgrows that budget. It
+    cannot choose without knowing each label's subject — see
+    `_format_vocabulary` in services/analyze.py.
+    """
+    res = _kernel(client, "concept_nodes").select("label, subject").execute()
+    return [r for r in (res.data or []) if r.get("label")]
 
 
 # --------------------------------------------------------------------------- #

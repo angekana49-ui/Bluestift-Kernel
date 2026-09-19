@@ -79,7 +79,7 @@ Each KC, per student, carries a four-dimensional state (Luckin / corpus §1.2):
 │   └── apply_migrations.py  # CLI: apply migrations via the Management API
 ├── migrations/              # 10 numbered Supabase SQL migrations
 ├── conftest.py              # In-memory fake Supabase for tests
-├── test_kernel.py           # 96 tests
+├── test_kernel.py           # 100 tests
 ├── requirements.txt / requirements-dev.txt
 └── railway.toml            # Deploy config + the cost rules that keep it cheap
 ```
@@ -258,6 +258,49 @@ curl -X POST http://localhost:8000/seed_kcs
 ---
 
 ## Cold-start: build a curriculum graph from the LLMs
+
+**Where the graph stands today** (live counts, not aspiration):
+
+| Subject | KCs | Internal edges |
+|---|---|---|
+| PHYSICS | 88 | 141 |
+| MATH | 56 | 89 |
+| HISTORY | 10 | 10 |
+| **MATH → PHYSICS** | — | **50 bridges** |
+
+So it is really a *two-subject* graph — maths feeding physics — plus a
+ten-node history island with no bridge in or out. Nothing in the code limits
+this: KCs are created on the fly for any subject, the detector traverses any
+edge, and `/prerequisite_gaps` walks whatever is there. Only these three have
+been built. Adding a subject is a run of the builder, not a change to the
+Kernel:
+
+```bash
+python scripts/build_graph.py CHEMISTRY cycle4 lycee --dry-run   # inspect
+python scripts/build_graph.py CHEMISTRY cycle4 lycee             # persist
+python scripts/build_bridges.py CHEMISTRY PHYSICS                # connect it
+```
+
+A subject without bridges is an island: root-cause detection can never leave
+it, which is exactly what HISTORY does today. Build the bridges, or the new
+subject buys you nodes and no reasoning.
+
+Two things were fixed so a wider graph actually works, because both failed
+silently:
+
+- **The extraction vocabulary is subject-aware.** The prompt can only carry
+  `VOCABULARY_BUDGET` (400) labels. That budget used to be filled in database
+  order across every subject — fine at 154 KCs, wrong past 400, where the
+  subject being analysed could end up barely represented and the model would
+  invent label variants instead of reusing canonical ones. That is label
+  drift, and it fragments the graph into near-duplicates precisely as subjects
+  are added. The home subject is now served first, with a quarter of the
+  budget held back so cross-subject detection survives.
+- **The graph is paged.** PostgREST caps rows per response. Past that cap a
+  plain select returns a short graph with no error, and a truncated graph is
+  not a partial read — the detector would walk a subgraph and name a root that
+  isn't one.
+
 
 Instead of waiting for real data, distill a dense, canonical prerequisite graph
 out of the public models (closed-world prerequisites, cross-model corroboration,

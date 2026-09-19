@@ -83,36 +83,69 @@ def _format_conversation(history: list[dict]) -> str:
     return "\n".join(f"{m['role']}: {m['content']}" for m in history)
 
 
-def _format_vocabulary(labels: list[str]) -> str:
+# How many KC labels the extraction prompt can carry. The budget is a context
+# cost, not a preference — past this the prompt bloats and extraction degrades.
+VOCABULARY_BUDGET = 400
+# Share of the budget reserved for subjects OTHER than the one being analysed.
+# Cross-subject detection is a headline capability: a physics conversation must
+# still be able to name a maths concept, so foreign vocabulary cannot be
+# squeezed to zero.
+CROSS_SUBJECT_SHARE = 0.25
+
+
+def _format_vocabulary(rows: list[dict], subject: str | None = None) -> str:
     """Render the known-KC vocabulary for the extraction prompt.
 
-    Capped so a large graph doesn't blow the context; the cap keeps the most
-    relevant (here: simply the provided order) labels.
+    The budget used to be filled in whatever order the database returned rows,
+    across every subject. At 154 concepts that was harmless. Past the budget it
+    is not: the subject the student is actually working on can end up barely
+    represented, the model stops seeing its canonical labels, and it invents
+    variants instead of reusing them. That is label drift, and it fragments the
+    graph into near-duplicates precisely as new subjects are added — the moment
+    the vocabulary matters most.
+
+    So the current subject is served first, and a quarter of the budget is held
+    back for everything else, because a physics conversation still has to be
+    able to say `derivation_fonction`.
     """
+    labels = [r["label"] for r in rows if r.get("label")]
     if not labels:
         return "(aucun concept connu pour l'instant)"
-    capped = labels[:400]
-    return ", ".join(sorted(set(capped)))
+    if len(set(labels)) <= VOCABULARY_BUDGET or not subject:
+        return ", ".join(sorted(set(labels))[:VOCABULARY_BUDGET])
+
+    own = sorted({r["label"] for r in rows if r.get("subject") == subject})
+    foreign = sorted({r["label"] for r in rows if r.get("subject") != subject})
+
+    cross_budget = int(VOCABULARY_BUDGET * CROSS_SUBJECT_SHARE)
+    own_budget = VOCABULARY_BUDGET - cross_budget
+    # A small home subject hands its unused room back rather than wasting it.
+    if len(own) < own_budget:
+        cross_budget += own_budget - len(own)
+
+    chosen = own[:own_budget] + foreign[:cross_budget]
+    return ", ".join(sorted(set(chosen)))
 
 
 async def extract_kcs(
     conversation: list[dict],
     subject: str,
     level: str,
-    known_labels: list[str] | None = None,
+    known_labels: list[dict] | None = None,
 ) -> tuple[dict, str]:
     """Run the extraction LLM call. Returns (parsed_data, llm_used).
 
-    `known_labels` is the existing KC vocabulary for the subject, injected into
-    the prompt so the LLM reuses canonical labels instead of inventing variants
-    (label drift). This is the lightweight half of KC canonicalization; the
-    Kernel still owns the ontology and creates genuinely new KCs on the fly.
+    `known_labels` is the existing KC vocabulary as `{label, subject}` rows,
+    injected into the prompt so the LLM reuses canonical labels instead of
+    inventing variants (label drift). It carries the subject because the
+    vocabulary has a budget, and past it the choice of WHICH labels to send is
+    what keeps the graph from fragmenting — see `_format_vocabulary`.
     """
     prompt = EXTRACTION_PROMPT.format(
         conversation=_format_conversation(conversation),
         subject=subject,
         level=level,
-        known_concepts=_format_vocabulary(known_labels or []),
+        known_concepts=_format_vocabulary(known_labels or [], subject),
     )
     response_text, llm_used = await llm_call(prompt, max_tokens=1200)
     try:
@@ -171,7 +204,7 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
     # 1. LLM extraction of mentioned KCs + attempt evaluations. The existing KC
     #    vocabulary (across ALL subjects) is fed to the prompt to curb label drift,
     #    including cross-subject references (e.g. a physics chat mentioning maths).
-    known_labels = db.load_all_labels(client)
+    known_labels = db.load_labels_by_subject(client)
     extraction, llm_used = await extract_kcs(conversation, subject, level, known_labels)
     langue = extraction.get("langue_interaction", "fr")
 
