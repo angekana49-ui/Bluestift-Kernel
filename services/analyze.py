@@ -560,18 +560,50 @@ def _estimate_personal_lambda(prev_state: dict | None, observed_now: float, curr
     return calibration.calibrate_personal_lambda(prev_k, observed_now, delta_days, current_lambda)
 
 
-def _update_mindset(client, user_id: str, signals: dict | None) -> float:
-    """Compute and persist the mindset score M; return it (0.5 if no signal)."""
-    if not signals:
-        return 0.5
+def _signal(signals: dict, key: str) -> float:
+    """One behavioural signal, defaulting to neutral when absent or unparseable.
+
+    Neutral and not 0.0: the signals do not share a direction of "good", so a
+    zero default would read a missing `abandon_rate` as a student who never
+    gives up and a missing `persistence_score` as one who never tries. Per-field
+    rather than all-or-nothing, so one junk value from the model does not
+    discard the three usable ones alongside it.
+    """
     try:
-        m = mindset.compute_mindset_score(
-            abandon_rate=float(signals.get("abandon_rate", 0.0)),
-            persistence_score=float(signals.get("persistence_score", 0.0)),
-            time_on_task=float(signals.get("time_on_task", 0.0)),
-            interaction_quality=float(signals.get("interaction_quality", 0.0)),
-        )
-    except (TypeError, ValueError):
-        return 0.5
+        return float(signals[key])
+    except (KeyError, TypeError, ValueError):
+        return mindset.NEUTRAL_M
+
+
+def _update_mindset(client, user_id: str, signals: dict | None) -> float:
+    """Fold this conversation's mindset reading into the stored score M.
+
+    Smoothed rather than overwritten (see mindset.EMA_WEIGHT): M is a trait
+    estimate taken through one exchange, and the label it feeds decides whether
+    the tutor stops teaching the concept to address the student's self-belief.
+
+    When the exchange said nothing about mindset, the STORED score is returned —
+    "this conversation carried no signal" is not the same claim as "this student
+    is average", and P is modulated by whichever one we hand back.
+    """
+    previous = None
+    row = db.load_mindset(client, user_id)
+    if row is not None and row.get("m_score") is not None:
+        try:
+            previous = float(row["m_score"])
+        except (TypeError, ValueError):
+            previous = None
+    fallback = previous if previous is not None else mindset.NEUTRAL_M
+
+    if not signals:
+        return fallback
+
+    observed = mindset.compute_mindset_score(
+        abandon_rate=_signal(signals, "abandon_rate"),
+        persistence_score=_signal(signals, "persistence_score"),
+        time_on_task=_signal(signals, "time_on_task"),
+        interaction_quality=_signal(signals, "interaction_quality"),
+    )
+    m = mindset.blend_mindset(previous, observed)
     db.upsert_mindset(client, user_id, round(m, 4), mindset.classify_mindset(m))
     return m

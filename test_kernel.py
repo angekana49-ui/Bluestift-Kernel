@@ -106,6 +106,63 @@ def test_mindset_bounds_and_classification():
     assert mindset.classify_mindset(0.3) == "fixed"
 
 
+def test_every_mindset_label_is_reachable_from_real_signals():
+    """The score has to span the labels it feeds.
+
+    This is the assertion the bounds test above was missing, and the reason a
+    broken scale survived: clamping to [0.05, 0.95] and classifying a hand-fed
+    0.8 both passed while NO combination of signals could produce a 0.8 at all.
+    A sigmoid over the un-centred weighted sum only reached [0.413, 0.657], so
+    every student was "mixed" for life and `detect_fixed_mindset` was dead code.
+    """
+    gives_up = mindset.compute_mindset_score(1.0, 0.0, 0.0, 0.0)
+    average = mindset.compute_mindset_score(0.5, 0.5, 0.5, 0.5)
+    digs_in = mindset.compute_mindset_score(0.0, 1.0, 1.0, 1.0)
+
+    assert mindset.classify_mindset(gives_up) == "fixed"
+    assert mindset.classify_mindset(average) == "mixed"
+    assert mindset.classify_mindset(digs_in) == "growth"
+    # And the alert that reads M can actually fire.
+    assert anomaly.detect_fixed_mindset(gives_up) is not None
+    assert anomaly.detect_fixed_mindset(digs_in) is None
+    # An all-neutral student sits exactly on the neutral point, which is what
+    # makes "no signal" and "average signal" comparable numbers.
+    assert average == pytest.approx(mindset.NEUTRAL_M)
+
+
+def test_mindset_signals_are_clamped_to_the_unit_interval():
+    """An LLM asked for [0,1] can still answer 1.4. It must not move the label
+    further than a maximal honest signal would."""
+    assert mindset.compute_mindset_score(0.0, 5.0, 5.0, 5.0) == mindset.compute_mindset_score(
+        0.0, 1.0, 1.0, 1.0
+    )
+    assert mindset.compute_mindset_score(-3.0, 1.0, 1.0, 1.0) == mindset.compute_mindset_score(
+        0.0, 1.0, 1.0, 1.0
+    )
+
+
+def test_mindset_is_smoothed_not_overwritten():
+    """One exchange moves the trait estimate; it does not redefine it."""
+    # First reading has nothing to blend against, so it stands alone.
+    assert mindset.blend_mindset(None, 0.9) == 0.9
+
+    # A growth-mindset student has one bad afternoon. It is allowed to move the
+    # estimate down to "mixed" — that is an honest "we are no longer sure" — but
+    # not to "fixed", which is the label that changes how the tutor teaches.
+    after_one = mindset.blend_mindset(0.9, 0.05)
+    assert mindset.classify_mindset(after_one) != "fixed", (
+        "one terse conversation must not brand a learner"
+    )
+
+    # Consistent evidence does get there, it just takes more than one reading.
+    m, readings = 0.9, 0
+    while mindset.classify_mindset(m) != "fixed":
+        m = mindset.blend_mindset(m, 0.05)
+        readings += 1
+        assert readings < 20, "sustained evidence has to be able to move M"
+    assert readings >= 3, "the estimate must not be one conversation deep"
+
+
 def test_calibrate_personal_lambda():
     # Mastery dropped from 0.8 to 0.5 over 20 days -> positive observed lambda.
     lam = calibration.calibrate_personal_lambda(0.8, 0.5, 20, 0.02)
@@ -1847,3 +1904,40 @@ def test_the_extraction_prompt_does_not_close_the_list_of_subjects():
     assert 'N\'utilise PAS "OTHER"' in prompt
     # The examples stay, as examples — they must not read as the whole set.
     assert "GEOGRAPHY" in prompt and "PHILOSOPHY" in prompt
+
+
+def test_update_mindset_keeps_the_stored_score_when_a_turn_says_nothing(fake_supabase):
+    """A silent conversation is not evidence of an average student.
+
+    `_update_mindset` returns the value P is modulated with, so answering 0.5 for
+    a learner already measured at 0.9 would quietly flatten their persistence
+    score on every exchange that happened not to carry a mindset signal.
+    """
+    fake_supabase.seed(
+        "kernel.student_mindset_state",
+        [{"user_id": "u1", "m_score": 0.9, "detected_mindset": "growth"}],
+    )
+    assert analyze_pipeline._update_mindset(fake_supabase, "u1", None) == 0.9
+    # Nothing was written: there was nothing new to write.
+    assert fake_supabase.tables["kernel.student_mindset_state"][0]["m_score"] == 0.9
+
+    # An unmeasured student with no signal still has to yield a usable number.
+    assert analyze_pipeline._update_mindset(fake_supabase, "u2", None) == mindset.NEUTRAL_M
+
+
+def test_update_mindset_blends_into_the_stored_score(fake_supabase):
+    fake_supabase.seed(
+        "kernel.student_mindset_state",
+        [{"user_id": "u1", "m_score": 0.9, "detected_mindset": "growth"}],
+    )
+    signals = {
+        "abandon_rate": 1.0,
+        "persistence_score": 0.0,
+        "time_on_task": 0.0,
+        "interaction_quality": 0.0,
+    }
+    m = analyze_pipeline._update_mindset(fake_supabase, "u1", signals)
+    assert 0.05 < m < 0.9, "the reading must move the estimate without replacing it"
+    row = fake_supabase.tables["kernel.student_mindset_state"][0]
+    assert row["m_score"] == round(m, 4)
+    assert row["detected_mindset"] == mindset.classify_mindset(m)
