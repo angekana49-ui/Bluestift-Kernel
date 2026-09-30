@@ -32,7 +32,7 @@ from fastapi.responses import JSONResponse
 load_dotenv()
 
 from core import bkt, calibration, forgetting, prerequisites, ratelimit  # noqa: E402
-from core.calibration import compute_empirical_kc_params  # noqa: E402
+from core.calibration import compute_empirical_kc_params, credit_sequences, fit_bkt_em  # noqa: E402
 from core.graph import build_graph  # noqa: E402
 from core.mindset import classify_mindset  # noqa: E402
 from models.schemas import (  # noqa: E402
@@ -53,7 +53,7 @@ from models.schemas import (  # noqa: E402
 )
 from services import analyze as analyze_pipeline  # noqa: E402
 from services import db  # noqa: E402
-from services.analyze import _persistence, _slip_estimate, _velocity  # noqa: E402
+from services.analyze import _learning_events, _next_state, _persist_state  # noqa: E402
 from services.kc_registry import _normalize_label, get_or_create_kc  # noqa: E402
 
 KERNEL_VERSION = os.getenv("KERNEL_VERSION", "1.0.0")
@@ -381,53 +381,58 @@ async def update_concept_state(
         node.get("type_kc", "conceptual"),
         state.get("last_strong_signal_at"),
         lambda_override=forgetting.get_lambda(node, state),
+        floor=params["p_init"],
     )
 
-    # Assisted attempts are capped at 0.9 — full credit can't come with help.
-    pc = min(req.partial_credit_score, 0.9) if req.is_assisted else req.partial_credit_score
+    # The same observation model as /analyze, through the same functions, so
+    # the two doors into a student's state cannot drift apart: help raises the
+    # guess rate instead of capping the credit, and a failure caused by a
+    # linguistic block is logged but is no evidence about the concept.
+    counted = bkt.blocage_evidence(req.partial_credit_score, req.blocage_type.value)
+    observation = {
+        "credit": counted if counted is not None else req.partial_credit_score,
+        "assisted": req.is_assisted,
+        "blocage_type": req.blocage_type.value,
+        "counted": counted is not None,
+    }
+    lam = forgetting.get_lambda(node, state)
 
-    k_raw = bkt.update_bkt(k_raw_prev, correct=(pc >= 0.5), partial_credit=pc, params=params)
+    if not observation["counted"]:
+        db.log_learning_events(client, _learning_events(
+            req.user_id, concept_id, None, [observation], [k_raw_prev], source="update_concept_state"
+        ))
+        current = bkt.effective_state(node, state)
+        return UpdateConceptStateResponse(
+            user_id=req.user_id,
+            concept_id=concept_id,
+            label=node.get("label", ""),
+            k_raw=current["k_raw"] if current["k_raw"] is not None else round(k_raw_prev, 4),
+            k_effective=current["k_effective"] if current["k_effective"] is not None else round(k_raw_prev, 4),
+            p_score=(state.get("p_score") if state else None) or 0.5,
+            status=current["status"],
+            updated=False,
+        )
 
-    now = datetime.now(timezone.utc).isoformat()
-    prev_count = (state.get("interactions_on_kc") if state else 0) or 0
-    prev_avg = state.get("partial_credit_avg") if state else None
-    new_avg = pc if prev_avg is None else (prev_avg * prev_count + pc) / (prev_count + 1)
-    prev_struggle = (state.get("struggle_index") if state else 0) or 0
-    interactions = prev_count + 1
-    struggle_index = prev_struggle + (1 if pc < 0.5 else 0)
+    ks = [k_raw_prev, bkt.update_bkt(
+        k_raw_prev, correct=observation["credit"] >= 0.5, partial_credit=observation["credit"],
+        params=params, assisted=observation["assisted"],
+    )]
+    k_raw = ks[-1]
 
-    # Cognitive vector: V = learning rate p(T); P = (1 - personal slip) modulated by M.
     m_row = db.load_mindset(client, req.user_id)
     m_score = (m_row.get("m_score") if m_row else None) or 0.5
-    p_slip_personal = _slip_estimate(state.get("p_slip_personal") if state else None, k_raw_prev, pc < 0.5)
-    v_score = _velocity(state.get("v_score") if state else None, k_raw_prev, k_raw)
-    p_score = _persistence(p_slip_personal, m_score)
+    row = _next_state(req.user_id, concept_id, ks, [observation], state, lam, m_score, params)
+    _persist_state(client, row, k_raw)
+    db.log_learning_events(client, _learning_events(
+        req.user_id, concept_id, None, [observation], ks, source="update_concept_state"
+    ))
+    p_score = row["p_score"]
 
-    db.upsert_student_concept_state(
-        client,
-        {
-            "user_id": req.user_id,
-            "concept_id": concept_id,
-            "mastery_score_raw": round(k_raw, 4),
-            "mastery_score_effective": round(k_raw, 4),
-            "v_score": v_score,
-            "p_score": p_score,
-            "p_slip_personal": p_slip_personal,
-            "partial_credit_avg": round(new_avg, 4),
-            "struggle_index": struggle_index,
-            "interactions_on_kc": interactions,
-            "last_strong_signal_at": now,
-        },
-    )
-    db.log_trajectory(client, req.user_id, concept_id, k_raw, k_raw)
-
-    k_eff = forgetting.compute_effective_mastery(
-        k_raw, node.get("type_kc", "conceptual"), now,
-        lambda_override=forgetting.get_lambda(node, state),
-    )
-    # The student's own slip, as /load_profile and /analyze use — otherwise this
-    # response and the next profile read disagree on whether the KC is mastered.
-    status = bkt.classify_status(k_eff, p_slip_personal, new_avg)
+    # Fresh signal: effective == raw. The student's own slip and recent
+    # autonomous credits, as /load_profile reads them — otherwise this response
+    # and the next profile read disagree on whether the KC is mastered.
+    k_eff = k_raw
+    status = bkt.classify_status(k_eff, row["p_slip_personal"], bkt.mastery_credit(row))
 
     # Fire-and-forget empirical recalibration, but only if this KC is past its
     # cooldown: recalibration reads every student's state for the KC, and a
@@ -449,11 +454,20 @@ async def update_concept_state(
 
 
 def _recalibrate_kc(concept_id: str) -> None:
-    """Background: recompute a KC's empirical params from all student states."""
+    """Background: recompute a KC's empirical params from all student states,
+    and refit its BKT parameters on the logged evidence once there is enough.
+
+    The fit always shrinks towards the LITERATURE priors, never towards the
+    previous fit: re-centring on our own last estimate would let an early,
+    noisy fit compound into the next one.
+    """
     try:
         client = db.get_client()
         states = db.load_states_for_concept(client, concept_id)
-        params = compute_empirical_kc_params(states)
+        params = compute_empirical_kc_params(states) or {}
+        fitted = fit_bkt_em(credit_sequences(db.load_learning_events_for_concept(client, concept_id)))
+        if fitted:
+            params.update(fitted)
         if params:
             params["last_calibration_at"] = datetime.now(timezone.utc).isoformat()
             db.update_concept_node(client, concept_id, params)

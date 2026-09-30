@@ -11,7 +11,10 @@ soft evidence, weighing the correct and incorrect likelihoods by its credit.
 """
 from __future__ import annotations
 
-# Literature priors — used only as a fallback prior, never as a hard constant.
+# [prior] Literature priors — used only as a fallback, never as a hard constant.
+# Typical of fitted Cognitive Tutor / ASSISTments values (Corbett & Anderson
+# 1995; Baker, Corbett & Aleven 2008), not fitted on our students. They are
+# replaced per KC by `calibration.fit_bkt_em` once enough evidence exists.
 BKT_PRIORS = {
     "p_init": 0.3,      # p(L0) initial mastery probability
     "p_transit": 0.1,   # p(T) probability of learning on a trial
@@ -19,7 +22,11 @@ BKT_PRIORS = {
     "p_guess": 0.2,     # p(G) probability of success by chance
 }
 
-# Recognized partial-credit bins (Ostrow & Heffernan 2015).
+# [prior, to verify] The partial-credit grading scale (Ostrow & Heffernan 2015).
+# A scale for GRADERS (the extraction LLM, the app) to report on. The update
+# itself takes any credit in [0, 1]: under soft evidence, snapping to these
+# bins only destroyed information — it even turned the uninformative 0.5 into
+# a 0.6 that counts as evidence of mastery.
 PARTIAL_CREDIT_BINS = (0.0, 0.3, 0.6, 0.7, 0.8, 1.0)
 
 
@@ -59,9 +66,11 @@ def get_bkt_params(concept_node: dict | None) -> dict:
     }
 
 
-def snap_partial_credit(value: float) -> float:
-    """Snap a raw partial-credit score to the nearest recognized bin."""
-    return min(PARTIAL_CREDIT_BINS, key=lambda b: abs(b - value))
+# [design] Guess rate of an assisted attempt: with help, a student who has not
+# learned the concept succeeds about half the time. A deliberately conservative
+# placeholder — calibrate it separately from p_guess once learning_events hold
+# enough assisted attempts.
+ASSISTED_GUESS = 0.5
 
 
 def update_bkt(
@@ -69,15 +78,25 @@ def update_bkt(
     correct: bool,
     partial_credit: float | None = None,
     params: dict | None = None,
+    assisted: bool = False,
 ) -> float:
     """Bayesian update of K after one observation.
+
+    An assisted attempt is a different observation, not a discounted one: with
+    help, a student who has NOT learned the concept succeeds far more often,
+    so its guess rate is raised to ASSISTED_GUESS. A success then still counts,
+    but as much weaker evidence (Bastani et al. 2024: assisted practice
+    performance barely predicts unassisted exam performance). Capping the
+    credit at 0.9, as before, left an assisted success ~70% as convincing as an
+    autonomous one.
 
     Args:
         k_current: prior mastery probability in [0, 1].
         correct: whether the attempt succeeded (ignored if partial_credit given).
-        partial_credit: graded outcome in [0, 1]; snapped to recognized bins.
+        partial_credit: graded outcome in [0, 1] (clamped).
         params: BKT params dict (p_init/p_transit/p_slip/p_guess). Falls back to
             literature priors when omitted.
+        assisted: the attempt was made with the tutor's help.
 
     Returns:
         Posterior mastery probability in [0, 1].
@@ -86,9 +105,11 @@ def update_bkt(
     p_slip = p["p_slip"]
     p_guess = p["p_guess"]
     p_transit = p["p_transit"]
+    if assisted:
+        p_guess = max(p_guess, ASSISTED_GUESS)
 
     if partial_credit is not None:
-        correct_weight = snap_partial_credit(partial_credit)
+        correct_weight = max(0.0, min(1.0, partial_credit))
     else:
         correct_weight = 1.0 if correct else 0.0
 
@@ -113,55 +134,81 @@ def update_bkt(
 
 
 # --------------------------------------------------------------------------- #
-# Selective-update gate
+# Evidence rules: blocage type
 # --------------------------------------------------------------------------- #
-def should_update_bkt(
-    consecutive_interactions: int,
-    partial_credit_now: float,
-    partial_credit_prev: float | None,
-    anomalous_pattern: bool = False,
-) -> bool:
-    """Decide whether a BKT update should fire (avoid noisy micro-updates).
+def blocage_evidence(credit: float, blocage_type: str | None) -> float | None:
+    """The credit an attempt counts for, given why the student was blocked.
 
-    Fires when any of:
-      - 3+ consecutive interactions on the same KC in the same session, OR
-      - partial-credit change > 0.3 vs the last stored value, OR
-      - an anomalous pattern is detected.
+    K measures the concept, not the language it was asked in, so a failure
+    caused by a LINGUISTIC block is no evidence about K and is not counted
+    (None). An AMBIGUOUS failure counts half: its credit is pulled halfway to
+    0.5, which is exactly the uninformative credit (at c = 0.5 both likelihoods
+    equal 0.5, so the posterior equals the prior). Successes and conceptual
+    failures count in full. [design: the half weight for ambiguous]
     """
-    if anomalous_pattern:
-        return True
-    if consecutive_interactions >= 3:
-        return True
-    if partial_credit_prev is not None and abs(partial_credit_now - partial_credit_prev) > 0.3:
-        return True
-    return False
+    if credit >= 0.5 or blocage_type in (None, "", "none", "conceptual"):
+        return credit
+    if blocage_type == "linguistic":
+        return None
+    if blocage_type == "ambiguous":
+        return (credit + 0.5) / 2
+    return credit
 
 
 # --------------------------------------------------------------------------- #
 # Mastery criterion (dual condition)
 # --------------------------------------------------------------------------- #
+# [prior] Corbett & Anderson (1995) mastery criterion.
 MASTERY_THRESHOLD = 0.95
+# [design] What "low slip" means for mastery; no published value for K-12.
 MAX_SLIP_FOR_MASTERY = 0.15
+# [design] Solid credit on the recent autonomous attempts.
 MIN_PARTIAL_CREDIT_AVG = 0.7
+# How many recent autonomous attempts the credit condition reads.
+RECENT_AUTONOMOUS_WINDOW = 3
 
 
-def is_mastered(k_effective: float, p_slip: float, partial_credit_avg: float) -> bool:
+def push_autonomous_credit(recent: list | None, credit: float) -> list[float]:
+    """Append an unassisted attempt's credit, keeping the last WINDOW, oldest first."""
+    return (list(recent or []) + [round(credit, 4)])[-RECENT_AUTONOMOUS_WINDOW:]
+
+
+def mastery_credit(student_state: dict | None) -> float | None:
+    """The credit figure the dual condition reads for a student's KC state.
+
+    The mean of the last three AUTONOMOUS attempts, and None (so: not
+    mastered) while fewer than three exist — mastery has to be shown without
+    help. Rows written before migration 011 have no list at all (NULL); for
+    those, fall back to the all-time average until new attempts fill the list.
+    """
+    if not student_state:
+        return None
+    recent = student_state.get("recent_autonomous_credits")
+    if recent is None:
+        return student_state.get("partial_credit_avg")
+    if len(recent) < RECENT_AUTONOMOUS_WINDOW:
+        return None
+    return sum(recent) / len(recent)
+
+
+def is_mastered(k_effective: float, p_slip: float, partial_credit_avg: float | None) -> bool:
     """Dual mastery condition: high effective mastery AND low slip AND solid credit."""
     return (
         k_effective >= MASTERY_THRESHOLD
         and p_slip <= MAX_SLIP_FOR_MASTERY
+        and partial_credit_avg is not None
         and partial_credit_avg >= MIN_PARTIAL_CREDIT_AVG
     )
 
 
-# Status thresholds used across the API.
+# [design] Status threshold used across the API.
 GAP_THRESHOLD = 0.4      # below -> "gap"; otherwise "partial" until mastered
 
 
 def classify_status(
     k_effective: float,
     p_slip: float = BKT_PRIORS["p_slip"],
-    partial_credit_avg: float = 0.5,
+    partial_credit_avg: float | None = 0.5,
 ) -> str:
     """Map an effective mastery to a human-facing status label.
 
@@ -199,9 +246,10 @@ def effective_state(concept_node: dict, student_state: dict | None) -> dict:
         concept_node.get("type_kc", "conceptual"),
         last_at,
         lambda_override=forgetting.get_lambda(concept_node, student_state),
+        floor=get_bkt_params(concept_node)["p_init"],
     )
     p_slip = student_state.get("p_slip_personal") or get_bkt_params(concept_node)["p_slip"]
-    pc_avg = student_state.get("partial_credit_avg") or 0.5
+    pc_avg = mastery_credit(student_state)
     return {
         "k_raw": round(k_raw, 4),
         "k_effective": round(k_effective, 4),

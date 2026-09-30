@@ -1,6 +1,13 @@
 """Exponential forgetting / decay of mastery.
 
-K_effective = K_raw * exp(-lambda * delta_days)
+    K_effective = floor + (K_raw - floor) * exp(-lambda * delta_days)
+
+K is a probability of mastery, so it decays towards what we would believe
+about this student with no evidence at all — the KC's p_init — never to 0.
+Decaying to 0 claimed certainty that the student does NOT know, which put a
+student who once learned the concept below one who never saw it. A K already
+below the floor is left alone: time passing does not make a failure better.
+(Forgetting in BKT: Qiu et al. 2011; Khajah, Lindsey & Mozer 2016.)
 
 Lambda is a *living* parameter resolved with a 3-level priority:
   1. the student's personal lambda on this KC (most precise),
@@ -12,14 +19,19 @@ from __future__ import annotations
 import math
 from datetime import datetime, timezone
 
-# Literature priors by KC type.
+from core.bkt import BKT_PRIORS
+
+# [design] Decay rates per day by KC type — half-lives of ~69 (procedural),
+# ~35 (conceptual) and ~14 (declarative) days. The ordering (facts fade faster
+# than procedures) follows the retention literature; the values themselves are
+# ours, starting points to be replaced by calibration (see PARAMETERS.md).
 LAMBDA_PRIORS = {
     "procedural": 0.01,
     "declarative": 0.05,
     "conceptual": 0.02,
 }
 
-# Minimum interactions before a KC's empirical lambda is trusted over the prior.
+# [design] Minimum interactions before a KC's empirical lambda is trusted over the prior.
 MIN_INTERACTIONS_FOR_EMPIRICAL = 10
 
 
@@ -64,17 +76,24 @@ def compute_effective_mastery(
     kc_type: str,
     last_interaction_at,
     lambda_override: float | None = None,
+    floor: float | None = None,
 ) -> float:
     """Apply exponential decay to a raw mastery score.
 
     Args:
         k_raw: stored mastery probability.
         kc_type: KC type used to pick the prior lambda when no override given.
-        last_interaction_at: datetime or ISO string of the last strong signal.
+        last_interaction_at: datetime or ISO string of the last observation.
         lambda_override: explicit lambda (already resolved via `get_lambda`).
+        floor: what K decays towards — the KC's p_init. Defaults to the
+            literature prior when the caller has no node at hand.
     """
+    k_raw = max(0.0, min(1.0, k_raw))
     if last_interaction_at is None:
-        return max(0.0, min(1.0, k_raw))
+        return k_raw
+    floor = BKT_PRIORS["p_init"] if floor is None else floor
+    if k_raw <= floor:
+        return k_raw
 
     lambda_val = (
         lambda_override
@@ -85,4 +104,4 @@ def compute_effective_mastery(
     delta_days = (datetime.now(timezone.utc) - last_dt).total_seconds() / 86400.0
     if delta_days < 0:
         delta_days = 0.0
-    return max(0.0, k_raw * math.exp(-lambda_val * delta_days))
+    return floor + (k_raw - floor) * math.exp(-lambda_val * delta_days)

@@ -10,6 +10,7 @@ Run: pytest -q
 from __future__ import annotations
 
 import asyncio
+import math
 import json
 from datetime import datetime, timedelta, timezone
 
@@ -46,9 +47,9 @@ def test_bkt_failure_decreases_mastery():
     assert k1 < k0
 
 
-def test_bkt_partial_credit_snapped_to_bins():
-    assert bkt.snap_partial_credit(0.72) == 0.7
-    assert bkt.snap_partial_credit(0.29) == 0.3
+def test_bkt_partial_credit_is_not_quantised():
+    # 0.72 and 0.7 are different evidence; no bin rounds one onto the other.
+    assert bkt.update_bkt(0.5, True, partial_credit=0.72) > bkt.update_bkt(0.5, True, partial_credit=0.7)
 
 
 def test_bkt_uses_node_params_over_priors():
@@ -57,13 +58,6 @@ def test_bkt_uses_node_params_over_priors():
     assert params["p_slip"] == 0.05
     # Missing values fall back to priors.
     assert params["p_guess"] == bkt.BKT_PRIORS["p_guess"]
-
-
-def test_selective_update_gate():
-    assert bkt.should_update_bkt(3, 0.5, 0.5) is True
-    assert bkt.should_update_bkt(1, 0.9, 0.4) is True   # delta > 0.3
-    assert bkt.should_update_bkt(1, 0.5, 0.5) is False
-    assert bkt.should_update_bkt(1, 0.5, None, anomalous_pattern=True) is True
 
 
 def test_mastery_dual_condition():
@@ -163,12 +157,87 @@ def test_mindset_is_smoothed_not_overwritten():
     assert readings >= 3, "the estimate must not be one conversation deep"
 
 
-def test_calibrate_personal_lambda():
-    # Mastery dropped from 0.8 to 0.5 over 20 days -> positive observed lambda.
-    lam = calibration.calibrate_personal_lambda(0.8, 0.5, 20, 0.02)
-    assert calibration.LAMBDA_MIN <= lam <= calibration.LAMBDA_MAX
-    # Not enough signal -> returns current.
-    assert calibration.calibrate_personal_lambda(0.8, 0.5, 0.5, 0.02) == 0.02
+def test_personal_lambda_learns_from_the_first_attempt_back():
+    args = dict(k_stored=0.9, floor=0.3, delta_days=30, p_slip=0.1, p_guess=0.2)
+    # An unexpected failure after a month: this student forgets faster.
+    faster = calibration.update_personal_lambda(0.02, credit=0.0, **args)
+    # A success: slower. Both move, neither jumps.
+    slower = calibration.update_personal_lambda(0.02, credit=1.0, **args)
+    assert slower < 0.02 < faster
+    assert 0.5 < slower / 0.02 < 1 and 1 < faster / 0.02 < 2
+    # No gap, or nothing above the floor to forget: nothing to learn.
+    assert calibration.update_personal_lambda(0.02, credit=0.0, **{**args, "delta_days": 0.5}) == 0.02
+    assert calibration.update_personal_lambda(0.02, credit=0.0, **{**args, "k_stored": 0.3}) == 0.02
+
+
+def _simulate_bkt(params, students, attempts, seed):
+    import random
+
+    rng = random.Random(seed)
+    sequences = []
+    for _ in range(students):
+        learned = rng.random() < params["p_init"]
+        seq = []
+        for _ in range(attempts):
+            p_correct = 1 - params["p_slip"] if learned else params["p_guess"]
+            seq.append(1.0 if rng.random() < p_correct else 0.0)
+            learned = learned or rng.random() < params["p_transit"]
+        sequences.append(seq)
+    return sequences
+
+
+def test_fit_bkt_em_recovers_known_parameters():
+    # Where the constants come from, eventually: our own students. Simulate a
+    # population with parameters far from the literature priors and check the
+    # fit finds them, not the priors.
+    truth = {"p_init": 0.15, "p_transit": 0.25, "p_slip": 0.05, "p_guess": 0.35}
+    fitted = calibration.fit_bkt_em(_simulate_bkt(truth, 400, 12, seed=7))
+    for name, value in truth.items():
+        # Nearer the truth than the prior it started from, on every parameter.
+        assert abs(fitted[name] - value) < abs(bkt.BKT_PRIORS[name] - value), name
+        # p_init and p_guess trade off against each other when guessing is
+        # common (a lucky first answer looks like prior knowledge), so they
+        # get a looser bound than slip and transit.
+        assert fitted[name] == pytest.approx(value, abs=0.07), name
+
+
+def test_fit_bkt_em_refuses_thin_evidence_and_stays_identifiable():
+    few = _simulate_bkt(bkt.BKT_PRIORS, 5, 4, seed=1)
+    assert calibration.fit_bkt_em(few) is None
+    # Pure noise (coin flips) must not produce an inverted model.
+    import random
+
+    rng = random.Random(3)
+    noise = [[float(rng.random() < 0.5) for _ in range(10)] for _ in range(100)]
+    fitted = calibration.fit_bkt_em(noise)
+    assert fitted["p_slip"] < 0.5 and fitted["p_guess"] < 0.5
+    assert fitted["p_slip"] + fitted["p_guess"] < 1
+
+
+def test_assisted_success_is_weak_evidence():
+    autonomous = bkt.update_bkt(0.3, correct=True) - 0.3
+    assisted = bkt.update_bkt(0.3, correct=True, assisted=True) - 0.3
+    assert 0 < assisted < 0.6 * autonomous
+
+
+def test_linguistic_block_does_not_count_against_the_concept():
+    assert bkt.blocage_evidence(0.0, "linguistic") is None
+    assert bkt.blocage_evidence(1.0, "linguistic") == 1.0  # a success still counts
+    assert bkt.blocage_evidence(0.0, "ambiguous") == 0.25
+    assert bkt.blocage_evidence(0.0, "conceptual") == 0.0
+    # 0.5 is the uninformative credit the ambiguous rule shrinks towards.
+    assert bkt.update_bkt(0.4, correct=False, partial_credit=0.5, params={**bkt.BKT_PRIORS, "p_transit": 0.0}) == pytest.approx(0.4)
+
+
+def test_mastery_requires_three_recent_autonomous_attempts():
+    base = {"mastery_score_raw": 0.99, "p_slip_personal": 0.05,
+            "last_strong_signal_at": datetime.now(timezone.utc).isoformat()}
+    assert bkt.effective_state({}, {**base, "recent_autonomous_credits": [1.0, 1.0]})["status"] == "partial"
+    assert bkt.effective_state({}, {**base, "recent_autonomous_credits": [1.0, 0.8, 1.0]})["status"] == "mastered"
+    assert bkt.effective_state({}, {**base, "recent_autonomous_credits": [0.3, 0.6, 0.7]})["status"] == "partial"
+    # A row from before migration 011 (no list) falls back to the average.
+    assert bkt.effective_state({}, {**base, "partial_credit_avg": 0.9})["status"] == "mastered"
+    assert bkt.push_autonomous_credit([0.1, 0.2, 0.3], 0.4) == [0.2, 0.3, 0.4]
 
 
 def test_empirical_kc_params_needs_min_students():
@@ -280,18 +349,6 @@ def test_dedup_vocabulary_merges_near_duplicates():
 # --------------------------------------------------------------------------- #
 # get_or_create_kc with mocked LLM
 # --------------------------------------------------------------------------- #
-def test_selective_update_gate_bootstraps_then_gates():
-    attempt = {"outcome": "failure", "partial_credit": 0.2}
-    # First contact (no prior state) always commits.
-    assert analyze_pipeline._should_commit(attempt, None, 1) is True
-    # Small change vs stored average, single attempt -> no commit.
-    prev = {"partial_credit_avg": 0.25, "mastery_score_raw": 0.3}
-    assert analyze_pipeline._should_commit(attempt, prev, 1) is False
-    # Large partial-credit shift -> commit.
-    prev_far = {"partial_credit_avg": 0.9, "mastery_score_raw": 0.9}
-    assert analyze_pipeline._should_commit(attempt, prev_far, 1) is True
-
-
 def test_velocity_is_learning_rate():
     # V = p(T): fraction of the remaining mastery gap closed this trial.
     fast = analyze_pipeline._velocity(None, 0.2, 0.6)   # closed half the gap
@@ -393,17 +450,6 @@ def test_population_baseline_ignores_the_uncalibrated_default():
     assert analyze_pipeline._population_baseline({"empirical_difficulty": 0.5}) is None
     calibrated = {"empirical_difficulty": 0.15, "last_calibration_at": "2026-07-01T00:00:00Z"}
     assert analyze_pipeline._population_baseline(calibrated) == 0.15
-
-
-def test_selective_update_gate_fires_on_an_unstable_history():
-    state = {"partial_credit_avg": 0.5, "mastery_score_raw": 0.5}
-    attempt = {"outcome": "partial", "partial_credit": 0.5}  # no shift, one attempt
-    # Nothing notable in the attempt itself: the gate holds.
-    assert analyze_pipeline._should_commit(attempt, state, 1, []) is False
-    # Same attempt, but the KC's estimate has been oscillating -> commit, because
-    # holding back would leave an unreliable value on the books.
-    swinging = [0.5, 0.9, 0.2, 0.85, 0.25, 0.9, 0.3]
-    assert analyze_pipeline._should_commit(attempt, state, 1, swinging) is True
 
 
 def test_group_trajectories_keeps_order_per_concept():
@@ -2157,3 +2203,116 @@ def test_update_concept_state_decays_before_updating(client, fake_supabase, monk
     assert resp.status_code == 200, resp.text
     decayed = forgetting.compute_effective_mastery(0.9, "conceptual", long_ago)
     assert resp.json()["k_raw"] == pytest.approx(bkt.update_bkt(decayed, correct=True), abs=1e-3)
+
+
+async def test_consistent_success_keeps_raising_mastery(fake_supabase, monkeypatch):
+    # One success per session, every session. The old "strong signal" gate held
+    # all of these back (no 3 attempts, no credit shift), so K froze and then
+    # decayed while the student kept succeeding.
+    fake_supabase.seed("kernel.concept_nodes", [{"id": "f", "label": "fractions", "subject": "MATH"}])
+    fake_supabase.seed(
+        "kernel.student_concept_state",
+        [{"user_id": "u1", "concept_id": "f", "mastery_score_raw": 0.7, "partial_credit_avg": 1.0,
+          "interactions_on_kc": 3, "last_strong_signal_at": datetime.now(timezone.utc).isoformat()}],
+    )
+    extraction = {
+        "kcs_mentioned": [{"label": "fractions", "subject": "MATH"}],
+        "attempts": [{"kc_label": "fractions", "outcome": "success", "partial_credit": 1.0}],
+    }
+    ks = []
+    for _ in range(3):
+        out = await _analyze(fake_supabase, monkeypatch, extraction)
+        ks.append(out["mastery_map"]["fractions"]["k_raw"])
+    assert ks[0] > 0.7 and ks == sorted(ks) and len(set(ks)) == 3
+
+
+def test_forgetting_decays_towards_the_prior_not_zero():
+    # A student who once learned a concept and has not practised it in a year
+    # is not below one who never saw it: with no evidence left, we are back to
+    # the prior — not to certainty that they don't know.
+    a_year_ago = datetime.now(timezone.utc) - timedelta(days=365)
+    k = forgetting.compute_effective_mastery(0.95, "declarative", a_year_ago, floor=0.3)
+    assert k == pytest.approx(0.3, abs=1e-3)
+    assert k >= 0.3
+    # Halfway in time, halfway in the gap above the floor (one half-life).
+    half_life = math.log(2) / forgetting.LAMBDA_PRIORS["declarative"]
+    halfway = datetime.now(timezone.utc) - timedelta(days=half_life)
+    assert forgetting.compute_effective_mastery(0.9, "declarative", halfway, floor=0.3) == pytest.approx(0.6, abs=1e-3)
+    # Time does not improve a failure: below the floor, K stays where it is.
+    assert forgetting.compute_effective_mastery(0.1, "declarative", a_year_ago, floor=0.3) == pytest.approx(0.1)
+
+
+async def test_analyze_logs_every_attempt_and_skips_linguistic_failures(fake_supabase, monkeypatch):
+    fake_supabase.seed("kernel.concept_nodes", [{"id": "f", "label": "fractions", "subject": "MATH"}])
+    out = await _analyze(fake_supabase, monkeypatch, {
+        "kcs_mentioned": [{"label": "fractions", "subject": "MATH"}],
+        "attempts": [
+            # Failed because the statement's vocabulary was not understood.
+            {"kc_label": "fractions", "outcome": "failure", "partial_credit": 0.0,
+             "blocage_type": "linguistic"},
+            {"kc_label": "fractions", "outcome": "success", "partial_credit": 1.0},
+        ],
+    })
+    # Only the success moved K.
+    assert out["mastery_map"]["fractions"]["k_raw"] == pytest.approx(
+        bkt.update_bkt(bkt.BKT_PRIORS["p_init"], correct=True), abs=1e-4
+    )
+    events = fake_supabase.tables["kernel.learning_events"]
+    assert [e["counted"] for e in events] == [False, True]
+    assert events[1]["k_before"] == pytest.approx(bkt.BKT_PRIORS["p_init"])
+    assert all(e["source"] == "analyze" and e["request_id"] == "req-1" for e in events)
+
+
+async def test_assisted_success_moves_mastery_less(fake_supabase, monkeypatch):
+    fake_supabase.seed("kernel.concept_nodes", [
+        {"id": "a", "label": "fractions", "subject": "MATH"},
+        {"id": "b", "label": "equations", "subject": "MATH"},
+    ])
+    out = await _analyze(fake_supabase, monkeypatch, {
+        "kcs_mentioned": [{"label": "fractions", "subject": "MATH"}, {"label": "equations", "subject": "MATH"}],
+        "attempts": [
+            {"kc_label": "fractions", "outcome": "success", "partial_credit": 1.0, "is_assisted": True},
+            {"kc_label": "equations", "outcome": "success", "partial_credit": 1.0},
+        ],
+    })
+    assert out["mastery_map"]["fractions"]["k_raw"] < out["mastery_map"]["equations"]["k_raw"]
+    rows = {r["concept_id"]: r for r in fake_supabase.tables["kernel.student_concept_state"]}
+    # Only the autonomous attempt enters the dual-condition window.
+    assert rows["a"]["recent_autonomous_credits"] == []
+    assert rows["b"]["recent_autonomous_credits"] == [1.0]
+
+
+def test_update_concept_state_ignores_a_linguistic_failure(client, fake_supabase, monkeypatch):
+    monkeypatch.setenv("KERNEL_API_SECRET", "s3cr3t")
+    monkeypatch.setattr(db_module, "get_client", lambda: fake_supabase)
+    fake_supabase.seed("kernel.concept_nodes", [{"id": "f", "label": "fractions", "subject": "MATH"}])
+    resp = client.post(
+        "/update_concept_state",
+        json={"user_id": "u1", "concept_id": "f", "partial_credit_score": 0.0,
+              "blocage_type": "linguistic"},
+        headers={"X-Kernel-Secret": "s3cr3t"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["updated"] is False
+    assert resp.json()["status"] == "unknown"
+    assert fake_supabase.tables["kernel.student_concept_state"] == []
+    event = fake_supabase.tables["kernel.learning_events"][0]
+    assert event["counted"] is False and event["source"] == "update_concept_state"
+
+
+def test_recalibration_fits_bkt_params_from_logged_evidence(fake_supabase, monkeypatch):
+    monkeypatch.setattr(db_module, "get_client", lambda: fake_supabase)
+    fake_supabase.seed("kernel.concept_nodes", [{"id": "f", "label": "fractions", "subject": "MATH"}])
+    truth = {"p_init": 0.15, "p_transit": 0.25, "p_slip": 0.05, "p_guess": 0.35}
+    events, t0 = [], datetime(2026, 1, 1, tzinfo=timezone.utc)
+    for u, seq in enumerate(_simulate_bkt(truth, 200, 10, seed=11)):
+        for i, c in enumerate(seq):
+            events.append({"user_id": f"u{u}", "concept_id": "f", "credit": c, "is_assisted": False,
+                           "counted": True, "source": "analyze",
+                           "created_at": (t0 + timedelta(minutes=10 * u + i)).isoformat()})
+    fake_supabase.seed("kernel.learning_events", events)
+    main._recalibrate_kc("f")
+    node = fake_supabase.tables["kernel.concept_nodes"][0]
+    assert node["last_calibration_at"]
+    for name, value in truth.items():
+        assert abs(node[name] - value) < abs(bkt.BKT_PRIORS[name] - value), name

@@ -144,15 +144,65 @@ def load_student_concept_state(client, user_id: str, concept_id: str) -> dict | 
     return res.data[0] if res.data else None
 
 
+# Columns added by a migration the running DB may not have yet. Code ships
+# before (or without) the migration more often than one would like on a shared
+# DB; losing one column must not lose the whole state write.
+_STATE_COLUMNS_SINCE_011 = ("recent_autonomous_credits",)
+
+
 def upsert_student_concept_state(client, state: dict) -> dict:
     """Insert or update one student_concept_state row (keyed by user+concept)."""
     state = {**state, "updated_at": _now_iso()}
-    res = (
-        _kernel(client, "student_concept_state")
-        .upsert(state, on_conflict="user_id,concept_id")
-        .execute()
-    )
+    try:
+        res = (
+            _kernel(client, "student_concept_state")
+            .upsert(state, on_conflict="user_id,concept_id")
+            .execute()
+        )
+    except Exception as e:  # noqa: BLE001 - retried below without the new columns
+        if not any(col in state for col in _STATE_COLUMNS_SINCE_011):
+            raise
+        log_monitoring(client, "warn", "state_write_without_011_columns", {"error": str(e)[:300]})
+        state = {k: v for k, v in state.items() if k not in _STATE_COLUMNS_SINCE_011}
+        res = (
+            _kernel(client, "student_concept_state")
+            .upsert(state, on_conflict="user_id,concept_id")
+            .execute()
+        )
     return res.data[0] if res.data else state
+
+
+def log_learning_events(client, events: list[dict]) -> None:
+    """Append graded attempts to kernel.learning_events (best-effort).
+
+    The raw evidence BKT parameters are fitted on. Losing a batch costs a
+    little calibration data; failing the analysis over it would cost the
+    student their diagnosis.
+    """
+    if not events:
+        return
+    try:
+        now = _now_iso()
+        _kernel(client, "learning_events").insert(
+            [{"created_at": now, **e} for e in events]
+        ).execute()
+    except Exception as e:  # noqa: BLE001
+        log_monitoring(client, "warn", "learning_events_write_failed", {"error": str(e)[:300]})
+
+
+def load_learning_events_for_concept(client, concept_id: str, limit: int = 20000) -> list[dict]:
+    """Counted evidence on one KC, ordered per student then time — for calibration."""
+    return (
+        _kernel(client, "learning_events")
+        .select("user_id, credit, is_assisted, created_at")
+        .eq("concept_id", concept_id)
+        .eq("counted", True)
+        .order("created_at")
+        .limit(limit)
+        .execute()
+        .data
+        or []
+    )
 
 
 def load_states_for_concept(client, concept_id: str) -> list[dict]:
