@@ -273,8 +273,19 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
         #     the temporal-inconsistency detector.
         trajectories = _group_trajectories(db.load_recent_trajectories(client, user_id))
 
-        # 3b. Mindset M from the conversation (needed to modulate P during the loop).
-        m_score = _update_mindset(client, user_id, extraction.get("mindset_signals"))
+        # 3b. Mindset M (needed to modulate P during the loop): the conversation
+        #     reading, plus what the student measurably did — their reaction to
+        #     errors here, and their learning dynamics in the states above.
+        session_attempts = [
+            (lbl, c)
+            for lbl, atts in attempts_by_label.items()
+            for c in (_attempt_credit(a) for a in atts)
+            if c is not None
+        ]
+        m_score = _update_mindset(
+            client, user_id, extraction.get("mindset_signals"),
+            states_rows, trajectories, session_attempts,
+        )
 
         # 4-5. Decay -> effective mastery, then a BKT update on every attempt.
         mastery_map: dict[str, dict] = {}
@@ -781,7 +792,14 @@ def _signal(signals: dict, key: str) -> float:
         return mindset.NEUTRAL_M
 
 
-def _update_mindset(client, user_id: str, signals: dict | None) -> float:
+def _update_mindset(
+    client,
+    user_id: str,
+    signals: dict | None,
+    states: list[dict] | None = None,
+    trajectories: dict[str, list[float]] | None = None,
+    session_attempts: list[tuple[str, float]] | None = None,
+) -> float:
     """Fold this conversation's mindset reading into the stored score M.
 
     Smoothed rather than overwritten (see mindset.EMA_WEIGHT): M is a trait
@@ -801,15 +819,28 @@ def _update_mindset(client, user_id: str, signals: dict | None) -> float:
             previous = None
     fallback = previous if previous is not None else mindset.NEUTRAL_M
 
-    if not signals:
-        return fallback
-
-    observed = mindset.compute_mindset_score(
-        abandon_rate=_signal(signals, "abandon_rate"),
-        persistence_score=_signal(signals, "persistence_score"),
-        time_on_task=_signal(signals, "time_on_task"),
-        interaction_quality=_signal(signals, "interaction_quality"),
+    # Measured on what the student did (see core/mindset.py): how they react to
+    # an error in this conversation, and their learning dynamics so far.
+    behaviour = mindset.session_behaviour(session_attempts or [])
+    measured, evidence = mindset.measured_linear(
+        states or [], trajectories or {}, behaviour["recovery"]
     )
+
+    conversation = None
+    if signals:
+        # "Abandon after an error" is measured whenever there was an error to
+        # abandon after; the LLM's reading of it only fills in when there wasn't.
+        abandon = behaviour["abandon_after_error"]
+        conversation = mindset.conversation_linear(
+            abandon_rate=abandon if abandon is not None else _signal(signals, "abandon_rate"),
+            persistence_score=_signal(signals, "persistence_score"),
+            time_on_task=_signal(signals, "time_on_task"),
+            interaction_quality=_signal(signals, "interaction_quality"),
+        )
+
+    observed = mindset.combine(conversation, measured, evidence)
+    if observed is None:
+        return fallback
     m = mindset.blend_mindset(previous, observed)
     db.upsert_mindset(client, user_id, round(m, 4), mindset.classify_mindset(m))
     return m

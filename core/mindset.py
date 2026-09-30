@@ -1,5 +1,12 @@
 """Mindset score M.
 
+M = sigmoid(GAIN * (linear - 0.5)), where `linear` blends two readings:
+  - the conversation (the corpus formula: abandon, persistence, time on task,
+    interaction quality), with abandon-after-error MEASURED in the conversation
+    whenever there was an error to abandon after;
+  - the Kernel's own traces: learning speed (V), progression across sessions,
+    recovery after an error, stability (P without M). See `measured_linear`.
+
 A sigmoid blend of behavioural signals, clamped away from {0,1} because — per
 Dweck — a fully fixed or fully growth mindset is never a settled fact.
 
@@ -54,6 +61,27 @@ def _unit(value: float) -> float:
     return max(0.0, min(1.0, value))
 
 
+def _squash(linear: float) -> float:
+    """The centred sigmoid, clamped: a linear score in [0,1] -> M."""
+    m_score = 1.0 / (1.0 + math.exp(-GAIN * (linear - NEUTRAL_M)))
+    return max(M_FLOOR, min(M_CEIL, m_score))
+
+
+def conversation_linear(
+    abandon_rate: float,
+    persistence_score: float,
+    time_on_task: float,
+    interaction_quality: float,
+) -> float:
+    """The behaviour read in one conversation, as a linear score in [0, 1]."""
+    return (
+        W_ABANDON * (1.0 - _unit(abandon_rate))
+        + W_PERSISTENCE * _unit(persistence_score)
+        + W_TIME * _unit(time_on_task)
+        + W_QUALITY * _unit(interaction_quality)
+    )
+
+
 def compute_mindset_score(
     abandon_rate: float,
     persistence_score: float,
@@ -61,14 +89,109 @@ def compute_mindset_score(
     interaction_quality: float,
 ) -> float:
     """Blend behavioural signals into a mindset score in [0.05, 0.95]."""
-    linear = (
-        W_ABANDON * (1.0 - _unit(abandon_rate))
-        + W_PERSISTENCE * _unit(persistence_score)
-        + W_TIME * _unit(time_on_task)
-        + W_QUALITY * _unit(interaction_quality)
-    )
-    m_score = 1.0 / (1.0 + math.exp(-GAIN * (linear - NEUTRAL_M)))
-    return max(M_FLOOR, min(M_CEIL, m_score))
+    return _squash(conversation_linear(abandon_rate, persistence_score, time_on_task, interaction_quality))
+
+
+# --------------------------------------------------------------------------- #
+# Measured M: the Kernel's own traces
+# --------------------------------------------------------------------------- #
+# The conversation signals above are an LLM's reading of prose. These are
+# measured on what the student actually did, and they are about DYNAMICS —
+# how the student reacts to difficulty and whether they improve — never about
+# LEVEL. K (what the student knows) and forgetting (what their memory keeps)
+# are deliberately left out: feeding them into M would label a weak or
+# forgetful student "fixed mindset" for their level, the stereotype-threat
+# mechanism the corpus warns about (§2.7). Dweck's mindset is a belief about
+# ability, not ability.
+#
+# [design] Weights of the measured signals (renormalised over the ones
+# available for this student).
+W_MEASURED = {
+    "learning_speed": 0.30,   # V: share of the mastery gap closed per attempt
+    "progression": 0.30,      # does K rise across sessions?
+    "recovery": 0.20,         # after a failure, does the next try succeed?
+    "stability": 0.20,        # P without M: 1 - personal slip
+}
+# [design] How much measured evidence it takes to weigh as much as half its
+# maximum share, and that maximum: the conversation always counts at least
+# half, because the measured signals are indirect proxies of a belief.
+MEASURED_HALF_WEIGHT_AT = 5
+MAX_MEASURED_SHARE = 0.5
+
+
+def session_behaviour(attempts: list[tuple[str, float]]) -> dict:
+    """Abandon-after-error and recovery, measured on one conversation.
+
+    Args:
+        attempts: (kc_label, credit) in conversation order.
+
+    A failure is ABANDONED when the student makes no further attempt on that KC
+    in the conversation — the corpus' "abandon post-erreur", measured instead
+    of guessed. RECOVERY is the share of those retries that succeed.
+    """
+    failures = retried = recovered = 0
+    for i, (kc, credit) in enumerate(attempts):
+        if credit >= 0.5:
+            continue
+        failures += 1
+        nxt = next((c for k, c in attempts[i + 1:] if k == kc), None)
+        if nxt is not None:
+            retried += 1
+            recovered += nxt >= 0.5
+    return {
+        "abandon_after_error": 1 - retried / failures if failures else None,
+        "recovery": recovered / retried if retried else None,
+        "failures": failures,
+    }
+
+
+def measured_linear(states: list[dict], trajectories: dict[str, list[float]], recovery: float | None):
+    """The measured signals as (linear score in [0, 1], evidence count), or (None, 0).
+
+    Args:
+        states: the student's KC states BEFORE this session.
+        trajectories: concept_id -> K series, oldest first.
+        recovery: this session's recovery rate (session_behaviour), if any.
+    """
+    signals: dict[str, float] = {}
+    n = 0
+    practised = [s for s in states if (s.get("interactions_on_kc") or 0) >= 2]
+    speeds = [float(s["v_score"]) for s in practised if s.get("v_score") is not None]
+    if speeds:
+        signals["learning_speed"] = sum(speeds) / len(speeds)
+        n += len(speeds)
+    slips = [float(s["p_slip_personal"]) for s in practised if s.get("p_slip_personal") is not None]
+    if slips:
+        signals["stability"] = 1.0 - sum(slips) / len(slips)
+    rises = [series[-1] - series[0] for series in trajectories.values() if len(series) >= 2]
+    if rises:
+        # A rise of +0.5 across the window reads as fully progressing, a fall
+        # of 0.5 as not at all.
+        signals["progression"] = _unit(0.5 + sum(rises) / len(rises))
+        n += len(rises)
+    if recovery is not None:
+        signals["recovery"] = recovery
+        n += 1
+    if not signals:
+        return None, 0
+    total = sum(W_MEASURED[k] for k in signals)
+    return sum(W_MEASURED[k] * v for k, v in signals.items()) / total, n
+
+
+def combine(conversation: float | None, measured: float | None, evidence: int) -> float | None:
+    """M from the conversation reading and the measured signals (linear -> M).
+
+    The measured share grows with the evidence behind it, up to
+    MAX_MEASURED_SHARE. With only one of the two, that one stands alone.
+    """
+    if conversation is None and measured is None:
+        return None
+    if measured is None:
+        return _squash(conversation)
+    if conversation is None:
+        return _squash(measured)
+    share = MAX_MEASURED_SHARE * evidence / (evidence + MEASURED_HALF_WEIGHT_AT)
+    return _squash((1 - share) * conversation + share * measured)
 
 
 def blend_mindset(previous: float | None, observed: float) -> float:

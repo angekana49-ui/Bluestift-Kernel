@@ -2523,3 +2523,56 @@ async def test_a_retrieval_after_a_gap_counts_as_review_or_lapse(fake_supabase, 
     assert (rows["lap"]["review_count"], rows["lap"]["lapse_count"]) == (0, 1)
     assert (rows["help"]["review_count"], rows["help"]["lapse_count"]) == (0, 0)       # help masks retention
     assert (rows["same_day"]["review_count"], rows["same_day"]["lapse_count"]) == (0, 0)  # no gap, no test
+
+
+# --------------------------------------------------------------------------- #
+# Measured mindset
+# --------------------------------------------------------------------------- #
+def test_abandon_after_error_is_measured_in_the_conversation():
+    gives_up = mindset.session_behaviour([("a", 0.0), ("b", 1.0)])
+    assert gives_up["abandon_after_error"] == 1.0 and gives_up["recovery"] is None
+    retries = mindset.session_behaviour([("a", 0.0), ("b", 1.0), ("a", 0.0), ("a", 1.0)])
+    # Both failures on "a" were followed by another try; one of the two worked.
+    assert retries["abandon_after_error"] == 0.0 and retries["recovery"] == 0.5
+    assert mindset.session_behaviour([("a", 1.0)])["abandon_after_error"] is None
+
+
+def test_measured_m_reads_dynamics_not_level():
+    # Same learning dynamics, very different LEVEL: the measured score must not
+    # tell them apart — mindset is not ability.
+    dynamics = {"interactions_on_kc": 4, "v_score": 0.6, "p_slip_personal": 0.1}
+    weak = [{**dynamics, "mastery_score_raw": 0.1, "lambda_personal": 0.2}]
+    strong = [{**dynamics, "mastery_score_raw": 0.95, "lambda_personal": 0.001}]
+    assert mindset.measured_linear(weak, {}, None) == mindset.measured_linear(strong, {}, None)
+    # Progress, fast learning and recovering from errors all raise it.
+    flat, n = mindset.measured_linear([], {"c": [0.4, 0.4]}, None)
+    rising, _ = mindset.measured_linear([], {"c": [0.2, 0.7]}, None)
+    assert rising > flat == pytest.approx(0.5) and n == 1
+    assert mindset.measured_linear([], {}, None) == (None, 0)
+
+
+def test_measured_share_grows_with_evidence_but_never_passes_half():
+    conversation, measured = 0.2, 0.9
+    little = mindset.combine(conversation, measured, 1)
+    lots = mindset.combine(conversation, measured, 1000)
+    assert mindset.combine(conversation, None, 0) < little < lots
+    # Capped: the conversation always keeps at least half the weight.
+    assert lots <= mindset._squash(0.5 * conversation + 0.5 * measured) + 1e-9
+    assert mindset.combine(None, measured, 3) == pytest.approx(mindset._squash(measured))
+    assert mindset.combine(None, None, 0) is None
+
+
+async def test_analyze_measures_abandon_instead_of_trusting_the_llm(fake_supabase, monkeypatch):
+    # The LLM reads the student as never giving up; the conversation shows a
+    # failure that was never retried. The measured reading wins on that signal.
+    fake_supabase.seed("kernel.concept_nodes", [{"id": "f", "label": "fractions", "subject": "MATH"}])
+    signals = {"abandon_rate": 0.0, "persistence_score": 0.5, "time_on_task": 0.5, "interaction_quality": 0.5}
+    await _analyze(fake_supabase, monkeypatch, {
+        "kcs_mentioned": [{"label": "fractions", "subject": "MATH"}],
+        "attempts": [{"kc_label": "fractions", "outcome": "failure", "partial_credit": 0.0}],
+        "mindset_signals": signals,
+    })
+    stored = fake_supabase.tables["kernel.student_mindset_state"][0]["m_score"]
+    as_the_llm_said = mindset.compute_mindset_score(0.0, 0.5, 0.5, 0.5)
+    assert stored < as_the_llm_said
+    assert stored == pytest.approx(mindset.compute_mindset_score(1.0, 0.5, 0.5, 0.5), abs=1e-4)
