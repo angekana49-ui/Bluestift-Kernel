@@ -8,8 +8,23 @@ from __future__ import annotations
 
 import networkx as nx
 
-# A concept is considered "failing" when its effective mastery is below this.
+# [design] The most a concept's mastery may be and still count as failing.
 FAILING_THRESHOLD = 0.5
+
+
+def failing_threshold(p_init: float) -> float:
+    """Below what mastery a KC counts as FAILING: under its own prior, capped at 0.5.
+
+    "Failing" has to mean the evidence points towards not knowing — a posterior
+    below the prior — not merely "not yet shown to be known". With the
+    literature p_init of 0.3, a flat 0.5 threshold made any weak positive
+    evidence a failure: one assisted success on a mastered concept leaves K
+    near 0.45, and that concept then became a root gap. It also keeps a
+    concept that has only decayed (towards p_init) from ever reading as failed
+    without fresh evidence. Once calibration raises p_init above 0.5, the cap
+    applies: more likely unknown than known.
+    """
+    return min(FAILING_THRESHOLD, p_init)
 
 
 # How many consecutive *unknown* (never-practised) prerequisites the search may
@@ -23,6 +38,7 @@ def detect_root_cause(
     failing_kcs: list[str],
     concept_states: dict[str, float],
     known: set[str] | None = None,
+    weak_below: dict[str, float] | None = None,
 ) -> dict:
     """Find the root gap among failing KCs.
 
@@ -41,12 +57,18 @@ def detect_root_cause(
             are treated as *unknown* (never practised), so the search descends
             into them as suspects. When None, every label in concept_states is
             considered known.
+        weak_below: per-label failing threshold (see `failing_threshold`);
+            FAILING_THRESHOLD for labels absent from it.
 
     Returns:
         dict with root_gap, detection_path (surface -> root), and confidence.
     """
     if known is None:
         known = set(concept_states.keys())
+    limits = weak_below or {}
+
+    def is_weak(label: str) -> bool:
+        return concept_states.get(label, 0.5) < limits.get(label, FAILING_THRESHOLD)
 
     failing_in_graph = [kc for kc in failing_kcs if kc in graph]
     if not failing_in_graph:
@@ -54,7 +76,7 @@ def detect_root_cause(
 
     # Each failing KC -> its chain down to a deepest weak/unknown concept.
     chains: dict[str, list[str]] = {
-        kc: _dfs_find_root(graph, kc, concept_states, known, set(), UNKNOWN_BUDGET)
+        kc: _dfs_find_root(graph, kc, is_weak, known, set(), UNKNOWN_BUDGET)
         for kc in failing_in_graph
     }
 
@@ -72,7 +94,7 @@ def detect_root_cause(
         )
 
     def has_evidence(r: str) -> int:
-        return 1 if (r in known and concept_states.get(r, 0.5) < FAILING_THRESHOLD) else 0
+        return 1 if (r in known and is_weak(r)) else 0
 
     def depth(r: str) -> int:
         return max((len(ch) for ch in chains.values() if ch and ch[-1] == r), default=1)
@@ -126,7 +148,7 @@ def _path_to_root(
 def _dfs_find_root(
     graph: nx.DiGraph,
     node: str,
-    states: dict[str, float],
+    is_weak,
     known: set[str],
     visited: set,
     budget: int,
@@ -152,18 +174,17 @@ def _dfs_find_root(
     best_chain: list[str] = []
     for prereq in prerequisites:
         is_known = prereq in known
-        mastery = states.get(prereq, 0.5)
 
-        if is_known and mastery >= FAILING_THRESHOLD:
+        if is_known and not is_weak(prereq):
             continue  # mastered prerequisite -> barrier, don't descend
         if is_known:
             # Known-weak: strong evidence, descend and refill the unknown budget.
-            deeper = _dfs_find_root(graph, prereq, states, known, visited, UNKNOWN_BUDGET)
+            deeper = _dfs_find_root(graph, prereq, is_weak, known, visited, UNKNOWN_BUDGET)
         else:
             # Unknown: a suspected gap, descend only while budget remains.
             if budget <= 0:
                 continue
-            deeper = _dfs_find_root(graph, prereq, states, known, visited, budget - 1)
+            deeper = _dfs_find_root(graph, prereq, is_weak, known, visited, budget - 1)
 
         if len(deeper) > len(best_chain):
             best_chain = deeper

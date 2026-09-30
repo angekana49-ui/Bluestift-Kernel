@@ -400,8 +400,15 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
 
     # 7. DFS root-cause from failing KCs. `known` = labels with real evidence, so
     #    the DFS can descend into untouched (suspected) prerequisites.
-    failing = [lbl for lbl, eff in effective_states.items() if eff < detector.FAILING_THRESHOLD]
-    detection = detector.detect_root_cause(graph, failing, all_states, known=set(effective_states))
+    #    "Failing" is relative to each KC's own prior (detector.failing_threshold).
+    weak_below = {
+        lbl: detector.failing_threshold(bkt.get_bkt_params(resolved[lbl])["p_init"])
+        for lbl in effective_states
+    }
+    failing = [lbl for lbl, eff in effective_states.items() if eff < weak_below[lbl]]
+    detection = detector.detect_root_cause(
+        graph, failing, all_states, known=set(effective_states), weak_below=weak_below
+    )
     root_gap = detection["root_gap"]
     detection_path = detection["detection_path"]
     confidence = detection["confidence"]

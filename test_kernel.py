@@ -2373,3 +2373,22 @@ async def test_kc_creation_cascade_is_bounded(fake_supabase, monkeypatch):
     assert calls["n"] == kc_registry.MAX_LLM_CALLS_PER_REQUEST
     # The KCs past the budget still exist, with neutral metadata.
     assert len(fake_supabase.tables["kernel.concept_nodes"]) > calls["n"]
+
+
+async def test_weak_positive_evidence_is_not_a_failure(fake_supabase, monkeypatch):
+    # One assisted success on a new KC leaves K under 0.5 but ABOVE the prior:
+    # the evidence points towards knowing. It used to make the KC "failing",
+    # and so a root gap.
+    fake_supabase.seed("kernel.concept_nodes", [{"id": "f", "label": "fractions", "subject": "MATH"}])
+    out = await _analyze(fake_supabase, monkeypatch, {
+        "kcs_mentioned": [{"label": "fractions", "subject": "MATH"}],
+        "attempts": [{"kc_label": "fractions", "outcome": "success", "partial_credit": 1.0,
+                      "is_assisted": True}],
+    })
+    assert bkt.BKT_PRIORS["p_init"] < out["mastery_map"]["fractions"]["k_raw"] < 0.5
+    assert out["root_gap"] is None
+
+
+def test_failing_threshold_is_the_prior_capped_at_one_half():
+    assert detector.failing_threshold(0.3) == 0.3
+    assert detector.failing_threshold(0.8) == detector.FAILING_THRESHOLD
