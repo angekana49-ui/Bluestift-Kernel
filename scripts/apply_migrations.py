@@ -7,7 +7,11 @@ Requires SUPABASE_ACCESS_TOKEN (a personal access token, sbp_...) and
 SUPABASE_URL in the environment (.env). The project ref is derived from the URL.
 
 Usage:
-    python scripts/apply_migrations.py
+    python scripts/apply_migrations.py                      # every migration, in order
+    python scripts/apply_migrations.py 011 012              # only these (prefix match)
+
+Apply only what is new on an existing database: the early migrations create RLS
+policies that are not all safe to replay.
 """
 from __future__ import annotations
 
@@ -24,8 +28,11 @@ load_dotenv()
 API = "https://api.supabase.com"
 MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations"
 
-# Schemas the Kernel needs PostgREST to expose (in addition to the defaults).
-EXPOSED_SCHEMAS = "public, graphql_public, kernel, schools, rag"
+# Schemas PostgREST must expose. The database is SHARED with the RAYA app, so
+# this is the UNION both sides need (the same list as migration 009): setting
+# only the Kernel's schemas would drop `learning` and `content` and break the
+# app — the recurring shared-DB regression KERNEL_HANDOFF.md §6 warns about.
+EXPOSED_SCHEMAS = "public, graphql_public, kernel, learning, schools, rag, content"
 
 
 def _project_ref() -> str:
@@ -69,6 +76,12 @@ def main() -> None:
     ref = _project_ref()
 
     files = sorted(MIGRATIONS_DIR.glob("*.sql"))
+    wanted = sys.argv[1:]
+    if wanted:
+        files = [f for f in files if any(f.name.startswith(w) for w in wanted)]
+        missing = [w for w in wanted if not any(f.name.startswith(w) for f in files)]
+        if missing:
+            sys.exit(f"No migration matches: {', '.join(missing)}")
     if not files:
         sys.exit(f"No .sql files found in {MIGRATIONS_DIR}")
 
