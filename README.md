@@ -22,8 +22,10 @@ Given a student↔RAYA conversation, the Kernel:
 1. **Extracts** the knowledge components (KCs) mentioned, the attempts, and
    behavioural signals (LLM).
 2. **Creates KCs on the fly** for any subject — the graph is open, not a fixed list.
-3. **Decays** stored mastery over time (exponential forgetting).
-4. **Updates** the cognitive vector with Bayesian Knowledge Tracing on strong signals.
+3. **Decays** stored mastery over time (exponential forgetting towards the KC's prior).
+4. **Updates** the cognitive vector with Bayesian Knowledge Tracing on every
+   attempt, in order: partial credit as soft evidence, assisted attempts as a
+   weaker observation, failures caused by a linguistic block not counted.
 5. **Walks** the prerequisite graph (DFS) to find the *deepest* underlying gap,
    chosen by **convergence** (the concept many failing KCs trace back to) —
    **across subjects**: a physics struggle can trace to a maths root.
@@ -33,7 +35,14 @@ Given a student↔RAYA conversation, the Kernel:
 8. **Logs** everything to Supabase and returns a structured analysis.
 
 Its parameters are **living**: BKT and decay values start from literature priors,
-then self-calibrate from real data (per student, per KC).
+then self-calibrate from real data. Every attempt is logged in
+`kernel.learning_events`, and the BKT parameters of each KC are refitted on it
+by EM. Where every constant comes from, and what replaces it:
+[PARAMETERS.md](PARAMETERS.md).
+
+How well it finds a gap is measured, not asserted: `scripts/eval_kernel.py`
+plants known gaps in simulated students and scores the diagnosis (see
+[Evaluation](#evaluation)).
 
 ---
 
@@ -43,9 +52,9 @@ Each KC, per student, carries a four-dimensional state (Luckin / corpus §1.2):
 
 | Dim | Meaning | Operationalisation |
 |-----|---------|--------------------|
-| **K** | Mastery probability | BKT p(L); dual mastery criterion (K ≥ 0.95 AND low slip AND partial-credit ≥ 0.7) |
-| **V** | Learning rate (individualised p(T), Yudelson) | smoothed fraction of the remaining mastery gap closed per trial |
-| **P** | Persistence / resistance to slip (Corbett) | (1 − personal p(S)), modulated by mindset M |
+| **K** | Mastery probability | BKT p(L); dual mastery criterion (K ≥ 0.95 AND low slip AND mean credit ≥ 0.7 on the last 3 **autonomous** attempts) |
+| **V** | Learning rate (individualised p(T), Yudelson) | smoothed fraction of the remaining mastery gap closed per trial — stored, not yet used in inference |
+| **P** | Persistence / resistance to slip | (1 − personal p(S)), modulated by mindset M — our construction; stored, not yet used in inference |
 | **M** | Mindset (Dweck) | sigmoid of behavioural signals, bounded to [0.05, 0.95]; global per student |
 
 ---
@@ -76,10 +85,12 @@ Each KC, per student, carries a four-dimensional state (Luckin / corpus §1.2):
 ├── scripts/
 │   ├── build_graph.py       # CLI: distill a KC graph from the LLMs
 │   ├── build_bridges.py     # CLI: generate cross-subject prerequisite bridges
-│   └── apply_migrations.py  # CLI: apply migrations via the Management API
-├── migrations/              # 10 numbered Supabase SQL migrations
+│   ├── apply_migrations.py  # CLI: apply migrations via the Management API
+│   └── eval_kernel.py       # Synthetic-student benchmark (root-gap recall/precision)
+├── migrations/              # 11 numbered Supabase SQL migrations
 ├── conftest.py              # In-memory fake Supabase for tests
-├── test_kernel.py           # 101 tests
+├── test_kernel.py           # 132 tests
+├── PARAMETERS.md            # Provenance of every constant
 ├── requirements.txt / requirements-dev.txt
 └── railway.toml            # Deploy config + the cost rules that keep it cheap
 ```
@@ -94,7 +105,7 @@ Each KC, per student, carries a four-dimensional state (Luckin / corpus §1.2):
 | GET    | `/ready`                 | open | Deep health — kernel-schema read+write (503 if degraded). |
 | POST   | `/analyze`               | 🔒   | **Main route.** Conversation → root-gap + alerts.  |
 | POST   | `/load_profile`          | 🔒   | Full cognitive profile with K_effective recomputed. |
-| POST   | `/update_concept_state`  | 🔒   | Manual KC update on a strong signal (called by RAYA). |
+| POST   | `/update_concept_state`  | 🔒   | One graded attempt on a KC (called by RAYA). `updated: false` when it was not counted (linguistic block). |
 | POST   | `/prerequisite_gaps`     | 🔒   | **GraphRAG.** What this student still needs before a concept, multi-hop. |
 | POST   | `/load_alerts`           | 🔒   | Read pedagogical-safety alerts — one student, or a whole school. |
 | POST   | `/resolve_alert`         | 🔒   | Acknowledge an alert (or reopen it).               |
@@ -226,7 +237,7 @@ The chain never crashes `/analyze`: Groq → Gemini, and only raises if both fai
 
 ### Database migrations
 
-Apply the ten SQL files **in order** in the Supabase SQL editor (or via the
+Apply the eleven SQL files **in order** in the Supabase SQL editor (or via the
 Management API with `scripts/apply_migrations.py`):
 
 ```
@@ -240,7 +251,13 @@ Management API with `scripts/apply_migrations.py`):
 008_kernel_monitoring_alerts.sql  # pedagogical-safety alert schema
 009_shared_db_hardening.sql       # re-assert exposed schemas + grants (shared DB)
 010_school_curriculum_layers.sql  # school layer types + payloads (School -> AI -> Student)
+011_learning_events.sql           # one row per graded attempt (BKT fitting) + recent autonomous credits
 ```
+
+> **Deploy 011 before the code that uses it.** Without it, state writes still
+> land (the new column is dropped and a `state_write_without_011_columns`
+> warning is logged), but no learning events are recorded, so nothing can be
+> calibrated.
 
 > **Shared DB:** the Kernel shares its Supabase project with the RAYA app. If the
 > app's setup ever drops `kernel` from the exposed schemas or resets grants,
@@ -365,13 +382,50 @@ detector change needed; the convergence search crosses the bridge automatically.
 pytest -q
 ```
 
-60 tests. The suite mocks the LLM and uses an in-memory fake Supabase
-(`conftest.py`), so **no network or real keys are required**. Coverage: BKT,
-forgetting, mindset, detector (convergence), calibration, the cognitive vector
+132 tests. The suite mocks the LLM and uses an in-memory fake Supabase
+(`conftest.py`, with real ILIKE semantics), so **no network or real keys are
+required**. Coverage: BKT (soft evidence, bounds, assisted attempts, blocage
+rules), forgetting, mindset, detector (convergence, determinism, cycles),
+calibration (personal λ, EM parameter recovery), the cognitive vector
 (V/P/slip), anomaly detectors (including temporal inconsistency and OOD),
 school curriculum layers, graph-builder validation, `get_or_create_kc`, and the
 `/health`, `/ready`, `/analyze`, `/load_profile`, `/update_concept_state`,
 `/load_alerts`, `/resolve_alert`, `/seed_kcs` routes.
+
+---
+
+## Evaluation
+
+```bash
+python scripts/eval_kernel.py --sessions 3                # priors only
+python scripts/eval_kernel.py --sessions 3 --warmup 1000  # after calibration
+```
+
+Simulated students with a **planted** root gap (one unlearned concept and
+everything built on it) hold conversations that go through the real `/analyze`
+pipeline. Their answers carry realistic noise: slips, guesses, help that makes
+an unlearned student look competent, and failures caused by the wording. The
+benchmark scores the diagnosis after the last session. Extraction is assumed
+perfect, so these numbers are the **ceiling** of the Kernel's reasoning, not
+of the whole stack.
+
+400 students × 3 sessions, seeds 0-2, compared with the code before the
+2026-09-30 audit (`160c6a6`):
+
+| | Before | Now, priors | Now, calibrated |
+|---|---|---|---|
+| Named roots that are right (precision) | 15–22% | 38–40% | 36–41% |
+| Planted gap named exactly (recall) | 20–29% | 27–31% | 35–40% |
+| False root on gap-free students | 99–100% | 8–12% | 11–17% |
+| Learned KCs labelled "gap", per student | 1.8–2.0 | 0.10–0.14 | 0.07–0.11 |
+
+What the numbers say:
+
+- **When the gap itself was practised**, it is found 30–44% of the time. When it
+  never was, only 0–11% of the time: the graph alone rarely singles it out.
+  Letting RAYA probe the unverified prerequisite is the biggest lever left.
+- The earlier code's recall came from naming a root for every student, including
+  the ones with no gap.
 
 ---
 

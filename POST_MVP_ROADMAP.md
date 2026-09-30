@@ -13,10 +13,13 @@ Shipped and verified live:
 - 5 API routes; LLM chain (Groq `openai/gpt-oss-120b` → Gemini `gemini-3.1-flash-lite`).
 - Cognitive vector **K, V, P, M** with canonical semantics (V = individualised
   p(T); P = 1 − p(S) modulated by M).
-- BKT (asymmetric, partial-credit, dual mastery criterion), exponential
-  forgetting with 3-level lambda, personal-lambda calibration, empirical KC
-  recalibration.
-- Selective-update gate, learning-trajectory snapshots.
+- BKT (partial credit as soft evidence, assisted attempts as a weaker
+  observation, dual mastery criterion on autonomous attempts), exponential
+  forgetting towards the prior with 3-level lambda, personal-lambda calibration
+  (online maximum likelihood), empirical KC recalibration, and EM fitting of
+  the BKT parameters on the logged evidence (`kernel.learning_events`).
+- Every attempt updates K (the earlier "strong signal" gate was removed in the
+  2026-09-30 audit, see below); learning-trajectory snapshots.
 - Root-cause detection by **convergence** over a dense, canonical, auto-generated
   prerequisite graph (LLM graph builder with cross-model corroboration + DAG
   validation).
@@ -120,10 +123,12 @@ The two deferred detectors are in, both reading beyond a single conversation:
   at high severity. KCs that haven't been calibrated carry no baseline and are
   skipped — the neutral 0.5 placeholder a new KC is created with would otherwise
   manufacture divergence out of nothing.
-- The selective-update gate's `anomalous` flag now also fires on an unstable
-  history, not only on failing a KC that looked mastered: when the estimate is
-  already oscillating, holding an update back keeps an unreliable value on the
-  books, so that is precisely where fresh evidence should count.
+- ~~The selective-update gate's `anomalous` flag also fires on an unstable
+  history~~ — superseded: the gate itself was removed (2026-09-30). Drift comes
+  from re-estimating *parameters* on thin data, which the calibration gates
+  guard, not from updating the *state*. In practice the gate froze a student who
+  succeeded once per session, and their mastery then decayed while they kept
+  succeeding.
 - Alerts write `inconsistency_rate`, `volatility_score` and `interactions_count`
   into their own `kernel_monitoring` columns (migration 008 already defined them),
   so the dashboard can filter and chart without parsing the details JSON.
@@ -138,6 +143,12 @@ Still open here:
 ---
 
 ## 4. Detection-quality tuning (needs real data)
+
+- **Active probing (biggest lever, measured).** In the synthetic benchmark the
+  planted gap is found 30–44% of the time when it was practised, and 0–11% when
+  it never was: the graph alone rarely singles out an unverified prerequisite.
+  Return the most informative unverified prerequisite on the detection path as
+  a `probe` and let RAYA ask one question on it.
 
 - **Confidence calibration** — the current confidence blend (convergence + depth
   + severity) is heuristic; calibrate against observed remediation outcomes.
@@ -161,8 +172,15 @@ Still open here:
 
 v1 is Bayesian BKT + LLM heuristics. The corpus targets a **hybrid
 neural-symbolic** model (Hooshyar 2026, Responsible-DKT): DKT backbone +
-injected symbolic rules (`mastered` / `not_mastered` / `avg_embed`), AUC ~0.90,
-temporally stable, interpretable, works with ~10% of the training data.
+injected symbolic rules (`mastered` / `not_mastered` / `avg_embed`). The corpus
+reports AUC ~0.90 and ~10% of the training data; **both figures are to be
+verified against the paper** before they are quoted anywhere.
+
+Keep in mind that extended BKT (forgetting, individual abilities) has been shown
+to match DKT on standard benchmarks (Khajah, Lindsey & Mozer 2016), and DKT's
+original ASSISTments gain was largely due to duplicated data (Xiong et al.
+2016). The switch is worth it only if `scripts/eval_kernel.py`, and later
+held-out real data, say so.
 
 - Cold-start vs warm modes (Baker): transfer/prior for trials 1–2, individual
   tracking from trial 3+.
@@ -197,8 +215,9 @@ temporally stable, interpretable, works with ~10% of the training data.
   resolution (not addressed in the corpus; design needed).
 - **Multilingual KT** — FR/EN (and local languages); impact on cognitive
   modelling is undocumented and needs design.
-- **Learner simulator** (GenMentor-style) — synthetic bootstrap before the first
-  real cohort, if cold-start data proves too slow.
+- **Learner simulator** — a first version ships as `scripts/eval_kernel.py`
+  (planted gaps, recall/precision of the diagnosis). Next: use it to test
+  threshold changes before they ship.
 
 ---
 
@@ -221,6 +240,7 @@ temporally stable, interpretable, works with ~10% of the training data.
 
 - Interpretability vs raw performance (Responsible-DKT vs SAKT/AKT/SAINT+).
 - Algorithmic guardrail generation at scale (no two half-time teachers per class).
-- Selective-update threshold not empirically set for K-12.
+- ~~Selective-update threshold not empirically set for K-12~~ — the gate was
+  removed; every attempt updates the state.
 - M as a quantifiable vector — a design decision, not a literature result.
 - MDP sequencing vs a hard national-curriculum constraint.

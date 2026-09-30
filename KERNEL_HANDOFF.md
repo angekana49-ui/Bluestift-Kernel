@@ -116,8 +116,8 @@ detected_mindset }`. Use for the dynamic prompt layer.
 
 ### `POST /update_concept_state`
 `{ user_id, concept_id | concept_label, subject, level, partial_credit_score,
-is_assisted, response_time_ms, blocage_type }` → updates one KC on a strong
-signal. **Use this for every graded attempt** — it carries the real score, where
+is_assisted, response_time_ms, blocage_type }` → updates one KC with one graded
+attempt. **Use this for every graded attempt** — it carries the real score, where
 `/analyze` can only re-infer one from prose.
 
 Identify the KC either way:
@@ -276,6 +276,49 @@ as staff work through it. A list that never shrinks is a list people stop readin
    conversation can trace its root gap into maths. Just send the real `subject`.
 7. **Graceful degradation** — if the shared DB regresses, `/analyze` still returns
    the diagnosis (state writes are best-effort). Watch `/ready` for `degraded`.
+
+### 3b. Changes from the 2026-09-30 core audit
+
+These change what the app sees. The contract shapes are the same, but the values
+behave differently.
+
+1. **"mastered" is stricter.** It now needs K ≥ 0.95 **and** a low personal slip
+   **and** a mean credit ≥ 0.7 on the **last 3 unassisted attempts**. K ≥ 0.7
+   alone used to be enough. Expect far fewer `mastered` statuses, and none until
+   a student has shown the concept three times without help. Students whose
+   state predates migration 011 keep the old all-time average until new attempts
+   arrive.
+2. **`unknown` now appears in `mastery_map`.** A concept only *mentioned* in the
+   conversation, with no attempt and no history, is `unknown`, and its
+   `k_raw`/`k_effective` are just the prior. It used to show as `gap` and could
+   become the root gap. Render `unknown` as "not assessed yet", never as a
+   failure.
+3. **`root_gap` is `null` more often.** On students with no gap, the Kernel used to
+   name a root gap for virtually everyone; it now does so for roughly 1 in 10
+   (synthetic benchmark, see the Kernel README). The "pas encore assez de signal"
+   summary is the honest answer, not an outage.
+4. **Send the real `blocage_type` and `is_assisted`.**
+   - On `/update_concept_state`, a failure with `blocage_type: "linguistic"` is
+     logged but **not counted**: the response has `updated: false` and nothing is
+     written.
+   - An `ambiguous` failure counts half.
+   - `is_assisted: true` is now a much weaker observation. It used to be a 0.9
+     credit, nearly full weight.
+5. **`commit_state: false` still uses the conversation.** The attempts the
+   conversation shows inform *this* diagnosis in memory; they are just not
+   written. If the same attempts already went through `/update_concept_state`,
+   they weigh twice in that one diagnosis, but they are never stored twice.
+6. **`recommended_path` climbs the detection path back** (root → … → the concept
+   the student is stuck on) before walking further. It used to follow the
+   alphabetically first dependent of the root, which could lead away from the
+   problem.
+7. **One label is one KC across subjects.** A PHYSICS request for `vecteurs`
+   resolves to the existing MATH `vecteurs` instead of creating a duplicate.
+8. **New table `kernel.learning_events`** (migration 011): one row per graded
+   attempt, per student. **Add it to the GDPR erasure and export lists**
+   (`lib/compliance/erasure.ts`, `lib/compliance/export.ts`, next to
+   `student_concept_state` and `learning_trajectories`).
+9. **Apply migration 011 before deploying** this Kernel version.
 
 ---
 

@@ -47,7 +47,7 @@ flowchart TD
     S1["1 · Extraction LLM<br/>concepts + tentatives + signaux affectifs"] --> S2
     S2["2 · KCs dynamiques<br/>get_or_create_kc (toute matière)"] --> S3
     S3["3 · Oubli<br/>K_effectif = K · e^(−λ·jours)"] --> S4
-    S4["4 · Vecteur cognitif K,V,P,M<br/>BKT + gate signal fort"] --> S5
+    S4["4 · Vecteur cognitif K,V,P,M<br/>BKT sur chaque tentative"] --> S5
     S5["5 · Détection anomalies<br/>faux mastery, dépendance passive…"] --> S6
     S6["6 · Root-cause DFS<br/>par convergence"] --> S7
     S7["7 · Explication LLM"] --> OUT

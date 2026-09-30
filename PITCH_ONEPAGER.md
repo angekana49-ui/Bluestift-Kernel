@@ -7,7 +7,9 @@
 ## Le problème
 Les outils d'IA éducative disent à l'élève ce qu'il rate (*« tu échoues aux dérivées »*) —
 ce qu'il sait déjà. Ils ne disent pas **pourquoi**. Et sans garde-fous, un tuteur IA
-**détruit l'apprentissage** : −17 % à l'examen (Bastani, RCT ~1000 élèves).
+**nuit à l'apprentissage** : −17 % à l'examen (Bastani et al. 2024, RCT ~1000 élèves).
+Avec des garde-fous, la perte disparaît — mais sans gain : éviter le mal ne suffit
+pas, il faut savoir *quoi* enseigner à *cet* élève.
 
 ## La solution
 Un service autonome (le **Kernel**) qui, à partir d'une conversation élève↔tuteur,
@@ -55,25 +57,39 @@ flowchart LR
     P --> R
 ```
 
-**Aujourd'hui** : BKT bayésien interprétable, marche dès le jour 1, auditable.
-**Demain** (data-gated) : Responsible-DKT neural-symbolique (AUC ~0.90).
+**Aujourd'hui** : BKT bayésien étendu (oubli, crédit partiel, aide, paramètres
+recalibrés par EM sur nos élèves), interprétable, auditable, fonctionnel dès le jour 1.
+Un BKT étendu rivalise avec le deep knowledge tracing sur les benchmarks publics
+(Khajah et al. 2016).
+**Demain** (data-gated) : un modèle hybride neuro-symbolique — seulement s'il bat
+le BKT étendu sur nos propres données.
 
 ## Le moat
 1. **Cause racine**, pas symptôme (détection par convergence).
 2. **Cognitif × affectif** (K, V, P, M).
 3. **Sécurité pédagogique** auditable (faux mastery, dépendance passive, surcharge, mindset).
-4. **Flywheel de données** : calibré sur le contexte **subsaharien** — là où tous les
-   modèles existants sont nord-américains. **Incopiable sans nos données.**
+4. **Flywheel de données** : calibré sur le contexte **subsaharien** — là où les
+   modèles existants sont calibrés sur des données nord-américaines, européennes
+   ou asiatiques. **Incopiable sans nos données.**
 5. **Graphe ouvert**, toute matière, auto-généré + auto-étendu.
 
 ## Traction technique
-✅ **v1 complet et déployé** (Railway, HTTPS) · 30 tests · 8 migrations · détection
-profonde vérifiée de bout en bout · graphe MATH dense auto-généré.
+✅ **v1 complet et déployé** (Railway, HTTPS) · 132 tests · 11 migrations · graphe
+MATH dense auto-généré.
+
+**Mesuré, pas affirmé** — banc d'élèves synthétiques à lacune connue, passés par le
+vrai pipeline (3 sessions, extraction supposée parfaite) : après l'audit du
+2026-09-30, **précision ×2** (15–22 % → 36–41 %), **fausses alertes sur élèves sans
+lacune : ~100 % → 8–17 %**. Prochain levier mesuré : faire sonder par RAYA le
+prérequis non vérifié.
 
 ## La suite
 **Intégration RAYA** (allume le flywheel) → canal **école→IA→élève** (différenciateur
 institutionnel) → Responsible-DKT quand la donnée s'accumule. Voir `POST_MVP_ROADMAP.md`.
 
 ## La cible
-**Bloom 2-sigma** : l'élève moyen tutoré dépasse 98 % de ses pairs. Applicable à
-**200 M d'élèves subsahariens** sans accès à un tuteur individuel.
+**Bloom 2-sigma** (1984) : l'élève moyen tutoré dépasse 98 % de ses pairs. C'est une
+cible, pas une promesse : les méta-analyses récentes mesurent +0.4 à +0.8 σ pour le
+tutorat humain et les meilleurs tuteurs intelligents (VanLehn 2011 ; Nickow et al.
+2020). Applicable à **200 M d'élèves subsahariens** *(chiffre à sourcer)* sans accès
+à un tuteur individuel.
