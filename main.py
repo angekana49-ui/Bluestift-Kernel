@@ -53,7 +53,8 @@ from models.schemas import (  # noqa: E402
 )
 from services import analyze as analyze_pipeline  # noqa: E402
 from services import db  # noqa: E402
-from services.analyze import _learning_events, _next_state, _persist_state  # noqa: E402
+from services import serial  # noqa: E402
+from services.analyze import _commit_session, _learning_events  # noqa: E402
 from services.kc_registry import _normalize_label, get_or_create_kc  # noqa: E402
 
 KERNEL_VERSION = os.getenv("KERNEL_VERSION", "1.0.0")
@@ -320,6 +321,9 @@ async def load_profile(
                 "p_score": s.get("p_score") or 0.5,
                 "status": eff["status"],
                 "last_interaction_at": last_at,
+                "tau": eff["tau"],
+                "review_count": s.get("review_count") or 0,
+                "lapse_count": s.get("lapse_count") or 0,
             }
         )
 
@@ -370,69 +374,53 @@ async def update_concept_state(
         )
     concept_id = node["id"]
 
-    state = db.load_student_concept_state(client, req.user_id, concept_id)
     params = bkt.get_bkt_params(node)
-    stored = state.get("mastery_score_raw") if state else None
-    # Update the belief the Kernel holds NOW — decayed since the last signal, as
-    # /load_profile shows it — not the stale stored value. (`is None`, not `or`:
-    # a stored 0.0 is a real, very low mastery, not a missing one.)
-    k_raw_prev = params["p_init"] if stored is None else forgetting.compute_effective_mastery(
-        stored,
-        node.get("type_kc", "conceptual"),
-        state.get("last_strong_signal_at"),
-        lambda_override=forgetting.get_lambda(node, state),
-        floor=params["p_init"],
+    # The same observation rules as /analyze (bkt.observation): the KC's rigour
+    # sets what the answer is worth, help raises the guess rate instead of
+    # capping the credit, and a failure caused by a linguistic block is logged
+    # but is no evidence about the concept.
+    observation = bkt.observation(
+        req.partial_credit_score, req.is_assisted, req.blocage_type.value, bkt.kc_tau(node)
     )
 
-    # The same observation model as /analyze, through the same functions, so
-    # the two doors into a student's state cannot drift apart: help raises the
-    # guess rate instead of capping the credit, and a failure caused by a
-    # linguistic block is logged but is no evidence about the concept.
-    counted = bkt.blocage_evidence(req.partial_credit_score, req.blocage_type.value)
-    observation = {
-        "credit": counted if counted is not None else req.partial_credit_score,
-        "assisted": req.is_assisted,
-        "blocage_type": req.blocage_type.value,
-        "counted": counted is not None,
-    }
-    lam = forgetting.get_lambda(node, state)
+    # Read-modify-write of this student's state: first come, first served
+    # (services/serial.py), and written as the next block of the KC's chain.
+    async with serial.student(req.user_id):
+        state = db.load_student_concept_state(client, req.user_id, concept_id)
 
-    if not observation["counted"]:
-        db.log_learning_events(client, _learning_events(
-            req.user_id, concept_id, None, [observation], [k_raw_prev], source="update_concept_state"
-        ))
-        current = bkt.effective_state(node, state)
-        return UpdateConceptStateResponse(
-            user_id=req.user_id,
-            concept_id=concept_id,
-            label=node.get("label", ""),
-            k_raw=current["k_raw"] if current["k_raw"] is not None else round(k_raw_prev, 4),
-            k_effective=current["k_effective"] if current["k_effective"] is not None else round(k_raw_prev, 4),
-            p_score=(state.get("p_score") if state else None) or 0.5,
-            status=current["status"],
-            updated=False,
+        if not observation["counted"]:
+            current = bkt.effective_state(node, state)
+            k_now = current["k_effective"] if current["k_effective"] is not None else params["p_init"]
+            db.log_learning_events(client, _learning_events(
+                req.user_id, concept_id, None, [observation], [k_now], source="update_concept_state"
+            ))
+            return UpdateConceptStateResponse(
+                user_id=req.user_id,
+                concept_id=concept_id,
+                label=node.get("label", ""),
+                k_raw=current["k_raw"] if current["k_raw"] is not None else round(k_now, 4),
+                k_effective=round(k_now, 4),
+                p_score=(state.get("p_score") if state else None) or 0.5,
+                status=current["status"],
+                updated=False,
+            )
+
+        m_row = db.load_mindset(client, req.user_id)
+        m_score = (m_row.get("m_score") if m_row else None) or 0.5
+        state, _lam, ks, row = _commit_session(
+            client, req.user_id, concept_id, node, params, state, [observation], m_score
         )
-
-    ks = [k_raw_prev, bkt.update_bkt(
-        k_raw_prev, correct=observation["credit"] >= 0.5, partial_credit=observation["credit"],
-        params=params, assisted=observation["assisted"],
-    )]
+        db.log_learning_events(client, _learning_events(
+            req.user_id, concept_id, None, [observation], ks, source="update_concept_state"
+        ))
     k_raw = ks[-1]
-
-    m_row = db.load_mindset(client, req.user_id)
-    m_score = (m_row.get("m_score") if m_row else None) or 0.5
-    row = _next_state(req.user_id, concept_id, ks, [observation], state, lam, m_score, params)
-    _persist_state(client, row, k_raw)
-    db.log_learning_events(client, _learning_events(
-        req.user_id, concept_id, None, [observation], ks, source="update_concept_state"
-    ))
     p_score = row["p_score"]
 
     # Fresh signal: effective == raw. The student's own slip and recent
     # autonomous credits, as /load_profile reads them — otherwise this response
     # and the next profile read disagree on whether the KC is mastered.
     k_eff = k_raw
-    status = bkt.classify_status(k_eff, row["p_slip_personal"], bkt.mastery_credit(row))
+    status = bkt.classify_status(k_eff, row["p_slip_personal"], bkt.mastery_credit(row), bkt.kc_tau(node))
 
     # Fire-and-forget empirical recalibration, but only if this KC is past its
     # cooldown: recalibration reads every student's state for the KC, and a

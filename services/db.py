@@ -147,7 +147,52 @@ def load_student_concept_state(client, user_id: str, concept_id: str) -> dict | 
 # Columns added by a migration the running DB may not have yet. Code ships
 # before (or without) the migration more often than one would like on a shared
 # DB; losing one column must not lose the whole state write.
-_STATE_COLUMNS_SINCE_011 = ("recent_autonomous_credits",)
+_STATE_COLUMNS_SINCE_011 = ("recent_autonomous_credits", "version", "review_count", "lapse_count")
+
+
+class StaleState(Exception):
+    """The state row moved on since it was read: recompute on the new tip."""
+
+
+def commit_student_concept_state(client, state: dict, read_version: int | None) -> dict:
+    """Write a state row as the next block of its chain (compare-and-set).
+
+    `read_version` is the `version` of the row the new state was computed from,
+    or None if there was no row. The write lands only if the row is still at
+    that height, and sets it one higher; otherwise StaleState is raised and
+    nothing is written. Without migration 012 there is no height to compare,
+    and the write falls back to a plain upsert (the in-process queue in
+    services/serial.py still orders requests).
+    """
+    row = {**state, "version": (read_version or 0) + 1, "updated_at": _now_iso()}
+    table = lambda: _kernel(client, "student_concept_state")  # noqa: E731
+    try:
+        if read_version is None:
+            try:
+                res = table().insert(row).execute()
+            except Exception as e:  # noqa: BLE001
+                # UNIQUE(user_id, concept_id): someone else wrote the first block.
+                if "version" in str(e) or "column" in str(e):
+                    raise
+                raise StaleState() from e
+        else:
+            query = (
+                table().update(row)
+                .eq("user_id", row["user_id"])
+                .eq("concept_id", row["concept_id"])
+            )
+            # Height 0 is also a row that has never been versioned (written
+            # before 012 was applied, or by a client that doesn't know it).
+            query = query.or_("version.eq.0,version.is.null") if read_version == 0 else query.eq("version", read_version)
+            res = query.execute()
+            if not res.data:
+                raise StaleState()
+        return res.data[0] if res.data else row
+    except StaleState:
+        raise
+    except Exception as e:  # noqa: BLE001 - most likely: migration 012 not applied
+        log_monitoring(client, "warn", "state_write_without_chain", {"error": str(e)[:300]})
+        return upsert_student_concept_state(client, state)
 
 
 def upsert_student_concept_state(client, state: dict) -> dict:

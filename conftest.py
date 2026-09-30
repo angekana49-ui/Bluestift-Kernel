@@ -16,6 +16,15 @@ from dataclasses import dataclass, field
 import pytest
 
 
+# UNIQUE constraints of the real schema (migrations 002/003), enforced on insert.
+UNIQUE_KEYS = {
+    "kernel.student_concept_state": ("user_id", "concept_id"),
+    "kernel.concept_nodes": ("label", "subject"),
+    "kernel.concept_edges": ("concept_id", "prerequisite_id"),
+    "kernel.student_mindset_state": ("user_id",),
+}
+
+
 def _like_to_regex(pattern: str) -> re.Pattern:
     """Compile a Postgres ILIKE pattern: `%` any run, `_` any one char, `\\` escapes.
 
@@ -208,9 +217,14 @@ class _Query:
         if self._op == "insert":
             payloads = self._payload if isinstance(self._payload, list) else [self._payload]
             inserted = []
+            unique = UNIQUE_KEYS.get(self._key)
             for p in payloads:
                 row = dict(p)
                 row.setdefault("id", str(uuid.uuid4()))
+                # The real tables' UNIQUE constraints: without them the fake
+                # would accept the duplicate a concurrent write produces.
+                if unique and any(all(r.get(k) == row.get(k) for k in unique) for r in self._rows):
+                    raise Exception(f"duplicate key value violates unique constraint on {unique}")
                 self._rows.append(row)
                 inserted.append(dict(row))
             return _Result(data=inserted)

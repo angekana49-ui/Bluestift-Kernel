@@ -2392,3 +2392,134 @@ async def test_weak_positive_evidence_is_not_a_failure(fake_supabase, monkeypatc
 def test_failing_threshold_is_the_prior_capped_at_one_half():
     assert detector.failing_threshold(0.3) == 0.3
     assert detector.failing_threshold(0.8) == detector.FAILING_THRESHOLD
+
+
+# --------------------------------------------------------------------------- #
+# The state chain: first come, first served; no lost update
+# --------------------------------------------------------------------------- #
+async def test_concurrent_analyses_of_one_student_lose_no_evidence(fake_supabase, monkeypatch):
+    # Two conversations analysed at the same time, each with one failure on the
+    # same KC. Both read the state, both write: without the chain, the second
+    # write erased the first and the student had 1 interaction instead of 2.
+    fake_supabase.seed("kernel.concept_nodes", [{"id": "f", "label": "fractions", "subject": "MATH"}])
+    extraction = {
+        "kcs_mentioned": [{"label": "fractions", "subject": "MATH"}],
+        "attempts": [{"kc_label": "fractions", "outcome": "failure", "partial_credit": 0.0}],
+    }
+
+    async def slow_llm(prompt, max_tokens=1000):
+        await asyncio.sleep(0.01)  # lets the two requests interleave
+        if "kcs_mentioned" in prompt:
+            return json.dumps(extraction), "mock"
+        return "resume", "mock"
+
+    monkeypatch.setattr(analyze_pipeline, "llm_call", slow_llm)
+    monkeypatch.setattr(kc_registry, "llm_call", slow_llm)
+    payload = {"user_id": "u1", "conversation_history": [{"role": "user", "content": "..."}],
+               "subject": "MATH", "level": "lycee"}
+    await asyncio.gather(
+        analyze_pipeline.run_analysis(fake_supabase, "r1", payload),
+        analyze_pipeline.run_analysis(fake_supabase, "r2", payload),
+    )
+    rows = fake_supabase.tables["kernel.student_concept_state"]
+    assert len(rows) == 1
+    assert rows[0]["interactions_on_kc"] == 2
+    assert rows[0]["struggle_index"] == 2
+    assert rows[0]["version"] == 2
+    k = bkt.update_bkt(bkt.update_bkt(bkt.BKT_PRIORS["p_init"], False), False)
+    assert rows[0]["mastery_score_raw"] == pytest.approx(k, abs=1e-3)
+
+
+def test_a_write_from_a_stale_state_is_rejected(fake_supabase):
+    fake_supabase.seed("kernel.student_concept_state",
+                       [{"user_id": "u1", "concept_id": "f", "mastery_score_raw": 0.4, "version": 3}])
+    row = {"user_id": "u1", "concept_id": "f", "mastery_score_raw": 0.9}
+    with pytest.raises(db_module.StaleState):
+        db_module.commit_student_concept_state(fake_supabase, row, read_version=2)
+    assert fake_supabase.tables["kernel.student_concept_state"][0]["mastery_score_raw"] == 0.4
+    db_module.commit_student_concept_state(fake_supabase, row, read_version=3)
+    stored = fake_supabase.tables["kernel.student_concept_state"][0]
+    assert stored["mastery_score_raw"] == 0.9 and stored["version"] == 4
+    # A first block where another request already wrote one is stale too.
+    with pytest.raises(db_module.StaleState):
+        db_module.commit_student_concept_state(fake_supabase, row, read_version=None)
+
+
+async def test_student_queue_serves_in_arrival_order():
+    from services import serial
+
+    order = []
+
+    async def request(name, hold):
+        async with serial.student("u1"):
+            order.append(name)
+            await asyncio.sleep(hold)
+
+    await asyncio.gather(request("first", 0.02), request("second", 0.0), request("third", 0.0))
+    assert order == ["first", "second", "third"]
+    assert "u1" not in serial._queues  # nothing left behind once idle
+
+
+# --------------------------------------------------------------------------- #
+# tau (rigour) and the spacing effect
+# --------------------------------------------------------------------------- #
+def test_tau_is_neutral_at_one_half_and_demands_more_when_higher():
+    assert bkt.rigor_credit(0.7, 0.5) == pytest.approx(0.7)
+    assert bkt.rigor_credit(0.7, 0.8) < 0.7 < bkt.rigor_credit(0.7, 0.3)
+    for tau in (0.2, 0.5, 0.9):  # full success and full failure never move
+        assert bkt.rigor_credit(1.0, tau) == 1.0 and bkt.rigor_credit(0.0, tau) == 0.0
+    assert bkt.mastery_threshold(0.5) == pytest.approx(bkt.MASTERY_THRESHOLD)
+    assert bkt.mastery_threshold(0.8) > bkt.mastery_threshold(0.5) > bkt.mastery_threshold(0.3)
+    # K 0.96 is mastery on a neutral KC, not on a rigorous one.
+    assert bkt.classify_status(0.96, 0.05, 0.9, tau=0.5) == "mastered"
+    assert bkt.classify_status(0.96, 0.05, 0.9, tau=0.8) == "partial"
+    # A rigorous KC fades faster by default; a missing tau is neutral.
+    assert forgetting.base_lambda({"type_kc": "conceptual", "tau": 0.8}) > forgetting.base_lambda({"type_kc": "conceptual"})
+    assert bkt.kc_tau({}) == bkt.TAU_NEUTRAL and bkt.kc_tau({"tau": "junk"}) == bkt.TAU_NEUTRAL
+
+
+def test_spaced_reviews_slow_forgetting_and_lapses_undo_it():
+    node = {"type_kc": "declarative"}
+    month_ago = datetime.now(timezone.utc) - timedelta(days=30)
+
+    def k_after_a_month(state):
+        return forgetting.compute_effective_mastery(
+            0.9, "declarative", month_ago, lambda_override=forgetting.get_lambda(node, state), floor=0.3
+        )
+
+    fresh = k_after_a_month({})
+    reviewed = k_after_a_month({"review_count": 2})
+    assert reviewed > fresh
+    # Two reviews = one half-life doubling.
+    assert forgetting.get_lambda(node, {"review_count": 2}) == pytest.approx(forgetting.get_lambda(node, {}) / 2)
+    assert k_after_a_month({"review_count": 2, "lapse_count": 2}) == pytest.approx(fresh)
+    # Lapses never make a student forget faster than their base rate.
+    assert k_after_a_month({"lapse_count": 5}) == pytest.approx(fresh)
+
+
+async def test_a_retrieval_after_a_gap_counts_as_review_or_lapse(fake_supabase, monkeypatch):
+    three_days_ago = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+    now = datetime.now(timezone.utc).isoformat()
+    fake_supabase.seed("kernel.concept_nodes", [
+        {"id": x, "label": x, "subject": "MATH"} for x in ("rev", "lap", "help", "same_day")
+    ])
+    fake_supabase.seed("kernel.student_concept_state", [
+        {"user_id": "u1", "concept_id": x, "mastery_score_raw": 0.8, "interactions_on_kc": 3,
+         "last_strong_signal_at": when}
+        for x, when in (("rev", three_days_ago), ("lap", three_days_ago),
+                        ("help", three_days_ago), ("same_day", now))
+    ])
+    await _analyze(fake_supabase, monkeypatch, {
+        "kcs_mentioned": [{"label": x, "subject": "MATH"} for x in ("rev", "lap", "help", "same_day")],
+        "attempts": [
+            {"kc_label": "rev", "outcome": "success", "partial_credit": 1.0},
+            {"kc_label": "lap", "outcome": "failure", "partial_credit": 0.0},
+            {"kc_label": "help", "outcome": "success", "partial_credit": 1.0, "is_assisted": True},
+            {"kc_label": "same_day", "outcome": "success", "partial_credit": 1.0},
+        ],
+    })
+    rows = {r["concept_id"]: r for r in fake_supabase.tables["kernel.student_concept_state"]}
+    assert (rows["rev"]["review_count"], rows["rev"]["lapse_count"]) == (1, 0)
+    assert (rows["lap"]["review_count"], rows["lap"]["lapse_count"]) == (0, 1)
+    assert (rows["help"]["review_count"], rows["help"]["lapse_count"]) == (0, 0)       # help masks retention
+    assert (rows["same_day"]["review_count"], rows["same_day"]["lapse_count"]) == (0, 0)  # no gap, no test

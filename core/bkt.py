@@ -156,10 +156,76 @@ def blocage_evidence(credit: float, blocage_type: str | None) -> float | None:
 
 
 # --------------------------------------------------------------------------- #
+# tau — the KC's rigour
+# --------------------------------------------------------------------------- #
+# tau in [0, 1] says how EXACT a KC must be to count as known: a definition to
+# recall word for word or a procedure that must be carried out without error
+# (high tau) versus a general idea (low tau). It comes with the KC (inferred at
+# creation from its type and target level), 0.5 being neutral: at tau = 0.5
+# every rule below reduces exactly to the behaviour without tau.
+#
+# tau acts on the rules WE own, never on a parameter fitted to data:
+#   - how much a partial answer is worth (rigor_credit),
+#   - the mastery threshold (mastery_threshold),
+#   - the forgetting prior (forgetting.get_lambda),
+# and it is exposed to RAYA, which chooses the EMT entry point with it.
+TAU_NEUTRAL = 0.5
+
+
+def kc_tau(concept_node: dict | None) -> float:
+    """The KC's rigour, bounded to [0, 1]; neutral when missing or unreadable."""
+    try:
+        value = float((concept_node or {}).get("tau"))
+    except (TypeError, ValueError):
+        return TAU_NEUTRAL
+    return max(0.0, min(1.0, value))
+
+
+def rigor_credit(credit: float, tau: float) -> float:
+    """What a partial answer is worth on a KC of rigour tau: credit ** (2 tau).
+
+    Full success and full failure are unchanged; only partial answers move. On
+    a rigorous KC (tau 0.8) a 0.7 answer counts as 0.56 — close is not enough
+    when exactness is the point; on a loose one (tau 0.3), as 0.81. This is the
+    "update speed" tau modulates: how fast partial answers build mastery,
+    without touching p_transit, which is fitted to data. [design: the exponent]
+    """
+    if credit <= 0.0 or credit >= 1.0:
+        return credit
+    return credit ** (2.0 * tau)
+
+
+def observation(credit: float, assisted: bool, blocage_type: str | None, tau: float = TAU_NEUTRAL) -> dict:
+    """One graded attempt, as the update and the ledger use it.
+
+    The single definition shared by /analyze and /update_concept_state, so the
+    two doors into a student's state apply the same evidence rules: rigour
+    first (what the answer is worth on this KC), then the blocage rule
+    (whether a failure says anything about the concept at all).
+    """
+    worth = rigor_credit(max(0.0, min(1.0, credit)), tau)
+    counted = blocage_evidence(worth, blocage_type)
+    return {
+        "credit": counted if counted is not None else worth,
+        "raw_credit": credit,
+        "assisted": bool(assisted),
+        "blocage_type": blocage_type,
+        "counted": counted is not None,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Mastery criterion (dual condition)
 # --------------------------------------------------------------------------- #
-# [prior] Corbett & Anderson (1995) mastery criterion.
+# [prior] Corbett & Anderson (1995) mastery criterion, at neutral rigour.
 MASTERY_THRESHOLD = 0.95
+# [design] How far rigour moves it: 0.93 at tau 0.3, 0.98 at tau 0.8.
+MASTERY_TAU_SLOPE = 0.10
+
+
+def mastery_threshold(tau: float = TAU_NEUTRAL) -> float:
+    """The K a KC of rigour tau must reach to count as mastered."""
+    return min(0.99, MASTERY_THRESHOLD + MASTERY_TAU_SLOPE * (tau - TAU_NEUTRAL))
 # [design] What "low slip" means for mastery; no published value for K-12.
 MAX_SLIP_FOR_MASTERY = 0.15
 # [design] Solid credit on the recent autonomous attempts.
@@ -191,10 +257,12 @@ def mastery_credit(student_state: dict | None) -> float | None:
     return sum(recent) / len(recent)
 
 
-def is_mastered(k_effective: float, p_slip: float, partial_credit_avg: float | None) -> bool:
+def is_mastered(
+    k_effective: float, p_slip: float, partial_credit_avg: float | None, tau: float = TAU_NEUTRAL
+) -> bool:
     """Dual mastery condition: high effective mastery AND low slip AND solid credit."""
     return (
-        k_effective >= MASTERY_THRESHOLD
+        k_effective >= mastery_threshold(tau)
         and p_slip <= MAX_SLIP_FOR_MASTERY
         and partial_credit_avg is not None
         and partial_credit_avg >= MIN_PARTIAL_CREDIT_AVG
@@ -209,6 +277,7 @@ def classify_status(
     k_effective: float,
     p_slip: float = BKT_PRIORS["p_slip"],
     partial_credit_avg: float | None = 0.5,
+    tau: float = TAU_NEUTRAL,
 ) -> str:
     """Map an effective mastery to a human-facing status label.
 
@@ -216,7 +285,7 @@ def classify_status(
     any K >= 0.7, which made the dual condition dead code: a KC slipped on 40%
     of the time read "mastered" on the same response that raised false_mastery.
     """
-    if is_mastered(k_effective, p_slip, partial_credit_avg):
+    if is_mastered(k_effective, p_slip, partial_credit_avg, tau):
         return "mastered"
     if k_effective < GAP_THRESHOLD:
         return "gap"
@@ -237,7 +306,8 @@ def effective_state(concept_node: dict, student_state: dict | None) -> dict:
     from core import forgetting  # local: forgetting is a leaf, this keeps it one
 
     if not student_state:
-        return {"k_raw": None, "k_effective": None, "p_slip": None, "status": "unknown"}
+        return {"k_raw": None, "k_effective": None, "p_slip": None, "status": "unknown",
+                "tau": kc_tau(concept_node)}
 
     k_raw = student_state.get("mastery_score_raw") or 0.0
     last_at = student_state.get("last_strong_signal_at")
@@ -254,5 +324,6 @@ def effective_state(concept_node: dict, student_state: dict | None) -> dict:
         "k_raw": round(k_raw, 4),
         "k_effective": round(k_effective, 4),
         "p_slip": p_slip,
-        "status": classify_status(k_effective, p_slip, pc_avg),
+        "status": classify_status(k_effective, p_slip, pc_avg, kc_tau(concept_node)),
+        "tau": kc_tau(concept_node),
     }

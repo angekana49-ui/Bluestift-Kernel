@@ -35,6 +35,15 @@ Regles pour lambda_decay :
 
 prerequisites : concepts qu'un eleve DOIT maitriser avant ce concept.
 Maximum 3 prerequis. Liste vide si c'est un concept fondamental.
+
+tau (rigueur) : a quel point ce concept doit etre EXACT pour etre considere
+comme su, a ce niveau. Depend du type ET du niveau vise :
+- 0.3 : une idee generale, une intuition (ex. "une fonction associe une valeur
+  a une autre" en cycle 3) ; une reponse approchee montre deja la comprehension.
+- 0.5 : cas general.
+- 0.8 : une definition a restituer mot pour mot, une procedure qui doit etre
+  executee sans erreur (ex. une formule de derivation en lycee) ; une reponse
+  presque juste ne suffit pas.
 """
 
 

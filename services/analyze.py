@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 
 from core import anomaly, bkt, calibration, curriculum, detector, forgetting, mindset
 from core.graph import build_graph, node_id
-from services import db
+from services import db, serial
 from services.kc_registry import LLMBudget, _normalize_label, get_or_create_kc
 from services.llm import extract_json, llm_call
 
@@ -261,120 +261,125 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
             canonical[_normalize_label(raw)] = label
         attempts_by_label.setdefault(label, []).append(attempt)
 
-    # 3. Load existing student states for this user.
-    states_rows = db.load_student_concept_states(client, user_id)
-    states_by_concept = {s["concept_id"]: s for s in states_rows}
+    # 3-5 read the student's state and write it back: one request at a time
+    #     per student, first come first served (services/serial.py). The LLM
+    #     calls before and after run outside the queue.
+    async with serial.student(user_id):
+        # 3. Load existing student states for this user.
+        states_rows = db.load_student_concept_states(client, user_id)
+        states_by_concept = {s["concept_id"]: s for s in states_rows}
 
-    # 3a. Mastery history, one query for the whole student, grouped per KC. Feeds
-    #     the temporal-inconsistency detector.
-    trajectories = _group_trajectories(db.load_recent_trajectories(client, user_id))
+        # 3a. Mastery history, one query for the whole student, grouped per KC. Feeds
+        #     the temporal-inconsistency detector.
+        trajectories = _group_trajectories(db.load_recent_trajectories(client, user_id))
 
-    # 3b. Mindset M from the conversation (needed to modulate P during the loop).
-    m_score = _update_mindset(client, user_id, extraction.get("mindset_signals"))
+        # 3b. Mindset M from the conversation (needed to modulate P during the loop).
+        m_score = _update_mindset(client, user_id, extraction.get("mindset_signals"))
 
-    # 4-5. Decay -> effective mastery, then a BKT update on every attempt.
-    mastery_map: dict[str, dict] = {}
-    effective_states: dict[str, float] = {}  # label -> k_effective (for DFS)
-    kc_records: list[dict] = []              # per-KC snapshot for anomaly detection
-    label_to_concept: dict[str, str] = {}
+        # 4-5. Decay -> effective mastery, then a BKT update on every attempt.
+        mastery_map: dict[str, dict] = {}
+        effective_states: dict[str, float] = {}  # label -> k_effective (for DFS)
+        kc_records: list[dict] = []              # per-KC snapshot for anomaly detection
+        label_to_concept: dict[str, str] = {}
 
-    for label, kc in resolved.items():
-        concept_id = kc["id"]
-        label_to_concept[label] = concept_id
-        state = states_by_concept.get(concept_id)
-        params = bkt.get_bkt_params(kc)
-        k_raw = state["mastery_score_raw"] if state else params["p_init"]
-        last_at = state.get("last_strong_signal_at") if state else None
+        for label, kc in resolved.items():
+            concept_id = kc["id"]
+            label_to_concept[label] = concept_id
+            state = states_by_concept.get(concept_id)
+            params = bkt.get_bkt_params(kc)
+            k_raw = state["mastery_score_raw"] if state else params["p_init"]
+            last_at = state.get("last_strong_signal_at") if state else None
 
-        lam = forgetting.get_lambda(kc, state)
-        k_eff = forgetting.compute_effective_mastery(
-            k_raw, kc.get("type_kc", "conceptual"), last_at, lambda_override=lam,
-            floor=params["p_init"],
-        )
+            lam = forgetting.get_lambda(kc, state)
+            k_eff = forgetting.compute_effective_mastery(
+                k_raw, kc.get("type_kc", "conceptual"), last_at, lambda_override=lam,
+                floor=params["p_init"],
+            )
 
-        # Each attempt becomes an observation: its credit, whether it was made
-        # with help, and whether it counts at all (a failure caused by a
-        # linguistic block is no evidence about the concept). Every graded
-        # attempt is logged; only counted ones move K.
-        observations = _observations(
-            attempts_by_label.get(label, []), extraction.get("blocage_type")
-        )
-        evidence = [o for o in observations if o["counted"]]
-        credits = [o["credit"] for o in evidence]
-        committed_slip = None
-        new_state = None
-        history = trajectories.get(concept_id, [])
+            # Each attempt becomes an observation: its credit, whether it was made
+            # with help, and whether it counts at all (a failure caused by a
+            # linguistic block is no evidence about the concept). Every graded
+            # attempt is logged; only counted ones move K.
+            observations = _observations(
+                attempts_by_label.get(label, []), extraction.get("blocage_type"), bkt.kc_tau(kc)
+            )
+            evidence = [o for o in observations if o["counted"]]
+            committed_slip = None
+            new_state = None
+            history = trajectories.get(concept_id, [])
 
-        # Named in the conversation, never practised, no history: there is no
-        # evidence either way. Report it as unknown and keep it out of the
-        # diagnosis — p_init sits under the failing threshold, so it used to turn
-        # every merely-mentioned concept into a "gap" the tutor would remediate.
-        if state is None and not evidence:
-            mastery_map[label] = {"k_raw": round(k_raw, 4), "k_effective": round(k_raw, 4), "status": "unknown"}
-            continue
+            # Named in the conversation, never practised, no history: there is no
+            # evidence either way. Report it as unknown and keep it out of the
+            # diagnosis — p_init sits under the failing threshold, so it used to turn
+            # every merely-mentioned concept into a "gap" the tutor would remediate.
+            if state is None and not evidence:
+                mastery_map[label] = {"k_raw": round(k_raw, 4), "k_effective": round(k_raw, 4), "status": "unknown"}
+                continue
 
-        # Every attempt is evidence. There used to be a "strong signal" gate
-        # here (3+ attempts, a 0.3 credit shift, or an anomaly), justified as
-        # protection against drift. But drift comes from re-estimating
-        # PARAMETERS on too little data — which the calibration cooldown
-        # guards — not from updating the STATE: BKT absorbs noisy answers
-        # through slip and guess by design. The gate's real effect was that a
-        # student succeeding once per session was never updated, so their
-        # mastery decayed while they kept succeeding.
-        #
-        # `commit_state` only decides whether the evidence is WRITTEN:
-        # diagnose-only mode still diagnoses from this conversation.
-        if evidence:
-            # Update the belief the Kernel actually holds now — the decayed one,
-            # the same value /load_profile shows. Updating the stale raw value
-            # would let a 6-month-old mastery absorb today's evidence as if no
-            # time had passed. Then apply EVERY attempt, in order: BKT is a
-            # sequence model, and keeping only the last one discarded the rest.
-            ks = [k_eff]
-            for o in evidence:
-                ks.append(bkt.update_bkt(
-                    ks[-1], correct=o["credit"] >= 0.5, partial_credit=o["credit"],
-                    params=params, assisted=o["assisted"],
-                ))
-            # Fresh signal -> no decay yet, so effective == raw.
-            k_raw = k_eff = ks[-1]
-            new_state = _next_state(user_id, concept_id, ks, evidence, state, lam, m_score, params)
-            committed_slip = new_state["p_slip_personal"]
-            # Best-effort: a write/permission failure must not sink the diagnosis.
-            try:
-                if commit_state:
-                    _persist_state(client, new_state, ks[-1])
+            # Every attempt is evidence. There used to be a "strong signal" gate
+            # here (3+ attempts, a 0.3 credit shift, or an anomaly), justified as
+            # protection against drift. But drift comes from re-estimating
+            # PARAMETERS on too little data — which the calibration cooldown
+            # guards — not from updating the STATE: BKT absorbs noisy answers
+            # through slip and guess by design. The gate's real effect was that a
+            # student succeeding once per session was never updated, so their
+            # mastery decayed while they kept succeeding.
+            #
+            # `commit_state` only decides whether the evidence is WRITTEN:
+            # diagnose-only mode still diagnoses from this conversation.
+            if evidence:
+                # Update the belief the Kernel actually holds now — the decayed one,
+                # the same value /load_profile shows — applying EVERY attempt, in
+                # order (see _session_update). Committed as the next block of this
+                # KC's chain: if another request moved the state on meanwhile, the
+                # update is recomputed on the new tip instead of overwriting it.
+                committed = False
+                try:
+                    state, lam, ks, new_state = _commit_session(
+                        client, user_id, concept_id, kc, params, state, evidence,
+                        m_score, commit=commit_state,
+                    )
+                    committed = commit_state
+                except Exception as e:  # noqa: BLE001 - degrade, still return the analysis
+                    # A write failure must not sink the diagnosis: this
+                    # conversation's evidence still informs it, in memory.
+                    db.log_monitoring(client, "warn", "persist_state_failed", {"error": str(e)[:300]})
+                    lam, ks, new_state = _session_update(
+                        user_id, concept_id, kc, params, state, evidence, m_score
+                    )
+                k_raw = k_eff = ks[-1]  # fresh signal -> no decay yet
+                committed_slip = new_state["p_slip_personal"]
+                if committed:
                     db.log_learning_events(client, _learning_events(
                         user_id, concept_id, request_id, observations, ks
                     ))
                     # This KC's evidence just changed, so its empirical
-                    # parameters may have too. The node is already in memory, so
-                    # the freshness check is free; the recalibration itself runs
-                    # in the background after the response, and only for KCs
-                    # actually past cooldown.
+                    # parameters may have too. The freshness check is free;
+                    # the recalibration runs in the background after the
+                    # response, and only for KCs actually past cooldown.
                     if calibration.is_calibration_due(kc):
                         recalibrate_ids.add(concept_id)
-            except Exception as e:  # noqa: BLE001 - degrade, still return the analysis
-                db.log_monitoring(client, "warn", "persist_state_failed", {"error": str(e)[:300]})
 
-        p_slip = committed_slip or (state.get("p_slip_personal") if state else None) or bkt.get_bkt_params(kc)["p_slip"]
-        status = bkt.classify_status(k_eff, p_slip, bkt.mastery_credit(new_state or state))
-        kc_records.append(
-            {
-                "label": label,
-                "k_effective": k_eff,
-                "p_slip": p_slip,
-                "trajectory": history,
-                "population_difficulty": _population_baseline(kc),
+            p_slip = committed_slip or (state.get("p_slip_personal") if state else None) or bkt.get_bkt_params(kc)["p_slip"]
+            status = bkt.classify_status(
+                k_eff, p_slip, bkt.mastery_credit(new_state or state), bkt.kc_tau(kc)
+            )
+            kc_records.append(
+                {
+                    "label": label,
+                    "k_effective": k_eff,
+                    "p_slip": p_slip,
+                    "trajectory": history,
+                    "population_difficulty": _population_baseline(kc),
+                }
+            )
+
+            mastery_map[label] = {
+                "k_raw": round(k_raw, 4),
+                "k_effective": round(k_eff, 4),
+                "status": status,
             }
-        )
-
-        mastery_map[label] = {
-            "k_raw": round(k_raw, 4),
-            "k_effective": round(k_eff, 4),
-            "status": status,
-        }
-        effective_states[label] = k_eff
+            effective_states[label] = k_eff
 
     # 6. Build the NetworkX graph from the full DB graph.
     nodes = db.load_concept_nodes(client)
@@ -545,6 +550,49 @@ def _persistence(p_slip: float, m_score: float) -> float:
     return round(max(0.05, min(0.95, base * (0.6 + 0.4 * m_score))), 4)
 
 
+def _session_update(user_id, concept_id, kc, params, state, evidence, m_score):
+    """Apply one session's evidence to one KC state, in order. Pure.
+
+    Returns (lam, ks, new_state): the decay rate used, the mastery trajectory
+    through the counted attempts (ks[0] = the decayed belief before the first),
+    and the state row to write.
+    """
+    lam = forgetting.get_lambda(kc, state)
+    k_raw = state["mastery_score_raw"] if state else params["p_init"]
+    last_at = state.get("last_strong_signal_at") if state else None
+    ks = [forgetting.compute_effective_mastery(
+        k_raw, kc.get("type_kc", "conceptual"), last_at, lambda_override=lam,
+        floor=params["p_init"],
+    )]
+    for o in evidence:
+        ks.append(bkt.update_bkt(
+            ks[-1], correct=o["credit"] >= 0.5, partial_credit=o["credit"],
+            params=params, assisted=o["assisted"],
+        ))
+    new_state = _next_state(user_id, concept_id, ks, evidence, state, lam, m_score, params)
+    return lam, ks, new_state
+
+
+def _commit_session(client, user_id, concept_id, kc, params, state, evidence, m_score, commit=True):
+    """Compute the session update and, if `commit`, write it as the next block.
+
+    A write computed from a stale state is rejected by the database
+    (db.StaleState); the state is then re-read and the SAME evidence reapplied
+    on top of it, so both requests' evidence ends up in the chain. Returns
+    (state it was built on, lam, ks, new_state).
+    """
+    for _ in range(serial.MAX_CHAIN_RETRIES):
+        lam, ks, new_state = _session_update(user_id, concept_id, kc, params, state, evidence, m_score)
+        if not commit:
+            return state, lam, ks, new_state
+        try:
+            _persist_state(client, new_state, ks[-1], state.get("version", 0) if state else None)
+            return state, lam, ks, new_state
+        except db.StaleState:
+            state = db.load_student_concept_state(client, user_id, concept_id)
+    raise RuntimeError(f"state chain for {concept_id} kept moving; evidence logged, not applied")
+
+
 def _next_state(user_id, concept_id, ks, evidence, prev_state, lam, m_score, params) -> dict:
     """The student_concept_state row after this session's evidence (pure).
 
@@ -593,27 +641,51 @@ def _next_state(user_id, concept_id, ks, evidence, prev_state, lam, m_score, par
         "last_strong_signal_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    # Personal forgetting rate, learned from how the first attempt after a real
-    # gap compares with what the decay model predicted for it.
-    personal_lambda = _estimate_personal_lambda(prev_state, evidence[0], lam, params)
+    # Spacing: the first autonomous attempt after a real gap is a retrieval
+    # test. Success is a review (the memory gets more durable), failure a lapse.
+    reviews, lapses = prev.get("review_count") or 0, prev.get("lapse_count") or 0
+    first = evidence[0]
+    is_retrieval = (
+        prev_state is not None
+        and prev.get("last_strong_signal_at")
+        and not first["assisted"]
+        and forgetting.days_since(prev["last_strong_signal_at"]) >= forgetting.REVIEW_MIN_GAP_DAYS
+    )
+    if is_retrieval:
+        if first["credit"] >= 0.5:
+            reviews += 1
+        else:
+            lapses += 1
+    row["review_count"] = reviews
+    row["lapse_count"] = lapses
+
+    # Personal forgetting rate, learned from how that retrieval compares with
+    # what the decay model predicted for it. `lam` is the rate that prediction
+    # used (base x spacing); what is stored is the BASE rate, so the reviews
+    # keep being applied on top of it rather than baked in twice.
+    personal_lambda = _estimate_personal_lambda(prev_state, first, lam, params)
     if personal_lambda is not None:
-        row["lambda_personal"] = round(personal_lambda, 5)
+        row["lambda_personal"] = round(personal_lambda / forgetting.spacing_factor(prev_state), 5)
     return row
 
 
-def _persist_state(client, row: dict, k_final: float) -> None:
-    """Write the state row, and one trajectory snapshot for the session."""
-    db.upsert_student_concept_state(client, row)
+def _persist_state(client, row: dict, k_final: float, read_version: int | None = None) -> None:
+    """Write the state row as the next block of its chain, and one trajectory
+    snapshot for the session. Raises db.StaleState if the chain moved on."""
+    db.commit_student_concept_state(client, row, read_version)
     # One snapshot per session, not per attempt: the inconsistency detector reads
     # this series, and within-session steps would read as oscillation.
     db.log_trajectory(client, row["user_id"], row["concept_id"], k_final, k_final)
 
 
-def _observations(attempts: list[dict], conversation_blocage: str | None) -> list[dict]:
+def _observations(
+    attempts: list[dict], conversation_blocage: str | None, tau: float = bkt.TAU_NEUTRAL
+) -> list[dict]:
     """Turn extracted attempts into observations the update can use.
 
     An attempt's own blocage_type wins over the conversation's; an attempt
-    with no usable credit is dropped entirely.
+    with no usable credit is dropped entirely. The rules themselves live in
+    bkt.observation, shared with /update_concept_state.
     """
     out = []
     for a in attempts:
@@ -621,14 +693,7 @@ def _observations(attempts: list[dict], conversation_blocage: str | None) -> lis
         if credit is None:
             continue
         blocage = a.get("blocage_type") or conversation_blocage
-        counted = bkt.blocage_evidence(credit, blocage)
-        out.append({
-            "credit": counted if counted is not None else credit,
-            "raw_credit": credit,
-            "assisted": bool(a.get("is_assisted")),
-            "blocage_type": blocage,
-            "counted": counted is not None,
-        })
+        out.append(bkt.observation(credit, bool(a.get("is_assisted")), blocage, tau))
     return out
 
 

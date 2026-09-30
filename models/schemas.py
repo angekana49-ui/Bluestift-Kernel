@@ -103,6 +103,13 @@ class ConceptStateOut(BaseModel):
     p_score: float
     status: KCStatus
     last_interaction_at: Optional[datetime] = None
+    # The KC's rigour in [0, 1] (0.5 neutral): how exact it must be to count as
+    # known. For RAYA's EMT entry point — a rigorous KC warrants an earlier
+    # worked example than a loose one at the same K.
+    tau: float = 0.5
+    # Successful / failed retrievals after a gap (the spacing effect).
+    review_count: int = 0
+    lapse_count: int = 0
 
 
 class MindsetOut(BaseModel):
