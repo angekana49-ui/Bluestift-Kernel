@@ -1680,7 +1680,9 @@ def _seed_graph_and_student(fake, *, mastered_fonction=False):
             "kernel.student_concept_state",
             [{
                 "id": "s1", "user_id": "student-a", "concept_id": "kc-fonc",
-                "mastery_score_raw": 0.95, "partial_credit_avg": 0.85,
+                # Clear of the 0.95 mastery line: decay starts the instant the
+                # signal is written, so a fresh 0.95 reads 0.9499... a moment later.
+                "mastery_score_raw": 0.97, "partial_credit_avg": 0.85,
                 "p_slip_personal": 0.05,
                 "last_strong_signal_at": datetime.now(timezone.utc).isoformat(),
             }],
@@ -1941,3 +1943,217 @@ def test_update_mindset_blends_into_the_stored_score(fake_supabase):
     row = fake_supabase.tables["kernel.student_mindset_state"][0]
     assert row["m_score"] == round(m, 4)
     assert row["detected_mindset"] == mindset.classify_mindset(m)
+
+
+# --------------------------------------------------------------------------- #
+# Core-correctness regressions (audit 2026-09-30)
+# --------------------------------------------------------------------------- #
+# Each test below pins a defect that made the Kernel's diagnosis disagree with
+# its own documentation. They are phrased as the behaviour a learner is owed,
+# not as the implementation, so a future refactor can't quietly reintroduce one.
+def _extraction_llm(extraction: dict):
+    """An LLM mock whose extraction call returns `extraction`; everything else
+    (KC metadata, summary) gets a harmless answer."""
+
+    async def fake_llm_call(prompt, max_tokens=1000):
+        if "kcs_mentioned" in prompt:
+            return json.dumps(extraction), "mock-model"
+        if "prerequisites" in prompt:
+            return json.dumps({"type_kc": "conceptual", "prerequisites": []}), "mock-model"
+        return "resume", "mock-model"
+
+    return fake_llm_call
+
+
+async def _analyze(fake_supabase, monkeypatch, extraction: dict, user_id: str = "u1") -> dict:
+    fake = _extraction_llm(extraction)
+    monkeypatch.setattr(analyze_pipeline, "llm_call", fake)
+    monkeypatch.setattr(kc_registry, "llm_call", fake)
+    payload = {
+        "user_id": user_id,
+        "conversation_history": [{"role": "user", "content": "..."}],
+        "subject": "MATH",
+        "level": "lycee",
+    }
+    return await analyze_pipeline.run_analysis(fake_supabase, "req-1", payload)
+
+
+def test_bkt_partial_credit_is_graded_not_binary():
+    # Ostrow & Heffernan: a 0.3 answer is better evidence than a 0.0 one, and a
+    # 0.6 answer weaker than a perfect one. A binarised update erases that.
+    ks = [bkt.update_bkt(0.5, correct=False, partial_credit=b) for b in bkt.PARTIAL_CREDIT_BINS]
+    assert ks == sorted(ks)
+    assert len(set(ks)) == len(ks), "every credit bin must move mastery differently"
+    # The ends of the scale are still the classic binary BKT update.
+    assert bkt.update_bkt(0.5, correct=True, partial_credit=1.0) == pytest.approx(
+        bkt.update_bkt(0.5, correct=True)
+    )
+    assert bkt.update_bkt(0.5, correct=False, partial_credit=0.0) == pytest.approx(
+        bkt.update_bkt(0.5, correct=False)
+    )
+
+
+def test_bkt_params_stay_identifiable():
+    # slip + guess >= 1 makes a success LOWER mastery (the model inverts). A
+    # calibrated or hand-edited node must never be able to put the Kernel there.
+    params = bkt.get_bkt_params({"p_slip": 0.6, "p_guess": 0.7, "p_transit": 0.0})
+    assert params["p_slip"] < 0.5 and params["p_guess"] < 0.5
+    assert bkt.update_bkt(0.5, correct=True, params=params) > 0.5
+    assert bkt.update_bkt(0.5, correct=False, params=params) < 0.5
+    # A legitimately calibrated 0.0 is data, not "missing".
+    assert bkt.get_bkt_params({"p_transit": 0.0})["p_transit"] == 0.0
+
+
+def test_mastered_status_requires_the_dual_condition():
+    # K alone is not mastery: a KC slipped on 40% of the time is not "mastered",
+    # whatever K says — that is exactly the false-mastery pattern we alert on.
+    assert bkt.classify_status(0.99, p_slip=0.4, partial_credit_avg=0.9) != "mastered"
+    assert bkt.classify_status(0.8, p_slip=0.1, partial_credit_avg=0.2) != "mastered"
+    assert bkt.classify_status(0.8, p_slip=0.1, partial_credit_avg=0.8) == "partial"
+    assert bkt.classify_status(0.99, p_slip=0.1, partial_credit_avg=0.8) == "mastered"
+
+
+def test_root_gap_is_deterministic_and_prefers_the_weakest():
+    # Three independent failing KCs, equal on convergence, evidence and depth.
+    # The weakest one is the most urgent — and the answer must not depend on the
+    # process's hash seed (it used to change between two identical requests).
+    nodes = [{"id": x, "label": x} for x in ("fractions", "equations", "algebra", "geometry")]
+    edges = [
+        {"prerequisite_id": "fractions", "concept_id": "algebra"},
+        {"prerequisite_id": "equations", "concept_id": "algebra"},
+    ]
+    g = build_graph(nodes, edges)
+    states = {"fractions": 0.2, "equations": 0.25, "geometry": 0.1}
+    result = detector.detect_root_cause(g, ["fractions", "equations", "geometry"], states)
+    assert result["root_gap"] == "geometry"
+
+
+def test_build_graph_breaks_prerequisite_cycles():
+    # LLM-inferred prerequisites can close a loop (A needs B, B needs A). The
+    # root-cause walk assumes a DAG; a cycle makes "deepest prerequisite" undefined.
+    import networkx as nx
+
+    nodes = [{"id": x, "label": x} for x in "abc"]
+    edges = [
+        {"prerequisite_id": "a", "concept_id": "b"},
+        {"prerequisite_id": "b", "concept_id": "c"},
+        {"prerequisite_id": "c", "concept_id": "a"},
+    ]
+    g = build_graph(nodes, edges)
+    assert nx.is_directed_acyclic_graph(g)
+    assert g.number_of_edges() == 2
+
+
+async def test_analyze_applies_every_attempt_not_just_the_last(fake_supabase, monkeypatch):
+    fake_supabase.seed("kernel.concept_nodes", [{"id": "f", "label": "fractions", "subject": "MATH"}])
+    attempts = [
+        {"kc_label": "fractions", "outcome": "failure", "partial_credit": 0.0},
+        {"kc_label": "fractions", "outcome": "failure", "partial_credit": 0.0},
+        {"kc_label": "fractions", "outcome": "success", "partial_credit": 1.0},
+    ]
+    out = await _analyze(fake_supabase, monkeypatch, {
+        "kcs_mentioned": [{"label": "fractions", "subject": "MATH"}],
+        "attempts": attempts,
+    })
+    # Replay the same evidence, in order, through the model by hand.
+    k = bkt.BKT_PRIORS["p_init"]
+    for a in attempts:
+        k = bkt.update_bkt(k, correct=a["outcome"] == "success", partial_credit=a["partial_credit"])
+    assert out["mastery_map"]["fractions"]["k_raw"] == pytest.approx(k, abs=1e-4)
+    row = fake_supabase.tables["kernel.student_concept_state"][0]
+    assert row["interactions_on_kc"] == 3
+    assert row["struggle_index"] == 2
+
+
+async def test_analyze_decays_mastery_before_updating_it(fake_supabase, monkeypatch):
+    # 200 days without practice: the Kernel's own view (load_profile) says the
+    # concept has faded. The next observation must update THAT belief, not the
+    # stale pre-holiday value.
+    long_ago = (datetime.now(timezone.utc) - timedelta(days=200)).isoformat()
+    fake_supabase.seed(
+        "kernel.concept_nodes",
+        [{"id": "f", "label": "fractions", "subject": "MATH", "type_kc": "conceptual"}],
+    )
+    fake_supabase.seed(
+        "kernel.student_concept_state",
+        [{"user_id": "u1", "concept_id": "f", "mastery_score_raw": 0.9,
+          "partial_credit_avg": 0.1, "interactions_on_kc": 4, "last_strong_signal_at": long_ago}],
+    )
+    out = await _analyze(fake_supabase, monkeypatch, {
+        "kcs_mentioned": [{"label": "fractions", "subject": "MATH"}],
+        "attempts": [{"kc_label": "fractions", "outcome": "success", "partial_credit": 1.0}],
+    })
+    decayed = forgetting.compute_effective_mastery(0.9, "conceptual", long_ago)
+    assert out["mastery_map"]["fractions"]["k_raw"] == pytest.approx(
+        bkt.update_bkt(decayed, correct=True), abs=1e-3
+    )
+
+
+async def test_mentioned_but_unpractised_kc_is_unknown_not_a_gap(fake_supabase, monkeypatch):
+    # A student naming a concept is not evidence they fail it. It used to start
+    # at p_init (0.3), fall under the failing threshold, and become a "root gap"
+    # the tutor would then remediate — on no evidence at all.
+    fake_supabase.seed("kernel.concept_nodes", [{"id": "f", "label": "fractions", "subject": "MATH"}])
+    out = await _analyze(fake_supabase, monkeypatch, {
+        "kcs_mentioned": [{"label": "fractions", "subject": "MATH"}],
+        "attempts": [],
+    })
+    assert out["mastery_map"]["fractions"]["status"] == "unknown"
+    assert out["root_gap"] is None
+
+
+async def test_attempt_label_follows_the_canonical_kc(fake_supabase, monkeypatch):
+    # The registry canonicalises "Fractions " to "fractions"; the attempt naming
+    # the raw spelling must still land on that KC instead of being dropped.
+    fake_supabase.seed("kernel.concept_nodes", [{"id": "f", "label": "fractions", "subject": "MATH"}])
+    await _analyze(fake_supabase, monkeypatch, {
+        "kcs_mentioned": [{"label": "Fractions ", "subject": "MATH"}],
+        "attempts": [{"kc_label": "Fractions", "outcome": "failure", "partial_credit": 0.0}],
+    })
+    assert len(fake_supabase.tables["kernel.student_concept_state"]) == 1
+
+
+async def test_success_with_a_placeholder_zero_credit_counts_as_success(fake_supabase, monkeypatch):
+    # The extraction template shows `"partial_credit": 0.0`; an LLM that copies
+    # it next to outcome=success must not have that success scored as a failure.
+    fake_supabase.seed("kernel.concept_nodes", [{"id": "f", "label": "fractions", "subject": "MATH"}])
+    out = await _analyze(fake_supabase, monkeypatch, {
+        "kcs_mentioned": [{"label": "fractions", "subject": "MATH"}],
+        "attempts": [{"kc_label": "fractions", "outcome": "success", "partial_credit": 0.0}],
+    })
+    assert out["mastery_map"]["fractions"]["k_raw"] > bkt.BKT_PRIORS["p_init"]
+
+
+async def test_kc_lookup_does_not_treat_underscore_as_a_wildcard(fake_supabase, monkeypatch):
+    # In SQL LIKE, `_` matches any character. "fraction_addition" must not
+    # resolve to an unrelated "fractionxaddition".
+    fake_supabase.seed(
+        "kernel.concept_nodes", [{"id": "x", "label": "fractionxaddition", "subject": "MATH"}]
+    )
+    monkeypatch.setattr(kc_registry, "llm_call", _extraction_llm({}))
+    kc = await kc_registry.get_or_create_kc("fraction_addition", "MATH", "lycee", fake_supabase)
+    assert kc["id"] != "x"
+    assert kc["label"] == "fraction_addition"
+
+
+def test_update_concept_state_decays_before_updating(client, fake_supabase, monkeypatch):
+    monkeypatch.setenv("KERNEL_API_SECRET", "s3cr3t")
+    monkeypatch.setattr(db_module, "get_client", lambda: fake_supabase)
+    long_ago = (datetime.now(timezone.utc) - timedelta(days=200)).isoformat()
+    fake_supabase.seed(
+        "kernel.concept_nodes",
+        [{"id": "f", "label": "fractions", "subject": "MATH", "type_kc": "conceptual"}],
+    )
+    fake_supabase.seed(
+        "kernel.student_concept_state",
+        [{"user_id": "u1", "concept_id": "f", "mastery_score_raw": 0.9,
+          "interactions_on_kc": 4, "last_strong_signal_at": long_ago}],
+    )
+    resp = client.post(
+        "/update_concept_state",
+        json={"user_id": "u1", "concept_id": "f", "partial_credit_score": 1.0},
+        headers={"X-Kernel-Secret": "s3cr3t"},
+    )
+    assert resp.status_code == 200, resp.text
+    decayed = forgetting.compute_effective_mastery(0.9, "conceptual", long_ago)
+    assert resp.json()["k_raw"] == pytest.approx(bkt.update_bkt(decayed, correct=True), abs=1e-3)

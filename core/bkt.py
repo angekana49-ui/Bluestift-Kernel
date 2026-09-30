@@ -6,8 +6,8 @@ Parameters are *living*: they are never hardcoded into the update. The literatur
 priors (Corbett & Anderson 1995) are used only as a fallback when a concept node
 has no empirically calibrated values yet. See `get_bkt_params`.
 
-Partial-credit handling follows Ostrow & Heffernan (2015); the asymmetric update
-(errors weigh more than successes) follows Hooshyar et al.
+Partial-credit handling follows Ostrow & Heffernan (2015): a graded answer is
+soft evidence, weighing the correct and incorrect likelihoods by its credit.
 """
 from __future__ import annotations
 
@@ -23,18 +23,39 @@ BKT_PRIORS = {
 PARTIAL_CREDIT_BINS = (0.0, 0.3, 0.6, 0.7, 0.8, 1.0)
 
 
+# Slip and guess must each stay below 0.5. At slip + guess >= 1 the model
+# inverts — a correct answer becomes evidence of NOT knowing — and near that
+# line it stops being identifiable (Baker, Corbett & Aleven 2008). Whatever a
+# calibration run or a hand edit writes to a node, the update never sees that.
+MAX_SLIP_OR_GUESS = 0.45
+
+
+def _param(node: dict, name: str, lo: float, hi: float) -> float:
+    """One param from the node, or the prior when missing/unreadable; bounded.
+
+    `None` means "not calibrated"; 0.0 is a calibrated value and is kept.
+    """
+    value = node.get(name)
+    try:
+        value = float(value) if value is not None else BKT_PRIORS[name]
+    except (TypeError, ValueError):
+        value = BKT_PRIORS[name]
+    return max(lo, min(hi, value))
+
+
 def get_bkt_params(concept_node: dict | None) -> dict:
     """Read BKT params from a concept node, falling back to literature priors.
 
     A node may carry empirically calibrated `p_init/p_transit/p_slip/p_guess`.
-    Any missing or null value falls back to the prior.
+    Any missing or null value falls back to the prior; every value is bounded
+    to the identifiable region.
     """
     node = concept_node or {}
     return {
-        "p_init": node.get("p_init") or BKT_PRIORS["p_init"],
-        "p_transit": node.get("p_transit") or BKT_PRIORS["p_transit"],
-        "p_slip": node.get("p_slip") or BKT_PRIORS["p_slip"],
-        "p_guess": node.get("p_guess") or BKT_PRIORS["p_guess"],
+        "p_init": _param(node, "p_init", 0.0, 1.0),
+        "p_transit": _param(node, "p_transit", 0.0, 1.0),
+        "p_slip": _param(node, "p_slip", 0.0, MAX_SLIP_OR_GUESS),
+        "p_guess": _param(node, "p_guess", 0.0, MAX_SLIP_OR_GUESS),
     }
 
 
@@ -71,13 +92,16 @@ def update_bkt(
     else:
         correct_weight = 1.0 if correct else 0.0
 
-    # Asymmetric likelihoods (Hooshyar): failures pull mastery down harder.
-    if correct_weight < 0.5:
-        p_obs_given_learned = p_slip * (1 - correct_weight)
-        p_obs_given_not_learned = (1 - p_guess) * (1 - correct_weight)
-    else:
-        p_obs_given_learned = (1 - p_slip) * correct_weight
-        p_obs_given_not_learned = p_guess * correct_weight
+    # Soft evidence: a credit c is read as "correct with weight c, incorrect with
+    # weight 1 - c", so the likelihood of the observation is the mixture of the
+    # two binary BKT likelihoods. c = 1 and c = 0 are exactly classic BKT.
+    #
+    # The previous form scaled BOTH likelihoods by the same factor, which cancels
+    # in the posterior ratio: every credit below 0.5 updated like a plain failure
+    # and every credit at/above 0.5 like a plain success — partial credit was
+    # binarised, whatever the bins said.
+    p_obs_given_learned = correct_weight * (1 - p_slip) + (1 - correct_weight) * p_slip
+    p_obs_given_not_learned = correct_weight * p_guess + (1 - correct_weight) * (1 - p_guess)
 
     numerator = p_obs_given_learned * k_current
     denominator = numerator + p_obs_given_not_learned * (1 - k_current)
@@ -131,8 +155,7 @@ def is_mastered(k_effective: float, p_slip: float, partial_credit_avg: float) ->
 
 
 # Status thresholds used across the API.
-GAP_THRESHOLD = 0.4      # below -> "gap"
-PARTIAL_THRESHOLD = 0.7  # below -> "partial", at/above -> "mastered"
+GAP_THRESHOLD = 0.4      # below -> "gap"; otherwise "partial" until mastered
 
 
 def classify_status(
@@ -140,14 +163,17 @@ def classify_status(
     p_slip: float = BKT_PRIORS["p_slip"],
     partial_credit_avg: float = 0.5,
 ) -> str:
-    """Map an effective mastery to a human-facing status label."""
+    """Map an effective mastery to a human-facing status label.
+
+    "mastered" is reserved for the dual condition. It used to also be granted to
+    any K >= 0.7, which made the dual condition dead code: a KC slipped on 40%
+    of the time read "mastered" on the same response that raised false_mastery.
+    """
     if is_mastered(k_effective, p_slip, partial_credit_avg):
         return "mastered"
     if k_effective < GAP_THRESHOLD:
         return "gap"
-    if k_effective < PARTIAL_THRESHOLD:
-        return "partial"
-    return "mastered"
+    return "partial"
 
 
 def effective_state(concept_node: dict, student_state: dict | None) -> dict:

@@ -6,13 +6,12 @@ of main.py so the route handler stays thin and this stays unit-testable.
 """
 from __future__ import annotations
 
-from collections import Counter
 from datetime import datetime, timezone
 
 from core import anomaly, bkt, calibration, curriculum, detector, forgetting, mindset
 from core.graph import build_graph, node_id
 from services import db
-from services.kc_registry import get_or_create_kc
+from services.kc_registry import _normalize_label, get_or_create_kc
 from services.llm import extract_json, llm_call
 
 EXTRACTION_PROMPT = """\
@@ -213,8 +212,11 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
     extraction, llm_used = await extract_kcs(conversation, subject, level, known_labels)
     langue = extraction.get("langue_interaction", "fr")
 
-    # 2. Resolve each mentioned KC, creating unknown ones on the fly.
-    resolved: dict[str, dict] = {}  # label -> concept_nodes row
+    # 2. Resolve each mentioned KC, creating unknown ones on the fly. The
+    #    registry canonicalises labels, so remember which raw spelling became
+    #    which KC — the attempts below name KCs in the LLM's spelling, not ours.
+    resolved: dict[str, dict] = {}  # canonical label -> concept_nodes row
+    canonical: dict[str, str] = {}  # normalized raw label -> canonical label
     for mention in extraction.get("kcs_mentioned", []):
         label = (mention.get("label") or "").strip()
         if not label:
@@ -226,6 +228,24 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
             supabase_client=client,
         )
         resolved[kc["label"]] = kc
+        canonical[_normalize_label(label)] = kc["label"]
+
+    # Attempts grouped per canonical KC, in conversation order. An attempt on a
+    # KC the extraction forgot to list is still evidence: resolve it too.
+    attempts_by_label: dict[str, list[dict]] = {}
+    for attempt in extraction.get("attempts", []):
+        raw = (attempt.get("kc_label") or "").strip()
+        if not raw:
+            continue
+        label = canonical.get(_normalize_label(raw))
+        if label is None:
+            kc = await get_or_create_kc(
+                label=raw, subject=subject, level=level, supabase_client=client
+            )
+            label = kc["label"]
+            resolved[label] = kc
+            canonical[_normalize_label(raw)] = label
+        attempts_by_label.setdefault(label, []).append(attempt)
 
     # 3. Load existing student states for this user.
     states_rows = db.load_student_concept_states(client, user_id)
@@ -240,10 +260,6 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
     m_score = _update_mindset(client, user_id, extraction.get("mindset_signals"))
 
     # 4-5. Decay -> effective mastery, then a selective BKT update on attempts.
-    attempts_by_label: dict[str, dict] = {a.get("kc_label"): a for a in extraction.get("attempts", [])}
-    # How many times each KC is attempted in this conversation (= one "session").
-    attempt_counts = Counter(a.get("kc_label") for a in extraction.get("attempts", []))
-
     mastery_map: dict[str, dict] = {}
     effective_states: dict[str, float] = {}  # label -> k_effective (for DFS)
     kc_records: list[dict] = []              # per-KC snapshot for anomaly detection
@@ -253,7 +269,8 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
         concept_id = kc["id"]
         label_to_concept[label] = concept_id
         state = states_by_concept.get(concept_id)
-        k_raw = state["mastery_score_raw"] if state else bkt.get_bkt_params(kc)["p_init"]
+        params = bkt.get_bkt_params(kc)
+        k_raw = state["mastery_score_raw"] if state else params["p_init"]
         last_at = state.get("last_strong_signal_at") if state else None
 
         lam = forgetting.get_lambda(kc, state)
@@ -261,39 +278,47 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
             k_raw, kc.get("type_kc", "conceptual"), last_at, lambda_override=lam
         )
 
-        attempt = attempts_by_label.get(label)
+        credits = [c for c in (_attempt_credit(a) for a in attempts_by_label.get(label, [])) if c is not None]
         committed_slip = None
         history = trajectories.get(concept_id, [])
-        # Selective-update gate: commit a BKT update only on a strong signal —
-        # the first contact (bootstrap), 3+ attempts this session, a large
-        # partial-credit shift, or an anomaly. Avoids overreacting to noise.
-        if attempt and commit_state and _should_commit(
-            attempt, state, attempt_counts.get(label, 1), history
-        ):
-            pc = attempt.get("partial_credit")
-            if attempt.get("is_assisted"):
-                pc = min(pc if pc is not None else 0.9, 0.9)
-            params = bkt.get_bkt_params(kc)
-            k_before = k_raw
-            k_raw = bkt.update_bkt(
-                k_before,
-                correct=(attempt.get("outcome") == "success"),
-                partial_credit=pc,
-                params=params,
-            )
-            # Decay is relative to "now" after a fresh signal -> k_eff == k_raw.
-            k_eff = k_raw
+
+        # Named in the conversation, never practised, no history: there is no
+        # evidence either way. Report it as unknown and keep it out of the
+        # diagnosis — p_init sits under the failing threshold, so it used to turn
+        # every merely-mentioned concept into a "gap" the tutor would remediate.
+        if state is None and not credits:
+            mastery_map[label] = {"k_raw": round(k_raw, 4), "k_effective": round(k_raw, 4), "status": "unknown"}
+            continue
+
+        # Selective-update gate: evidence counts only on a strong signal — the
+        # first contact (bootstrap), 3+ attempts this session, a large credit
+        # shift, or an anomaly. It decides whether the evidence COUNTS;
+        # `commit_state` only decides whether it is WRITTEN (diagnose-only mode
+        # still diagnoses from this conversation, it just leaves no trace).
+        if credits and _should_commit(_session_summary(credits), state, len(credits), history):
+            # Update the belief the Kernel actually holds now — the decayed one,
+            # the same value /load_profile shows. Updating the stale raw value
+            # would let a 6-month-old mastery absorb today's evidence as if no
+            # time had passed. Then apply EVERY attempt, in order: BKT is a
+            # sequence model, and keeping only the last one discarded the rest.
+            ks = [k_eff]
+            for c in credits:
+                ks.append(bkt.update_bkt(ks[-1], correct=c >= 0.5, partial_credit=c, params=params))
+            # Fresh signal -> no decay yet, so effective == raw.
+            k_raw = k_eff = ks[-1]
             # Best-effort: a write/permission failure must not sink the diagnosis.
             try:
-                committed_slip = _persist_state(
-                    client, user_id, concept_id, kc, k_before, k_raw, pc, attempt, state, lam, m_score
-                )
-                # This KC's evidence just changed, so its empirical parameters
-                # may have too. The node is already in memory, so the freshness
-                # check is free; the recalibration itself runs in the background
-                # after the response, and only for KCs actually past cooldown.
-                if calibration.is_calibration_due(kc):
-                    recalibrate_ids.add(concept_id)
+                if commit_state:
+                    committed_slip = _persist_state(
+                        client, user_id, concept_id, ks, credits, state, lam, m_score
+                    )
+                    # This KC's evidence just changed, so its empirical
+                    # parameters may have too. The node is already in memory, so
+                    # the freshness check is free; the recalibration itself runs
+                    # in the background after the response, and only for KCs
+                    # actually past cooldown.
+                    if calibration.is_calibration_due(kc):
+                        recalibrate_ids.add(concept_id)
             except Exception as e:  # noqa: BLE001 - degrade, still return the analysis
                 db.log_monitoring(client, "warn", "persist_state_failed", {"error": str(e)[:300]})
 
@@ -506,30 +531,39 @@ def _persistence(p_slip: float, m_score: float) -> float:
     return round(max(0.05, min(0.95, base * (0.6 + 0.4 * m_score))), 4)
 
 
-def _persist_state(client, user_id, concept_id, kc, k_before, k_after, pc, attempt, prev_state, lam, m_score) -> None:
-    """Write the updated student_concept_state: K, V, P, personal slip/lambda, trajectory."""
+def _persist_state(client, user_id, concept_id, ks, credits, prev_state, lam, m_score) -> float:
+    """Write the updated student_concept_state: K, V, P, personal slip/lambda, trajectory.
+
+    `ks` is the mastery trajectory through this session's attempts — ks[0] the
+    belief before the first attempt, ks[i + 1] the belief after credits[i] —
+    so the per-attempt estimates (slip, velocity) see the mastery each attempt
+    was actually made at. Returns the personal slip written.
+    """
     now = datetime.now(timezone.utc).isoformat()
     prev = prev_state or {}
     prev_count = prev.get("interactions_on_kc", 0) or 0
     prev_struggle = prev.get("struggle_index", 0) or 0
-    is_struggle = attempt.get("outcome") == "failure"
-    interactions = prev_count + 1
-    struggle_index = prev_struggle + (1 if is_struggle else 0)
+    interactions = prev_count + len(credits)
+    struggle_index = prev_struggle + sum(1 for c in credits if c < 0.5)
 
-    # Running average of partial credit (incremental mean).
+    # Running average of partial credit (incremental mean over all attempts).
     prev_avg = prev.get("partial_credit_avg")
-    pc_val = pc if pc is not None else (1.0 if attempt.get("outcome") == "success" else 0.0)
-    new_avg = pc_val if prev_avg is None else (prev_avg * prev_count + pc_val) / (prev_count + 1)
+    prior_n = prev_count if prev_avg is not None else 0  # no average yet: nothing to weigh
+    new_avg = ((prev_avg or 0.0) * prior_n + sum(credits)) / (prior_n + len(credits))
 
     # Cognitive vector: V = learning rate p(T); P = (1 - personal slip) modulated by M.
-    p_slip_personal = _slip_estimate(prev.get("p_slip_personal"), k_before, is_struggle)
+    p_slip_personal = prev.get("p_slip_personal")
+    v_score = prev.get("v_score")
+    for k_before, k_after, c in zip(ks, ks[1:], credits):
+        p_slip_personal = _slip_estimate(p_slip_personal, k_before, c < 0.5)
+        v_score = _velocity(v_score, k_before, k_after)
 
     row = {
         "user_id": user_id,
         "concept_id": concept_id,
-        "mastery_score_raw": round(k_after, 4),
-        "mastery_score_effective": round(k_after, 4),  # fresh signal -> no decay
-        "v_score": _velocity(prev.get("v_score"), k_before, k_after),
+        "mastery_score_raw": round(ks[-1], 4),
+        "mastery_score_effective": round(ks[-1], 4),  # fresh signal -> no decay
+        "v_score": v_score,
         "p_score": _persistence(p_slip_personal, m_score),
         "p_slip_personal": p_slip_personal,
         "partial_credit_avg": round(new_avg, 4),
@@ -539,14 +573,54 @@ def _persist_state(client, user_id, concept_id, kc, k_before, k_after, pc, attem
     }
 
     # Personal forgetting rate: if the student returns after a real gap, estimate
-    # lambda from the observed decay (stored mastery -> demonstrated level now).
-    personal_lambda = _estimate_personal_lambda(prev_state, pc_val, lam)
+    # lambda from the observed decay (stored mastery -> first demonstrated level).
+    personal_lambda = _estimate_personal_lambda(prev_state, credits[0], lam)
     if personal_lambda is not None:
         row["lambda_personal"] = round(personal_lambda, 5)
 
     db.upsert_student_concept_state(client, row)
-    db.log_trajectory(client, user_id, concept_id, k_after, k_after)
+    # One snapshot per session, not per attempt: the inconsistency detector reads
+    # this series, and within-session steps would read as oscillation.
+    db.log_trajectory(client, user_id, concept_id, ks[-1], ks[-1])
     return p_slip_personal
+
+
+def _attempt_credit(attempt: dict) -> float | None:
+    """The credit in [0, 1] an extracted attempt stands for, or None if unusable.
+
+    The outcome is the LLM's judgement and the credit its grading; when they
+    contradict, the outcome wins. The extraction template shows
+    `"partial_credit": 0.0`, and a model that copies it next to
+    outcome="success" must not have that success scored as a failure.
+    Assisted work is capped at 0.9: full credit can't come with help.
+    """
+    raw = attempt.get("partial_credit")
+    try:
+        pc = max(0.0, min(1.0, float(raw))) if raw is not None else None
+    except (TypeError, ValueError):
+        pc = None
+
+    outcome = attempt.get("outcome")
+    if outcome == "success":
+        credit = pc if pc is not None and pc >= 0.5 else 1.0
+    elif outcome == "failure":
+        credit = pc if pc is not None and pc < 0.5 else 0.0
+    elif outcome == "partial":
+        credit = pc if pc is not None else 0.5
+    else:
+        credit = pc  # unknown outcome: the grade alone, if there is one
+
+    if credit is not None and attempt.get("is_assisted"):
+        credit = min(credit, 0.9)
+    return credit
+
+
+def _session_summary(credits: list[float]) -> dict:
+    """One attempt-shaped summary of a session, for the selective-update gate."""
+    return {
+        "outcome": "failure" if any(c < 0.5 for c in credits) else "success",
+        "partial_credit": sum(credits) / len(credits),
+    }
 
 
 def _estimate_personal_lambda(prev_state: dict | None, observed_now: float, current_lambda: float):

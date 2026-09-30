@@ -29,7 +29,9 @@ def detect_root_cause(
     The root is chosen by **convergence** first, not by chain length: a weak or
     unverified concept that many failing KCs depend on is the strongest
     explanation for the struggle. Ties break on evidence (a known-weak concept
-    beats a merely-unknown one), then on depth (more foundational).
+    beats a merely-unknown one), then on depth (more foundational), then on
+    severity (the weaker concept), and finally on the label — so two identical
+    requests always get the same answer, whatever the process's hash seed.
 
     Args:
         graph: the Kernel Graph (prerequisite -> concept).
@@ -75,7 +77,12 @@ def detect_root_cause(
     def depth(r: str) -> int:
         return max((len(ch) for ch in chains.values() if ch and ch[-1] == r), default=1)
 
-    root_gap = max(candidates, key=lambda r: (convergence(r), has_evidence(r), depth(r)))
+    # `candidates` is a set: iterate it sorted, because max() keeps the first
+    # maximal element and set order changes between processes.
+    root_gap = max(
+        sorted(candidates),
+        key=lambda r: (convergence(r), has_evidence(r), depth(r), -concept_states.get(r, 0.5)),
+    )
 
     # detection_path: a real surface -> root prerequisite chain.
     detection_path = _path_to_root(graph, chains, root_gap, failing_in_graph)
@@ -136,7 +143,9 @@ def _dfs_find_root(
         return []
     visited.add(node)
 
-    prerequisites = list(graph.predecessors(node))
+    # Sorted: the first-longest chain wins ties below, and edge order comes from
+    # an unordered DB read.
+    prerequisites = sorted(graph.predecessors(node))
     if not prerequisites:
         return [node]
 

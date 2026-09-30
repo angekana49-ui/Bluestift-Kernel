@@ -9,10 +9,29 @@ services/kc_registry.py.
 """
 from __future__ import annotations
 
+import re
 import uuid
 from dataclasses import dataclass, field
 
 import pytest
+
+
+def _like_to_regex(pattern: str) -> re.Pattern:
+    """Compile a Postgres ILIKE pattern: `%` any run, `_` any one char, `\\` escapes.
+
+    Faithful on purpose — an equality stand-in would hide exactly the bug where
+    an unescaped `_` in a label matches a different label.
+    """
+    out, i = [], 0
+    while i < len(pattern):
+        ch = pattern[i]
+        if ch == "\\" and i + 1 < len(pattern):
+            out.append(re.escape(pattern[i + 1]))
+            i += 2
+            continue
+        out.append(".*" if ch == "%" else "." if ch == "_" else re.escape(ch))
+        i += 1
+    return re.compile("".join(out), re.IGNORECASE | re.DOTALL)
 
 
 def _split_top_level(expression: str) -> list[str]:
@@ -112,7 +131,7 @@ class _Query:
         return self
 
     def ilike(self, col, value):
-        self._filters.append((col, str(value).lower(), "ilike"))
+        self._filters.append((col, _like_to_regex(str(value)), "ilike"))
         return self
 
     def in_(self, col, values):
@@ -149,7 +168,7 @@ class _Query:
         for col, value, kind in self._filters:
             cell = row.get(col) if col is not None else None
             if kind == "ilike":
-                if str(cell).lower() != value:
+                if cell is None or not value.fullmatch(str(cell)):
                     return False
             elif kind == "in":
                 if cell not in value:

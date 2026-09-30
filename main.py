@@ -372,7 +372,16 @@ async def update_concept_state(
 
     state = db.load_student_concept_state(client, req.user_id, concept_id)
     params = bkt.get_bkt_params(node)
-    k_raw_prev = (state.get("mastery_score_raw") if state else None) or params["p_init"]
+    stored = state.get("mastery_score_raw") if state else None
+    # Update the belief the Kernel holds NOW — decayed since the last signal, as
+    # /load_profile shows it — not the stale stored value. (`is None`, not `or`:
+    # a stored 0.0 is a real, very low mastery, not a missing one.)
+    k_raw_prev = params["p_init"] if stored is None else forgetting.compute_effective_mastery(
+        stored,
+        node.get("type_kc", "conceptual"),
+        state.get("last_strong_signal_at"),
+        lambda_override=forgetting.get_lambda(node, state),
+    )
 
     # Assisted attempts are capped at 0.9 — full credit can't come with help.
     pc = min(req.partial_credit_score, 0.9) if req.is_assisted else req.partial_credit_score
@@ -416,7 +425,9 @@ async def update_concept_state(
         k_raw, node.get("type_kc", "conceptual"), now,
         lambda_override=forgetting.get_lambda(node, state),
     )
-    status = bkt.classify_status(k_eff, params["p_slip"], new_avg)
+    # The student's own slip, as /load_profile and /analyze use — otherwise this
+    # response and the next profile read disagree on whether the KC is mastered.
+    status = bkt.classify_status(k_eff, p_slip_personal, new_avg)
 
     # Fire-and-forget empirical recalibration, but only if this KC is past its
     # cooldown: recalibration reads every student's state for the KC, and a
