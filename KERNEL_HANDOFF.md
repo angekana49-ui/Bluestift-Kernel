@@ -318,7 +318,21 @@ behave differently.
    attempt, per student. **Add it to the GDPR erasure and export lists**
    (`lib/compliance/erasure.ts`, `lib/compliance/export.ts`, next to
    `student_concept_state` and `learning_trajectories`).
-9. **Apply migration 011 before deploying** this Kernel version.
+9. **Apply migrations 011 and 012 before deploying** this Kernel version.
+10. **Concurrent requests for one student are safe.** They are served first come,
+    first served, and each state write is compare-and-set on a version (a chain),
+    so a graded attempt landing while a conversation is analysed no longer erases
+    either one. Nothing to do app-side; retries are safe.
+11. **`/load_profile` concept states carry three new fields:**
+    - `tau` (0.5 neutral) is the KC's rigour: how exact it must be to count as
+      known. Use it for the EMT entry point: at the same K, a rigorous KC warrants
+      an earlier worked example.
+    - `review_count` and `lapse_count` count successful and failed retrievals
+      after a gap. Forgetting slows with each review.
+12. **M means something different.** It still starts from the conversation
+    reading, but "abandon after an error" is now measured (was a failure retried?),
+    and it blends in the student's measured learning dynamics. It never uses
+    their level. A struggling student who keeps trying is **not** "fixed".
 
 ---
 

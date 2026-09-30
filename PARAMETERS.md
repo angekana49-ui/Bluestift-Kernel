@@ -35,8 +35,22 @@ commit message.
 | `MAX_SLIP_FOR_MASTERY` | 0.15 | design — no published value for K-12 | link to held-out performance once available |
 | `MIN_PARTIAL_CREDIT_AVG` | 0.7 | design | same |
 | `RECENT_AUTONOMOUS_WINDOW` | 3 | design — "the last 3 autonomous attempts" (from the Bluestift corpus condensate) | same |
+| `MASTERY_TAU_SLOPE` | 0.10 | design — rigour moves the mastery threshold: 0.93 at τ 0.3, 0.95 at 0.5, 0.98 at 0.8 | outcomes on held-out checks |
 | `GAP_THRESHOLD` | 0.4 | design — display label only ("gap" vs "partial") | — |
 | `PARTIAL_CREDIT_BINS` | 0, 0.3, 0.6, 0.7, 0.8, 1.0 | prior, **to verify** — the grading scale reported by graders (Ostrow & Heffernan 2015). The update takes any credit in [0, 1] and does not snap to it. | — |
+
+### τ — the KC's rigour
+
+τ ∈ [0, 1] says how **exact** a KC must be to count as known. It is inferred with the KC from its type and target level, and 0.5 is neutral. **At τ = 0.5 every rule reduces exactly to the rule without τ.** τ only acts on rules we own, never on a parameter fitted to data:
+
+| Rule | Formula | At τ 0.3 / 0.5 / 0.8 |
+|---|---|---|
+| What a partial answer is worth (`rigor_credit`) | credit^(2τ) | a 0.7 answer counts 0.81 / 0.70 / 0.56 |
+| Mastery threshold (`mastery_threshold`) | 0.95 + 0.10·(τ − 0.5) | 0.93 / 0.95 / 0.98 |
+| Forgetting prior (`forgetting.base_lambda`, level 3 only) | λ_type · (1 + (τ − 0.5)) | ×0.8 / ×1 / ×1.3 |
+| EMT entry point | exposed in `/load_profile` for RAYA | — |
+
+All [design]. Full success and full failure are never changed by τ.
 
 **Model choices, not constants:**
 
@@ -48,14 +62,19 @@ commit message.
 
 K_effective = floor + (K_raw − floor) · e^(−λ·Δt), where floor = the KC's p_init. A K below the floor is left alone.
 
+Forgetting depends on **days and reviews**: λ = base_λ · 2^(−max(0, 0.5·reviews − 0.5·lapses)). A *review* is a successful autonomous first attempt after ≥ 1 day without practice; a *lapse* is a failed one. Each review multiplies the half-life by √2, and a lapse cancels a review. Lapses never make a student forget faster than their base rate; the personal λ covers that case. This is the counts-based form of half-life regression (Settles & Meeder 2016); the spacing effect itself goes back to Ebbinghaus (see Cepeda et al. 2006).
+
 | Constant | Value | Provenance | Replaced by |
 |---|---|---|---|
 | `LAMBDA_PRIORS.procedural` | 0.01 /day (half-life ≈ 69 days) | design — the ordering "facts fade faster than procedures" follows the retention literature; the values are ours | KC `lambda_decay` from the average of personal λ (`compute_empirical_kc_params`) |
 | `LAMBDA_PRIORS.conceptual` | 0.02 /day (≈ 35 days) | design | same |
 | `LAMBDA_PRIORS.declarative` | 0.05 /day (≈ 14 days) | design | same |
 | `MIN_INTERACTIONS_FOR_EMPIRICAL` | 10 | design | — |
+| `REVIEW_GAIN`, `LAPSE_PENALTY` | 0.5, 0.5 half-lives | design | half-life regression weights fitted on `learning_events` |
+| `REVIEW_MIN_GAP_DAYS` | 1 | design — a retrieval the same day tests short-term memory, not retention | — |
+| `TAU_LAMBDA_SLOPE` | 1.0 | design — rigour scales the forgetting prior | — |
 
-Known limit: a constant λ ignores the spacing effect (each review slows forgetting). The reference model for that is half-life regression (Settles & Meeder 2016). It is the target once the data exists.
+The personal λ is stored as a **base** rate (reviews are applied on top of it, never baked in).
 
 ## Calibration — `core/calibration.py`
 
@@ -91,11 +110,15 @@ Known limit: a constant λ ignores the spacing effect (each review slows forgett
 
 | Constant | Value | Provenance |
 |---|---|---|
-| `W_ABANDON` (on 1 − abandon), `W_PERSISTENCE`, `W_TIME`, `W_QUALITY` | 0.35, 0.30, 0.20, 0.15 | design — from the Bluestift corpus condensate. The signals are read by the extraction LLM from the text; it cannot measure time on task. |
+| `W_ABANDON` (on 1 − abandon), `W_PERSISTENCE`, `W_TIME`, `W_QUALITY` | 0.35, 0.30, 0.20, 0.15 | design — the corpus formula. **Abandon after an error is measured** in the conversation (was a failure followed by another try on the same KC?) whenever there was an error; the other three are read by the extraction LLM, which cannot measure time on task. |
+| `W_MEASURED` | learning speed 0.30, progression 0.30, recovery after error 0.20, stability (1 − slip) 0.20 | design — the Kernel's own traces, renormalised over the ones available |
+| `MEASURED_HALF_WEIGHT_AT`, `MAX_MEASURED_SHARE` | 5 data points, 0.5 | design — the measured share grows with its evidence; the conversation always keeps half |
 | `GAIN` | 6.0 | design — spreads the score over [~0.05, ~0.95] |
 | `EMA_WEIGHT` | 0.3 | design — symmetric. The condensate's "degrades fast, rebuilds slowly" is a hypothesis, not implemented. |
 | `M_FLOOR`, `M_CEIL` | 0.05, 0.95 | design |
 | labels | growth ≥ 0.66, fixed ≤ 0.40 | design |
+
+**Not inputs of M, on purpose: the level K and the forgetting rate.** They measure ability and memory; feeding them into M would label a weak or forgetful student "fixed mindset" for their level, the stereotype-threat mechanism the corpus warns about. M reads *dynamics* (how the student reacts to difficulty, whether they improve), never *level*.
 
 Caveat: mindset interventions have small average effects (Sisk et al. 2018, d ≈ 0.08). M is a behavioural proxy, not a validated measure of Dweck's construct.
 
@@ -119,6 +142,14 @@ All design, and every one is to be calibrated on real alert outcomes:
 - inconsistency > 0.40 over up to 20 snapshots, from 6 onwards (the 0.40 and the 20-interaction window come from Hooshyar, to verify)
 - OOD deviation 0.4, from 3 KCs onwards
 
+## State chain — `services/serial.py`, migration 012
+
+| Constant | Value | Provenance |
+|---|---|---|
+| `MAX_CHAIN_RETRIES` | 3 | design — recomputations of a write rejected as stale before giving up (the evidence stays logged) |
+
+Requests for one student are served first come, first served (a FIFO queue per student in the process), and every state write is the next block of its chain: accepted only from the `version` it was read at.
+
 ## Cost bounds
 
 | Constant | Value | Where |
@@ -127,6 +158,3 @@ All design, and every one is to be calibrated on real alert outcomes:
 | `MAX_LLM_CALLS_PER_REQUEST` | 6 | `services/kc_registry.py` — KC inference per request |
 | rate limits | 30 per student per hour, 300 per hour overall | `core/ratelimit.py` |
 
-## Declared but not used
-
-- **τ (`tau`)** is stored per KC. The condensate says it should modulate the mastery threshold, the update speed, λ and the EMT entry point. None of that is implemented. Define it before using it.

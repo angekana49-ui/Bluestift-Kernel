@@ -159,7 +159,11 @@ est un point de départ, remplacé à terme par nos données (EM sur
 - **Tension 2** ⚠️ : « dès que N élèves font la même erreur → garde-fou
   automatique » contredit ton propre principe de validation humaine par
   l'enseignant.
-- **Tension 3** ❌ : voir §1.4, le gate est supprimé.
+- **Tension 3** ❌ : voir §1.4, le gate est supprimé. 🔧 La concurrence est
+  réglée « comme une blockchain » : file FIFO par élève (premier arrivé,
+  premier servi) et état versionné (chaque écriture est le bloc suivant ;
+  une écriture calculée sur un état périmé est rejetée et recalculée).
+  `learning_events` est le registre.
 - **Tension 4** ❌ **La formule de M est fausse, dans deux sens.**
   - Le signe de l'abandon est inversé : un élève qui abandonne plus obtient un M
     plus élevé.
@@ -169,16 +173,37 @@ est un point de départ, remplacé à terme par nos données (EM sur
   - « Dégradation rapide, reconstruction lente » est une hypothèse, pas du Dweck.
   - 🔧 Corrigé dans le code : sigmoïde centrée, gain 6, moyenne mobile
     symétrique 0.3.
+  - 🔧 **M est désormais mesuré.**
+    - « Abandon post-erreur » est mesuré dans la conversation (un échec est-il
+      suivi d'un nouvel essai ?).
+    - Ta formule est combinée à la dynamique d'apprentissage mesurée : V, la
+      progression de K entre sessions, la récupération après erreur, P sans M
+      (1 − slip, pour éviter la circularité, puisque P dépend de M).
+    - La part mesurée croît avec les données et plafonne à 50 %.
+  - ⚠️ **Choix assumé : ni K ni l'oubli n'entrent dans M.** Ils mesurent le niveau
+    et la mémoire, pas la croyance. Les y mettre étiquetterait « fixed » un élève
+    faible ou qui oublie vite, à cause de son niveau : c'est exactement le
+    mécanisme de menace du stéréotype (§2.7).
 
 ## §6 Lacunes
 
 - **Lacune 2 (oubli)** ⚠️ : K × e^(−λΔt) tend vers 0 alors que K est une
   probabilité. L'élève qui a su puis oublié passait sous celui qui n'a jamais vu
   le concept. 🔧 Le Kernel décroît désormais vers p_init. Les λ (demi-vies de 69 /
-  35 / 14 jours) sont nos choix. Cible : l'effet d'espacement (half-life
-  regression, Settles & Meeder 2016).
-- **Lacune 3 (τ)** ⚠️ : 🔧 τ est stocké mais n'est utilisé nulle part. Le définir
-  avant de l'utiliser.
+  35 / 14 jours) sont nos choix. 🔧 **L'oubli dépend des jours ET des
+  révisions** : chaque récupération autonome réussie après ≥ 1 jour multiplie la
+  demi-vie par √2, un échec (lapse) l'annule. C'est la forme par comptage de la
+  half-life regression (Settles & Meeder 2016), à ajuster sur `learning_events`.
+- **Lacune 3 (τ)** ✅ 🔧 Implémenté, neutre à 0.5 (toutes les règles y retombent
+  sur l'ancien comportement). τ module :
+  - ce que vaut une réponse partielle (crédit^(2τ)), c'est la « vitesse de mise
+    à jour » ;
+  - le seuil de maîtrise (0.93 → 0.98) ;
+  - le prior de λ ;
+  - et il est exposé à RAYA pour le point d'entrée EMT.
+
+  Il ne touche jamais un paramètre ajusté sur les données (p_transit reste
+  calibré par EM).
 - **Lacune 4 (langue)** : 🔧 implémenté depuis l'audit. Un échec dû à un blocage
   linguistique ne compte pas contre K ; un échec ambigu compte pour moitié.
   ⚠️ « Anglais = langue pivot » : les labels et les prompts sont en français.

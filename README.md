@@ -22,7 +22,8 @@ Given a student↔RAYA conversation, the Kernel:
 1. **Extracts** the knowledge components (KCs) mentioned, the attempts, and
    behavioural signals (LLM).
 2. **Creates KCs on the fly** for any subject — the graph is open, not a fixed list.
-3. **Decays** stored mastery over time (exponential forgetting towards the KC's prior).
+3. **Decays** stored mastery over time (exponential forgetting towards the KC's
+   prior), more slowly for every successful spaced review.
 4. **Updates** the cognitive vector with Bayesian Knowledge Tracing on every
    attempt, in order: partial credit as soft evidence, assisted attempts as a
    weaker observation, failures caused by a linguistic block not counted.
@@ -32,7 +33,9 @@ Given a student↔RAYA conversation, the Kernel:
 6. **Detects anomalies** (false mastery, passive dependency, cognitive overload,
    fixed mindset, re-emergence errors) for pedagogical safety.
 7. **Explains** the gap in one learner-friendly sentence.
-8. **Logs** everything to Supabase and returns a structured analysis.
+8. **Logs** everything to Supabase and returns a structured analysis. A student's
+   state changes one request at a time (first come, first served), each write
+   the next block of a versioned chain, so concurrent requests lose no evidence.
 
 Its parameters are **living**: BKT and decay values start from literature priors,
 then self-calibrate from real data. Every attempt is logged in
@@ -55,7 +58,7 @@ Each KC, per student, carries a four-dimensional state (Luckin / corpus §1.2):
 | **K** | Mastery probability | BKT p(L); dual mastery criterion (K ≥ 0.95 AND low slip AND mean credit ≥ 0.7 on the last 3 **autonomous** attempts) |
 | **V** | Learning rate (individualised p(T), Yudelson) | smoothed fraction of the remaining mastery gap closed per trial — stored, not yet used in inference |
 | **P** | Persistence / resistance to slip | (1 − personal p(S)), modulated by mindset M — our construction; stored, not yet used in inference |
-| **M** | Mindset (Dweck) | sigmoid of behavioural signals, bounded to [0.05, 0.95]; global per student |
+| **M** | Mindset (Dweck) | the corpus formula on the conversation (abandon after error **measured**), blended with the Kernel's measured learning dynamics (V, progression, recovery after error, stability) — never with the level K; bounded to [0.05, 0.95]; global per student |
 
 ---
 
@@ -87,9 +90,9 @@ Each KC, per student, carries a four-dimensional state (Luckin / corpus §1.2):
 │   ├── build_bridges.py     # CLI: generate cross-subject prerequisite bridges
 │   ├── apply_migrations.py  # CLI: apply migrations via the Management API
 │   └── eval_kernel.py       # Synthetic-student benchmark (root-gap recall/precision)
-├── migrations/              # 11 numbered Supabase SQL migrations
+├── migrations/              # 12 numbered Supabase SQL migrations
 ├── conftest.py              # In-memory fake Supabase for tests
-├── test_kernel.py           # 132 tests
+├── test_kernel.py           # 142 tests
 ├── PARAMETERS.md            # Provenance of every constant
 ├── requirements.txt / requirements-dev.txt
 └── railway.toml            # Deploy config + the cost rules that keep it cheap
@@ -237,7 +240,7 @@ The chain never crashes `/analyze`: Groq → Gemini, and only raises if both fai
 
 ### Database migrations
 
-Apply the eleven SQL files **in order** in the Supabase SQL editor (or via the
+Apply the twelve SQL files **in order** in the Supabase SQL editor (or via the
 Management API with `scripts/apply_migrations.py`):
 
 ```
@@ -252,12 +255,15 @@ Management API with `scripts/apply_migrations.py`):
 009_shared_db_hardening.sql       # re-assert exposed schemas + grants (shared DB)
 010_school_curriculum_layers.sql  # school layer types + payloads (School -> AI -> Student)
 011_learning_events.sql           # one row per graded attempt (BKT fitting) + recent autonomous credits
+012_state_chain.sql               # state version (chain height) + review/lapse counts (spacing)
 ```
 
-> **Deploy 011 before the code that uses it.** Without it, state writes still
+> **Deploy 011 and 012 before the code that uses them.** Without it, state writes still
 > land (the new column is dropped and a `state_write_without_011_columns`
 > warning is logged), but no learning events are recorded, so nothing can be
-> calibrated.
+> calibrated. Without 012, writes fall back to a plain upsert
+> (`state_write_without_chain`): the in-process queue still orders requests,
+> but several instances could overwrite each other again.
 
 > **Shared DB:** the Kernel shares its Supabase project with the RAYA app. If the
 > app's setup ever drops `kernel` from the exposed schemas or resets grants,
@@ -382,8 +388,8 @@ detector change needed; the convergence search crosses the bridge automatically.
 pytest -q
 ```
 
-132 tests. The suite mocks the LLM and uses an in-memory fake Supabase
-(`conftest.py`, with real ILIKE semantics), so **no network or real keys are
+142 tests. The suite mocks the LLM and uses an in-memory fake Supabase
+(`conftest.py`, with real ILIKE semantics and the real UNIQUE constraints), so **no network or real keys are
 required**. Coverage: BKT (soft evidence, bounds, assisted attempts, blocage
 rules), forgetting, mindset, detector (convergence, determinism, cycles),
 calibration (personal λ, EM parameter recovery), the cognitive vector
