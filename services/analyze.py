@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from core import anomaly, bkt, calibration, curriculum, detector, forgetting, mindset
 from core.graph import build_graph, node_id
 from services import db
-from services.kc_registry import _normalize_label, get_or_create_kc
+from services.kc_registry import LLMBudget, _normalize_label, get_or_create_kc
 from services.llm import extract_json, llm_call
 
 EXTRACTION_PROMPT = """\
@@ -226,6 +226,7 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
     # 2. Resolve each mentioned KC, creating unknown ones on the fly. The
     #    registry canonicalises labels, so remember which raw spelling became
     #    which KC — the attempts below name KCs in the LLM's spelling, not ours.
+    kc_budget = LLMBudget()  # one allowance of KC-inference calls for the whole request
     resolved: dict[str, dict] = {}  # canonical label -> concept_nodes row
     canonical: dict[str, str] = {}  # normalized raw label -> canonical label
     for mention in extraction.get("kcs_mentioned", []):
@@ -237,6 +238,7 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
             subject=mention.get("subject", subject),
             level=mention.get("level", level),
             supabase_client=client,
+            budget=kc_budget,
         )
         resolved[kc["label"]] = kc
         canonical[_normalize_label(label)] = kc["label"]
@@ -251,7 +253,8 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
         label = canonical.get(_normalize_label(raw))
         if label is None:
             kc = await get_or_create_kc(
-                label=raw, subject=subject, level=level, supabase_client=client
+                label=raw, subject=subject, level=level, supabase_client=client,
+                budget=kc_budget,
             )
             label = kc["label"]
             resolved[label] = kc
@@ -410,7 +413,9 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
     #     Best-effort throughout — no school, or a school with bad JSON, must land
     #     the student on exactly the analysis they'd get without one.
     layers = _load_curriculum_layers(client, user_id, subject, level)
-    rec_path = detector.recommended_path(graph, root_gap, priorities=layers.weights)
+    rec_path = detector.recommended_path(
+        graph, root_gap, priorities=layers.weights, detection_path=detection_path
+    )
 
     # 8. Natural-language summary.
     surface = detection_path[0] if detection_path else (failing[0] if failing else "")

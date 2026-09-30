@@ -205,11 +205,16 @@ def recommended_path(
     root_gap: str | None,
     max_len: int = 4,
     priorities: dict[str, float] | None = None,
+    detection_path: list[str] | None = None,
 ) -> list[str]:
     """Suggest a remediation order: root gap first, then its dependents upward.
 
-    A short forward walk from the root gap through the concepts that build on it,
-    giving RAYA a concrete sequence to rebuild from the foundation.
+    When the diagnosis has a detection path (surface -> root), the remediation
+    climbs it back (root -> surface): those are the concepts standing between
+    the foundation and what the student is actually stuck on. A free walk from
+    the root could wander off towards an unrelated dependent — it used to pick
+    the alphabetically first one. Beyond the path, or without one, the walk
+    continues forward through the concepts that build on the last step.
 
     `priorities` is the school's per-concept weighting (see core/curriculum.py).
     It only ever chooses *between* concepts that are already valid next steps —
@@ -220,9 +225,12 @@ def recommended_path(
         return [] if not root_gap else [root_gap]
 
     weights = priorities or {}
-    path = [root_gap]
-    current = root_gap
-    visited = {root_gap}
+    climb = list(reversed(detection_path or []))
+    if not climb or climb[0] != root_gap:
+        climb = [root_gap]
+    path = climb[:max_len]
+    current = path[-1]
+    visited = set(path)
     while len(path) < max_len:
         successors = [s for s in graph.successors(current) if s not in visited]
         if not successors:

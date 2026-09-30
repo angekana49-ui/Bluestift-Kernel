@@ -12,8 +12,13 @@ import networkx as nx
 def build_graph(nodes: list[dict], edges: list[dict]) -> nx.DiGraph:
     """Build a DiGraph from concept_nodes + concept_edges rows.
 
-    Nodes are keyed by their `label` (snake_case, unique per subject in practice).
-    Each node keeps a copy of its DB row in attributes. Each edge points from the
+    Nodes are keyed by their `label`, the KC's identity across the API. The DB
+    only enforces UNIQUE(label, subject), so rows created before the registry
+    made labels global can share a label. Those collapse onto one node: the
+    OLDEST row owns the attributes (and so the id), deterministically — it used
+    to be whichever row the DB returned last — and every duplicate is listed in
+    `graph.graph["duplicate_labels"]` so it can be merged in the data. Edges of
+    all duplicates are kept on the shared node. Each edge points from the
     prerequisite to the dependent concept.
 
     Args:
@@ -21,12 +26,16 @@ def build_graph(nodes: list[dict], edges: list[dict]) -> nx.DiGraph:
         edges: rows from kernel.concept_edges, with concept_id/prerequisite_id.
     """
     graph = nx.DiGraph()
+    graph.graph["duplicate_labels"] = {}
 
     # Map id -> label so edges (stored by id) can be wired by label.
     id_to_label: dict[str, str] = {}
-    for node in nodes:
+    for node in sorted(nodes, key=lambda n: (str(n.get("created_at") or ""), str(n["id"]))):
         label = node["label"]
         id_to_label[node["id"]] = label
+        if label in graph:
+            graph.graph["duplicate_labels"].setdefault(label, [graph.nodes[label]["id"]]).append(node["id"])
+            continue
         graph.add_node(label, **node)
 
     for edge in edges:

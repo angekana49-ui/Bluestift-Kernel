@@ -2316,3 +2316,60 @@ def test_recalibration_fits_bkt_params_from_logged_evidence(fake_supabase, monke
     assert node["last_calibration_at"]
     for name, value in truth.items():
         assert abs(node[name] - value) < abs(bkt.BKT_PRIORS[name] - value), name
+
+
+def test_recommended_path_climbs_back_to_where_the_student_is_stuck():
+    # racine -> algebre -> equations (the student is stuck on equations), and
+    # racine -> aaa_unrelated. The old walk took the alphabetically first
+    # dependent and led away from the problem.
+    nodes = [{"id": x, "label": x} for x in ("racine", "algebre", "equations", "aaa_unrelated")]
+    edges = [
+        {"prerequisite_id": "racine", "concept_id": "algebre"},
+        {"prerequisite_id": "algebre", "concept_id": "equations"},
+        {"prerequisite_id": "racine", "concept_id": "aaa_unrelated"},
+    ]
+    g = build_graph(nodes, edges)
+    path = detector.recommended_path(g, "racine", detection_path=["equations", "algebre", "racine"])
+    assert path == ["racine", "algebre", "equations"]
+
+
+async def test_one_label_is_one_kc_across_subjects(fake_supabase, monkeypatch):
+    # A physics conversation about vecteurs practises the maths KC, instead of
+    # creating a second "vecteurs" node the graph would silently merge.
+    fake_supabase.seed("kernel.concept_nodes", [{"id": "v", "label": "vecteurs", "subject": "MATH"}])
+    monkeypatch.setattr(kc_registry, "llm_call", _extraction_llm({}))
+    kc = await kc_registry.get_or_create_kc("vecteurs", "PHYSICS", "lycee", fake_supabase)
+    assert kc["id"] == "v"
+    assert len(fake_supabase.tables["kernel.concept_nodes"]) == 1
+
+
+def test_build_graph_resolves_legacy_duplicate_labels_deterministically():
+    nodes = [
+        {"id": "new", "label": "vecteurs", "subject": "PHYSICS", "created_at": "2026-08-01T00:00:00Z"},
+        {"id": "old", "label": "vecteurs", "subject": "MATH", "created_at": "2026-07-01T00:00:00Z"},
+        {"id": "f", "label": "forces", "subject": "PHYSICS", "created_at": "2026-08-01T00:00:00Z"},
+    ]
+    edges = [{"prerequisite_id": "new", "concept_id": "f"}]
+    for order in (nodes, list(reversed(nodes))):
+        g = build_graph(order, edges)
+        assert g.nodes["vecteurs"]["id"] == "old"
+        assert g.graph["duplicate_labels"] == {"vecteurs": ["old", "new"]}
+        assert g.has_edge("vecteurs", "forces")  # the duplicate's edges survive
+
+
+async def test_kc_creation_cascade_is_bounded(fake_supabase, monkeypatch):
+    # Every inferred KC claims three brand-new prerequisites: unbounded, one
+    # unknown concept costs 40 sequential LLM calls on the request path.
+    calls = {"n": 0}
+
+    async def fanout(prompt, max_tokens=1000):
+        calls["n"] += 1
+        return json.dumps({"type_kc": "conceptual",
+                           "prerequisites": [f"p{calls['n']}_{i}" for i in range(3)]}), "mock"
+
+    monkeypatch.setattr(kc_registry, "llm_call", fanout)
+    kc = await kc_registry.get_or_create_kc("tout_nouveau", "MATH", "lycee", fake_supabase)
+    assert kc["label"] == "tout_nouveau"
+    assert calls["n"] == kc_registry.MAX_LLM_CALLS_PER_REQUEST
+    # The KCs past the budget still exist, with neutral metadata.
+    assert len(fake_supabase.tables["kernel.concept_nodes"]) > calls["n"]

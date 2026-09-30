@@ -68,14 +68,55 @@ def _bounded(value, default: float, lo: float, hi: float) -> float:
 
 
 def _find_kc(client, norm: str, subject: str) -> dict | None:
-    existing = (
+    """The KC with this label, in ANY subject — preferring the requested one.
+
+    The label is the KC's identity everywhere downstream: the graph is keyed by
+    it, and so are mastery_map, detection_path and recommended_path. The DB
+    only enforces UNIQUE(label, subject), so a second "vecteurs" under PHYSICS
+    used to become a second node that the graph then silently merged with the
+    MATH one (attributes overwritten, ids crossed). One label, one KC: a
+    physics conversation about vecteurs practises the same concept.
+    """
+    rows = (
         _kernel(client, "concept_nodes")
         .select("*")
         .ilike("label", _escape_like(norm))
-        .eq("subject", subject)
         .execute()
-    )
-    return existing.data[0] if existing.data else None
+    ).data or []
+    if not rows:
+        return None
+    return min(rows, key=lambda r: (r.get("subject") != subject, str(r.get("created_at") or ""), str(r["id"])))
+
+
+# [design] LLM calls one request may spend inferring new KCs. Depth 3 with 3
+# prerequisites each is up to 1 + 3 + 9 + 27 = 40 sequential calls (each with
+# its own retries) for a single unknown concept — minutes on the request path.
+# Past the budget a KC is still created, with neutral metadata and no inferred
+# prerequisites; scripts/build_graph.py fills the structure in offline.
+MAX_LLM_CALLS_PER_REQUEST = 6
+
+
+class LLMBudget:
+    """A per-request allowance of KC-inference LLM calls, shared by recursion."""
+
+    def __init__(self, calls: int = MAX_LLM_CALLS_PER_REQUEST):
+        self.remaining = calls
+
+    def take(self) -> bool:
+        if self.remaining <= 0:
+            return False
+        self.remaining -= 1
+        return True
+
+
+def _fallback_kc_data(label: str) -> dict:
+    return {
+        "type_kc": "conceptual",
+        "lambda_decay": 0.02,
+        "description": f"Concept: {label}",
+        "prerequisites": [],
+        "tau": 0.5,
+    }
 
 
 async def get_or_create_kc(
@@ -84,35 +125,35 @@ async def get_or_create_kc(
     level: str,
     supabase_client,
     depth: int = 0,
+    budget: LLMBudget | None = None,
 ) -> dict:
     """Find a KC in the DB; create it (and its prerequisites) via LLM if absent.
 
-    Recursion is bounded at MAX_DEPTH to avoid infinite prerequisite chains.
+    Recursion is bounded at MAX_DEPTH to avoid infinite prerequisite chains,
+    and the LLM calls by `budget` — pass one budget for a whole request.
 
     Returns the concept_nodes row (existing or newly created).
     """
     norm = _normalize_label(label)
+    budget = budget or LLMBudget()
 
-    # 1. Look up by label (case-insensitive) within the subject.
+    # 1. Look up by label (case-insensitive), in any subject.
     found = _find_kc(supabase_client, norm, subject)
     if found:
         return found
 
     # 2. Infer the KC's metadata via the LLM (with a safe fallback).
-    prompt = INFER_PREREQUISITES_PROMPT.format(label=label, subject=subject, level=level)
-    try:
-        response_text, _llm_used = await llm_call(prompt)
-        kc_data = extract_json(response_text)
-        if not isinstance(kc_data, dict):
-            raise ValueError("expected object")
-    except Exception:  # noqa: BLE001 - degrade gracefully on bad LLM output
-        kc_data = {
-            "type_kc": "conceptual",
-            "lambda_decay": 0.02,
-            "description": f"Concept: {label}",
-            "prerequisites": [],
-            "tau": 0.5,
-        }
+    kc_data = _fallback_kc_data(label)
+    if budget.take():
+        prompt = INFER_PREREQUISITES_PROMPT.format(label=label, subject=subject, level=level)
+        try:
+            response_text, _llm_used = await llm_call(prompt)
+            parsed = extract_json(response_text)
+            if not isinstance(parsed, dict):
+                raise ValueError("expected object")
+            kc_data = parsed
+        except Exception:  # noqa: BLE001 - degrade gracefully on bad LLM output
+            pass
 
     # 3. Insert the new KC.
     type_kc = kc_data.get("type_kc")
@@ -148,6 +189,7 @@ async def get_or_create_kc(
                 level=level,
                 supabase_client=supabase_client,
                 depth=depth + 1,
+                budget=budget,
             )
             if prereq["id"] == created_kc["id"]:
                 continue  # guard against self-loops
