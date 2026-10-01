@@ -130,6 +130,36 @@ _FALLBACK = {
 }
 
 
+# Function words, by language: frequent, short, and rarely shared. Enough to
+# tell which of the app's languages a learner writes in, without a model.
+_FUNCTION_WORDS = {
+    "en": {"the", "and", "is", "it", "you", "what", "i", "my", "to", "of", "so", "but", "that", "do", "can", "just", "how", "don't", "i'm"},
+    "fr": {"le", "la", "les", "et", "est", "je", "tu", "que", "pas", "une", "des", "du", "pour", "mais", "c'est", "j'ai", "comment", "pourquoi"},
+    "es": {"el", "los", "las", "y", "es", "que", "yo", "pero", "por", "una", "para", "como", "qué", "porque", "tengo"},
+    "de": {"der", "die", "das", "und", "ist", "ich", "nicht", "ein", "eine", "aber", "wie", "was", "warum", "habe"},
+}
+
+
+def _student_language(history: list[dict]) -> str | None:
+    """The language the learner writes in, when their own words make it plain.
+
+    The extraction model reads that from a French prompt and, now and then,
+    answers "fr" for an English conversation: 1 analysis in 8 in a local run,
+    after the prompt had already been made explicit. Counting function words in
+    the learner's messages is free and does not drift; it decides when it is
+    clear (enough hits, and well ahead), and leaves the model's answer alone
+    otherwise.
+    """
+    import re
+
+    words = re.findall(r"[a-zà-ÿ']+", " ".join(
+        str(m.get("content") or "") for m in history if m.get("role") == "user").lower())
+    counts = {lang: sum(w in vocab for w in words) for lang, vocab in _FUNCTION_WORDS.items()}
+    ranked = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
+    (best, top), (_, second) = ranked[0], ranked[1]
+    return best if top >= 3 and top >= 2 * second else None
+
+
 def _summary_language(langue: str | None) -> str:
     code = (langue or "").strip().lower()
     return code if code in LANGUAGE_NAMES else DEFAULT_SUMMARY_LANGUAGE
@@ -261,7 +291,7 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
     #    including cross-subject references (e.g. a physics chat mentioning maths).
     known_labels = db.load_labels_by_subject(client)
     extraction, llm_used = await extract_kcs(conversation, subject, level, known_labels)
-    langue = extraction.get("langue_interaction", "fr")
+    langue = _student_language(conversation) or extraction.get("langue_interaction", "fr")
 
     # 2. Resolve each mentioned KC, creating unknown ones on the fly. The
     #    registry canonicalises labels, so remember which raw spelling became
@@ -487,6 +517,14 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
     #     RAYA asks it and sends the answer to /update_concept_state; the next
     #     analysis reads it back through the student's history above.
     probe = active_probe.choose_probe(graph, failing, all_states, known, weak_below, root_gap)
+    # A question that does not check the root itself is only worth asking about
+    # something this conversation is already on. Run end to end, one on integer
+    # addition, asked during a fractions and then an equations session, took
+    # both sessions off course twice out of two, and the wrong answers it drew
+    # pulled the diagnosis towards integers. A root-checking question is the
+    # point of probing, and stays.
+    if probe and not probe.get("confirms_root") and probe.get("label") not in mastery_map:
+        probe = None
 
     # 7b. School layer: if the student belongs to a school, its curriculum layers
     #     shape the sequencing and its objectives are reported against real state.
@@ -523,7 +561,8 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
         # for it after responding; the next analysis can descend into it.
         "deepen": (
             {"label": root_gap, "subject": subject, "level": level}
-            if deepening.should_deepen(graph, root_gap, failing) else None
+            if deepening.should_deepen(graph, root_gap, failing) and deepening.claim_for_learner(user_id)
+            else None
         ),
     }
 

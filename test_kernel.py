@@ -3046,6 +3046,7 @@ async def test_deepen_does_nothing_without_migration_014(fake_supabase, monkeypa
 
 
 def test_analyze_asks_to_deepen_a_failing_root_and_the_route_schedules_it(fake_supabase, monkeypatch):
+    deepening._recent.clear()  # the per-learner brake is process-wide
     fake_supabase.seed("kernel.concept_nodes", [{"id": "f", "label": "fractions", "subject": "MATH"}])
     out = asyncio.run(_analyze(fake_supabase, monkeypatch, {
         "kcs_mentioned": [{"label": "fractions", "subject": "MATH"}],
@@ -3068,3 +3069,69 @@ async def test_an_existing_concept_goes_below_only_if_both_models_agree(fake_sup
     report = await deepening.deepen(fake_supabase, "fractions_egales_et_operations", "MATH", "cycle3")
     assert report["added"] == ["sens_du_denominateur"]  # new and finer: no vote needed
     assert len(asked) == 2 and "slope" in asked[0], "grounded on the description"
+
+
+# --------------------------------------------------------------------------- #
+# Guards on a graph that grows by itself
+# --------------------------------------------------------------------------- #
+def test_one_idea_one_kc_whatever_the_wording():
+    w = kc_registry._canonical_words
+    assert w("multiplication_concept") == w("multiplication") == w("notion_de_multiplication")
+    assert w("fractions") == w("fraction")
+    assert w("fraction_unitaire") != w("fraction")
+    assert w("concept_de_produit") != w("multiplication")  # a synonym is not caught: wording only
+
+
+@pytest.mark.asyncio
+async def test_a_reworded_concept_reuses_the_existing_kc(fake_supabase, monkeypatch):
+    fake_supabase.seed("kernel.concept_nodes", [{"id": "m", "label": "multiplication", "subject": "MATH"}])
+    calls = []
+
+    async def fake_llm_call(prompt, max_tokens=1000):
+        calls.append(prompt)
+        return json.dumps({"prerequisites": []}), "mock"
+
+    monkeypatch.setattr(kc_registry, "llm_call", fake_llm_call)
+    kc = await kc_registry.get_or_create_kc("multiplication_concept", "MATH", "cycle3", fake_supabase)
+    assert kc["id"] == "m" and calls == []
+    assert len(fake_supabase.tables["kernel.concept_nodes"]) == 1
+
+
+def test_deepening_is_braked_per_learner_not_per_concept():
+    deepening._recent.clear()
+    t = 1_000_000.0
+    assert all(deepening.claim_for_learner("a", t + i) for i in range(deepening.MAX_DEEPENINGS_PER_LEARNER_HOUR))
+    assert deepening.claim_for_learner("a", t + 10) is False
+    assert deepening.claim_for_learner("b", t + 10) is True  # another learner is not braked
+    assert deepening.claim_for_learner("a", t + 3601) is True  # an hour later
+    deepening._recent.clear()
+
+
+def test_a_question_off_the_conversation_is_dropped_unless_it_checks_the_root(fake_supabase, monkeypatch):
+    fake_supabase.seed("kernel.concept_nodes", [{"id": "f", "label": "fractions", "subject": "MATH"}])
+    picks = iter([
+        {"label": "entiers", "confirms_root": False},
+        {"label": "fractions", "confirms_root": False},
+        {"label": "entiers", "confirms_root": True},
+    ])
+    monkeypatch.setattr(analyze_pipeline.active_probe, "choose_probe", lambda *a, **k: next(picks))
+    extraction = {
+        "kcs_mentioned": [{"label": "fractions", "subject": "MATH"}],
+        "attempts": [{"kc_label": "fractions", "outcome": "failure", "partial_credit": 0.0}],
+    }
+    assert asyncio.run(_analyze(fake_supabase, monkeypatch, extraction))["probe"] is None
+    assert asyncio.run(_analyze(fake_supabase, monkeypatch, extraction))["probe"]["label"] == "fractions"
+    assert asyncio.run(_analyze(fake_supabase, monkeypatch, extraction))["probe"]["confirms_root"] is True
+
+
+@pytest.mark.parametrize("messages,expected", [
+    (["can u just tell me the answer", "i don't get it, what is the point"], "en"),
+    (["je comprends pas pourquoi c'est faux", "mais j'ai fait la même chose"], "fr"),
+    (["no entiendo por qué es así", "pero yo tengo la misma respuesta"], "es"),
+    (["ich verstehe nicht, warum das falsch ist", "aber ich habe das gleiche"], "de"),
+    (["3x = 15", "x = 5"], None),  # nothing to go on: the model's answer stands
+])
+def test_the_learners_own_words_decide_the_language(messages, expected):
+    history = [{"role": "user", "content": m} for m in messages]
+    history.append({"role": "assistant", "content": "Le tuteur parle français ici, ça ne compte pas."})
+    assert analyze_pipeline._student_language(history) == expected

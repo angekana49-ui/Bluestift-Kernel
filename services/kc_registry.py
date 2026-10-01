@@ -68,6 +68,43 @@ def _escape_like(value: str) -> str:
 
 KC_TYPES = ("procedural", "declarative", "conceptual")
 
+# Words that name the kind of thing, not the thing: "multiplication_concept"
+# and "notion_de_multiplication" are both "multiplication". Articles and "de"
+# go too, so word order and phrasing do not make a second KC.
+_GENERIC_WORDS = frozenset({
+    "concept", "concepts", "notion", "notions", "idee", "idees", "base", "bases",
+    "de", "du", "des", "d", "la", "le", "les", "l", "un", "une", "et",
+})
+
+
+def _canonical_words(label: str) -> frozenset[str]:
+    """A label's content words, singular, in no particular order."""
+    words = set()
+    for word in _normalize_label(label).replace("-", "_").split("_"):
+        if not word or word in _GENERIC_WORDS:
+            continue
+        # Plural to singular, French and English alike: "fractions" -> "fraction".
+        words.add(word[:-1] if len(word) > 3 and word.endswith(("s", "x")) else word)
+    return frozenset(words)
+
+
+def _find_near_duplicate(client, norm: str, subject: str) -> dict | None:
+    """An existing KC of this subject that names the same idea in other words.
+
+    Run end to end, deepening created "multiplication_concept" next to an
+    existing "multiplication", and extraction later another; each splits the
+    evidence on one idea across several nodes, and the diagnosis with it. Only
+    the same content words count, so "fraction_unitaire" is not "fraction".
+    """
+    words = _canonical_words(norm)
+    if not words:
+        return None
+    rows = (_kernel(client, "concept_nodes").select("*").eq("subject", subject).execute()).data or []
+    same = [r for r in rows if r.get("label") and _canonical_words(r["label"]) == words]
+    if not same:
+        return None
+    return min(same, key=lambda r: (str(r.get("created_at") or ""), str(r["id"])))
+
 
 def _bounded(value, default: float, lo: float, hi: float) -> float:
     """An LLM-provided number, coerced and bounded; the default if unreadable.
@@ -153,7 +190,7 @@ async def get_or_create_kc(
     budget = budget or LLMBudget()
 
     # 1. Look up by label (case-insensitive), in any subject.
-    found = _find_kc(supabase_client, norm, subject)
+    found = _find_kc(supabase_client, norm, subject) or _find_near_duplicate(supabase_client, norm, subject)
     if found:
         return found
 

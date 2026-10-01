@@ -152,6 +152,8 @@ prerequisite question grounded on each concept's description and level.
 | `MAX_FINER` | 3 | design — the same cap as at creation |
 | `DEEPEN_LLM_CALLS` | 5 | design — the question, then the new KCs' own inference |
 | verification | both models, grounded | design — on labels alone one model put "slope" below linear equations; grounded, both answered 7 test pairs right, direction included |
+| `MAX_DEEPENINGS_PER_LEARNER_HOUR` | 3 | design — the descent is how the diagnosis reaches the real gap (fractions took three steps), so not one; a brake so one learner's noisy answers cannot drill the shared graph down |
+| near-duplicates | same content words = same KC | `services/kc_registry.py` — "multiplication_concept" is "multiplication"; generic words (concept, notion, de...) and plurals ignored. Synonyms ("produit") are not caught. |
 
 ## Active probing — `core/probe.py`
 
@@ -168,6 +170,10 @@ The evidence on a practised concept enters as the likelihood ratio
 belief from its prior. A question is chosen by maximum expected information
 about the gap's location, and asked only if its two answers lead the detector to
 different roots.
+
+A question that does not check the root itself (`confirms_root: false`) is
+dropped unless its concept is already in this conversation (`mastery_map`):
+run end to end, off-topic ones took two sessions out of two off course.
 
 ## Mindset — `core/mindset.py`
 

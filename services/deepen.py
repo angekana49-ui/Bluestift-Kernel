@@ -105,6 +105,29 @@ async def _confirmed_prerequisite(concept: dict, candidate: dict, subject: str) 
     return True
 
 
+# [design] Deepenings one learner's conversations may trigger in an hour. The
+# descent is how the diagnosis reaches the real gap (fractions took three steps
+# to get from "operations on fractions" to "what a fraction is"), so it is not
+# capped at one; but each step writes into everyone's graph, and a learner whose
+# answers are noise should not be able to drill it down to counting. In-process:
+# the Kernel runs as one instance, and a restart only resets a brake.
+MAX_DEEPENINGS_PER_LEARNER_HOUR = 3
+_recent: dict[str, list[float]] = {}
+
+
+def claim_for_learner(user_id: str, now: float | None = None) -> bool:
+    """Count one deepening against this learner, if their hour allows it."""
+    import time
+
+    now = time.time() if now is None else now
+    recent = [t for t in _recent.get(user_id, []) if now - t < 3600]
+    if len(recent) >= MAX_DEEPENINGS_PER_LEARNER_HOUR:
+        _recent[user_id] = recent
+        return False
+    _recent[user_id] = recent + [now]
+    return True
+
+
 def should_deepen(graph, root_gap: str | None, failing: list[str]) -> bool:
     """The diagnosis bottomed out: the root is itself failing, and not deepened."""
     if not root_gap or root_gap not in failing or root_gap not in graph:
