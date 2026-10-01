@@ -49,7 +49,7 @@ Reponds UNIQUEMENT en JSON valide, sans markdown, sans explication :
     }}
   ],
   "blocage_type": "conceptual" | "linguistic" | "ambiguous" | "none",
-  "langue_interaction": "fr" | "en" | "ar" | "other",
+  "langue_interaction": "fr" | "en" | "es" | "de" | "ar" | "other",
   "mindset_signals": {{
     "abandon_rate": 0.0,
     "persistence_score": 0.0,
@@ -84,15 +84,54 @@ Reutilise exactement le mot-cle deja employe pour cette matiere s'il existe.
 """
 
 SUMMARY_PROMPT = """\
-Tu es RAYA, un tuteur bienveillant. En une seule phrase courte, en {langue},
-explique a l'eleve pourquoi il bloque, sans jargon et sans le decourager.
+Tu es RAYA, un tuteur bienveillant. En une seule phrase courte, ECRITE EN
+{langue}, explique a l'eleve pourquoi il bloque, sans jargon et sans le
+decourager.
 
 Concept ou il bloque : {surface}
 Lacune racine detectee : {root_gap}
 Chemin de detection : {path}
 
+Ces noms de concepts sont des identifiants techniques en francais : ne les
+recopie pas, dis-les en mots simples, en {langue}.
+
 Reponds UNIQUEMENT par la phrase, sans guillemets.
 """
+
+# The prompt is French; "en {langue}" with the bare code read "en en" and the
+# model answered in French — every learner got a French summary. A language
+# NAME cannot be misread. Anything unrecognised gets English, the app's default.
+LANGUAGE_NAMES = {
+    "fr": "FRANCAIS",
+    "en": "ANGLAIS (English)",
+    "es": "ESPAGNOL (español)",
+    "de": "ALLEMAND (Deutsch)",
+    "ar": "ARABE (العربية)",
+}
+DEFAULT_SUMMARY_LANGUAGE = "en"
+
+# Shown without an LLM: no root gap yet, or every provider down.
+_NO_SIGNAL = {
+    "fr": "On n'a pas encore assez de signal pour cibler une lacune precise — continue, j'observe.",
+    "en": "There isn't enough to go on yet to pin down a specific gap — keep going, I'm watching.",
+    "es": "Todavía no hay suficiente para señalar una laguna concreta — sigue, estoy observando.",
+    "de": "Noch zu wenig, um eine bestimmte Lücke zu erkennen — mach weiter, ich beobachte.",
+}
+_FALLBACK = {
+    "fr": "Tu bloques sur « {surface} » parce que « {root} » n'est pas encore solide.",
+    "en": "You're stuck on \"{surface}\" because \"{root}\" isn't solid yet.",
+    "es": "Te atascas en «{surface}» porque «{root}» todavía no está sólido.",
+    "de": "Du hängst bei „{surface}“ fest, weil „{root}“ noch nicht sitzt.",
+}
+
+
+def _summary_language(langue: str | None) -> str:
+    code = (langue or "").strip().lower()
+    return code if code in LANGUAGE_NAMES else DEFAULT_SUMMARY_LANGUAGE
+
+
+def _readable(label: str) -> str:
+    return label.replace("_", " ")
 
 
 def _format_conversation(history: list[dict]) -> str:
@@ -182,14 +221,11 @@ async def generate_summary(
     surface: str, root_gap: str | None, path: list[str], langue: str
 ) -> tuple[str, str]:
     """Generate the learner-facing summary. Returns (summary, llm_used)."""
+    code = _summary_language(langue)
     if not root_gap:
-        return (
-            "On n'a pas encore assez de signal pour cibler une lacune precise — "
-            "continue, j'observe.",
-            "none",
-        )
+        return _NO_SIGNAL.get(code, _NO_SIGNAL[DEFAULT_SUMMARY_LANGUAGE]), "none"
     prompt = SUMMARY_PROMPT.format(
-        langue=langue or "fr",
+        langue=LANGUAGE_NAMES[code],
         surface=surface or root_gap,
         root_gap=root_gap,
         path=" -> ".join(path),
@@ -198,11 +234,8 @@ async def generate_summary(
         summary, llm_used = await llm_call(prompt, max_tokens=200)
         return summary.strip().strip('"'), llm_used
     except Exception:  # noqa: BLE001
-        return (
-            f"Tu bloques sur « {surface or root_gap} » parce que « {root_gap} » "
-            "n'est pas encore solide.",
-            "none",
-        )
+        template = _FALLBACK.get(code, _FALLBACK[DEFAULT_SUMMARY_LANGUAGE])
+        return template.format(surface=_readable(surface or root_gap), root=_readable(root_gap)), "none"
 
 
 async def run_analysis(client, request_id: str, payload: dict) -> dict:

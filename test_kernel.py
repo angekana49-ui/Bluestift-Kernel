@@ -2862,3 +2862,31 @@ def test_backfill_dry_run_writes_nothing(fake_supabase, monkeypatch):
     report = asyncio.run(display_names.backfill(fake_supabase, dry_run=True))
     assert report["named"] == 1 and report["examples"]["fonction_affine"]["en"] == "Linear functions"
     assert not fake_supabase.tables["kernel.concept_nodes"][0].get("display_names")
+
+
+# --------------------------------------------------------------------------- #
+# The learner's summary is in the learner's language
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("code,expected", [("en", "ANGLAIS"), ("es", "ESPAGNOL"), ("fr", "FRANCAIS"), ("other", "ANGLAIS"), (None, "ANGLAIS")])
+def test_summary_prompt_names_the_language(monkeypatch, code, expected):
+    seen = {}
+
+    async def fake_llm_call(prompt, max_tokens=1000):
+        seen["prompt"] = prompt
+        return "ok", "mock"
+
+    monkeypatch.setattr(analyze_pipeline, "llm_call", fake_llm_call)
+    asyncio.run(analyze_pipeline.generate_summary("fractions", "notion_de_fraction", ["fractions"], code))
+    # "en en" was read as French: the code must never reach the prompt bare.
+    assert f"ECRITE EN\n{expected}" in seen["prompt"]
+
+
+def test_summary_without_llm_follows_the_language(monkeypatch):
+    async def down(prompt, max_tokens=1000):
+        raise RuntimeError("every provider down")
+
+    monkeypatch.setattr(analyze_pipeline, "llm_call", down)
+    text, _ = asyncio.run(analyze_pipeline.generate_summary("fractions", "notion_de_fraction", [], "en"))
+    assert text.startswith("You're stuck") and "notion de fraction" in text
+    no_gap, _ = asyncio.run(analyze_pipeline.generate_summary("fractions", None, [], "en"))
+    assert no_gap.startswith("There isn't enough")
