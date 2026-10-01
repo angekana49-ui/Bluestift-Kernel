@@ -6,6 +6,7 @@ prerequisites are inferred by the LLM and created recursively (bounded depth).
 """
 from __future__ import annotations
 
+from . import display_names
 from .db import _kernel
 from .llm import extract_json, llm_call
 
@@ -24,6 +25,7 @@ Reponds UNIQUEMENT en JSON valide, sans markdown :
   "type_kc": "procedural" | "declarative" | "conceptual",
   "lambda_decay": 0.01 a 0.05,
   "description": "description courte du concept en une phrase",
+  "display_names": {{"en": "...", "fr": "...", "es": "...", "de": "..."}},
   "prerequisites": ["label_prereq_1", "label_prereq_2"],
   "tau": 0.3 a 0.8
 }}
@@ -32,6 +34,10 @@ Regles pour lambda_decay :
 - procedural (regles, calculs) : 0.01
 - conceptual (idees abstraites) : 0.02
 - declarative (faits, definitions) : 0.05
+
+display_names : le nom du concept tel qu'un enseignant l'ecrirait, 2 a 7 mots,
+majuscule au premier mot seulement. "en" en anglais americain (vocabulaire des
+ecoles des Etats-Unis), "fr" avec les accents, "es" espagnol, "de" allemand.
 
 prerequisites : concepts qu'un eleve DOIT maitriser avant ce concept.
 Maximum 3 prerequis. Liste vide si c'est un concept fondamental.
@@ -175,9 +181,17 @@ async def get_or_create_kc(
         "lambda_decay": _bounded(kc_data.get("lambda_decay"), 0.02, 0.001, 0.2),
         "tau": _bounded(kc_data.get("tau"), 0.5, 0.0, 1.0),
         "empirical_difficulty": 0.5,  # neutral default
+        "display_names": display_names.clean(kc_data.get("display_names")),
     }
     try:
-        inserted = _kernel(supabase_client, "concept_nodes").insert(row).execute()
+        try:
+            inserted = _kernel(supabase_client, "concept_nodes").insert(row).execute()
+        except Exception as e:  # noqa: BLE001
+            # Migration 013 not applied yet: a name is not worth losing the KC.
+            if "display_names" not in str(e):
+                raise
+            row.pop("display_names")
+            inserted = _kernel(supabase_client, "concept_nodes").insert(row).execute()
         created_kc = inserted.data[0]
     except Exception:
         # UNIQUE(label, subject): another request created this KC while we were

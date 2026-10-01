@@ -91,13 +91,14 @@ Each KC, per student, carries a four-dimensional state (Luckin / corpus §1.2):
 ├── scripts/
 │   ├── build_graph.py       # CLI: distill a KC graph from the LLMs
 │   ├── build_bridges.py     # CLI: generate cross-subject prerequisite bridges
+│   ├── backfill_display_names.py  # CLI: name existing concepts in en/fr/es/de (migration 013)
 │   ├── apply_migrations.py  # CLI: apply migrations via the Management API
 │   ├── eval_kernel.py       # Synthetic-student benchmark (root-gap recall/precision, probing)
 │   ├── fit_forgetting.py    # Offline: fit the forgetting constants on learning_events
 │   └── validate_mindset.py  # Offline: does M predict what students do next?
 ├── migrations/              # 12 numbered Supabase SQL migrations
 ├── conftest.py              # In-memory fake Supabase for tests
-├── test_kernel.py           # 154 tests
+├── test_kernel.py           # 159 tests
 ├── PARAMETERS.md            # Provenance of every constant
 ├── requirements.txt / requirements-dev.txt
 └── railway.toml            # Deploy config + the cost rules that keep it cheap
@@ -261,6 +262,7 @@ Management API with `scripts/apply_migrations.py`):
 010_school_curriculum_layers.sql  # school layer types + payloads (School -> AI -> Student)
 011_learning_events.sql           # one row per graded attempt (BKT fitting) + recent autonomous credits
 012_state_chain.sql               # state version (chain height) + review/lapse counts (spacing)
+013_concept_display_names.sql     # readable concept name per locale (the label stays the identity)
 ```
 
 > **Deploy 011 and 012 before the code that uses them.** Without it, state writes still
@@ -393,7 +395,7 @@ detector change needed; the convergence search crosses the bridge automatically.
 pytest -q
 ```
 
-154 tests. The suite mocks the LLM and uses an in-memory fake Supabase
+159 tests. The suite mocks the LLM and uses an in-memory fake Supabase
 (`conftest.py`, with real ILIKE semantics and the real UNIQUE constraints), so **no network or real keys are
 required**. Coverage: BKT (soft evidence, bounds, assisted attempts, blocage
 rules), forgetting, mindset, detector (convergence, determinism, cycles),

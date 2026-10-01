@@ -371,6 +371,13 @@ behave differently.
     that analysis and its parts), for `scripts/validate_mindset.py`. It is
     **not** in the `/analyze` response. `kernel_outputs` is already in the GDPR
     erasure and export lists, so nothing changes app-side.
+17. **`concept_nodes.display_names`** (migration 013): the readable name of a
+    concept per locale, `{"en", "fr", "es", "de"}`. The `label` stays the
+    identity, French snake_case, and is no longer meant to be shown. New
+    concepts are named at creation; `scripts/backfill_display_names.py` names
+    the existing ones. The app reads the column itself
+    (`lib/kernel/concept-names-server.ts`) and falls back to the label made
+    readable. Without the migration, concepts are still created, just unnamed.
 
 ---
 

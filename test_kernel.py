@@ -29,6 +29,7 @@ from core.graph import build_graph
 from models.schemas import AnalyzeResponse
 from services import analyze as analyze_pipeline
 from services import db as db_module
+from services import display_names
 from services import graph_builder
 from services import kc_registry
 from services import llm
@@ -2767,3 +2768,97 @@ def test_analyze_logs_the_mindset_trace_but_does_not_return_it(fake_supabase, mo
     assert logged["ema_weight"] == mindset.EMA_WEIGHT
     (trace,) = db_module.load_mindset_traces(fake_supabase)
     assert trace["user_id"] == "u1" and trace["observed"] == logged["observed"]
+
+
+# --------------------------------------------------------------------------- #
+# Display names (migration 013)
+# --------------------------------------------------------------------------- #
+def test_display_names_keep_known_locales_and_plain_text_only():
+    raw = {
+        "en": "  Solving   linear equations ",
+        "fr": "Résoudre des équations <b>linéaires</b>",
+        "de": "x" * 200,
+        "es": 42,
+        "xx": "unknown locale",
+    }
+    out = display_names.clean(raw)
+    assert out["en"] == "Solving linear equations"
+    assert "<" not in out["fr"] and "Résoudre" in out["fr"]
+    assert len(out["de"]) == display_names.MAX_NAME_LENGTH
+    assert "es" not in out and "xx" not in out
+    assert display_names.clean("not a dict") == {}
+    assert display_names.missing_locales(out) == ["es"]
+
+
+@pytest.mark.asyncio
+async def test_new_kc_is_named_at_creation(fake_supabase, monkeypatch):
+    async def fake_llm_call(prompt, max_tokens=1000):
+        return json.dumps({
+            "type_kc": "procedural", "lambda_decay": 0.01, "description": "d", "prerequisites": [], "tau": 0.5,
+            "display_names": {"en": "Derivatives", "fr": "Dérivées", "es": "Derivadas", "de": "Ableitungen"},
+        }), "mock"
+
+    monkeypatch.setattr(kc_registry, "llm_call", fake_llm_call)
+    kc = await kc_registry.get_or_create_kc("derivees", "MATH", "lycee", fake_supabase)
+    assert kc["label"] == "derivees"
+    assert kc["display_names"]["en"] == "Derivatives"
+
+
+@pytest.mark.asyncio
+async def test_kc_is_still_created_without_migration_013(fake_supabase, monkeypatch):
+    async def fake_llm_call(prompt, max_tokens=1000):
+        return json.dumps({"type_kc": "procedural", "prerequisites": [],
+                           "display_names": {"en": "Derivatives"}}), "mock"
+
+    monkeypatch.setattr(kc_registry, "llm_call", fake_llm_call)
+    query_type = type(fake_supabase.schema("kernel").table("concept_nodes"))
+    real_insert = query_type.insert
+
+    def insert_without_column(self, payload):
+        if isinstance(payload, dict) and "display_names" in payload:
+            raise Exception('column "display_names" of relation "concept_nodes" does not exist')
+        return real_insert(self, payload)
+
+    monkeypatch.setattr(query_type, "insert", insert_without_column)
+    kc = await kc_registry.get_or_create_kc("derivees", "MATH", "lycee", fake_supabase)
+    assert kc["label"] == "derivees" and "display_names" not in kc
+
+
+def test_backfill_names_only_what_is_missing_and_keeps_existing(fake_supabase, monkeypatch):
+    fake_supabase.seed("kernel.concept_nodes", [
+        {"id": "a", "label": "fonction_affine", "subject": "MATH", "display_names": {}},
+        {"id": "b", "label": "pente_ligne", "subject": "MATH", "display_names": {"en": "Slope (kept)"}},
+        {"id": "c", "label": "fractions", "subject": "MATH",
+         "display_names": {"en": "Fractions", "fr": "Fractions", "es": "Fracciones", "de": "Brüche"}},
+    ])
+    asked = []
+
+    async def fake_llm_call(prompt, max_tokens=1000):
+        asked.append(prompt)
+        return json.dumps({
+            "fonction_affine": {"en": "Linear functions", "fr": "Fonctions affines", "es": "Funciones afines", "de": "Lineare Funktionen"},
+            "pente_ligne": {"en": "Slope of a line", "fr": "Pente d'une droite", "es": "Pendiente", "de": "Steigung"},
+            "invented_label": {"en": "Not asked"},
+        }), "mock"
+
+    monkeypatch.setattr(display_names, "llm_call", fake_llm_call)
+    report = asyncio.run(display_names.backfill(fake_supabase))
+    assert report["missing"] == 2 and report["named"] == 2 and len(asked) == 1
+    assert '"fractions"' not in asked[0]  # fully named: not sent again
+    rows = {r["id"]: r for r in fake_supabase.tables["kernel.concept_nodes"]}
+    assert rows["a"]["display_names"]["en"] == "Linear functions"
+    assert rows["b"]["display_names"]["en"] == "Slope (kept)"
+    assert rows["b"]["display_names"]["de"] == "Steigung"
+    assert not any(r["label"] == "invented_label" for r in rows.values())
+
+
+def test_backfill_dry_run_writes_nothing(fake_supabase, monkeypatch):
+    fake_supabase.seed("kernel.concept_nodes", [{"id": "a", "label": "fonction_affine", "subject": "MATH"}])
+
+    async def fake_llm_call(prompt, max_tokens=1000):
+        return json.dumps({"fonction_affine": {"en": "Linear functions"}}), "mock"
+
+    monkeypatch.setattr(display_names, "llm_call", fake_llm_call)
+    report = asyncio.run(display_names.backfill(fake_supabase, dry_run=True))
+    assert report["named"] == 1 and report["examples"]["fonction_affine"]["en"] == "Linear functions"
+    assert not fake_supabase.tables["kernel.concept_nodes"][0].get("display_names")
