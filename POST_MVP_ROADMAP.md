@@ -144,11 +144,13 @@ Still open here:
 
 ## 4. Detection-quality tuning (needs real data)
 
-- **Active probing (biggest lever, measured).** In the synthetic benchmark the
-  planted gap is found 30–44% of the time when it was practised, and 0–11% when
-  it never was: the graph alone rarely singles out an unverified prerequisite.
-  Return the most informative unverified prerequisite on the detection path as
-  a `probe` and let RAYA ask one question on it.
+- **Active probing — shipped 2026-10-01** (`core/probe.py`, `probe` in
+  `/analyze`). Calibrated recall 46–53% → 56–64% in the synthetic benchmark.
+  Next: (1) multi-question planning (the choice is greedy, one step ahead);
+  (2) fit `PROPAGATION` on real probe answers; (3) use the posterior over the
+  gap's location for the root itself, not only for the question — the
+  detector's convergence/depth rules would become one Bayesian decision. Worth
+  it only if the benchmark and, later, real remediation outcomes say so.
 
 - **Confidence calibration** — the current confidence blend (convergence + depth
   + severity) is heuristic; calibrate against observed remediation outcomes.

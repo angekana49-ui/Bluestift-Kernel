@@ -74,14 +74,16 @@ le BKT étendu sur nos propres données.
 5. **Graphe ouvert**, toute matière, auto-généré + auto-étendu.
 
 ## Traction technique
-✅ **v1 complet et déployé** (Railway, HTTPS) · 132 tests · 11 migrations · graphe
+✅ **v1 complet et déployé** (Railway, HTTPS) · 147 tests · 12 migrations · graphe
 MATH dense auto-généré.
 
 **Mesuré, pas affirmé** — banc d'élèves synthétiques à lacune connue, passés par le
 vrai pipeline (3 sessions, extraction supposée parfaite) : après l'audit du
 2026-09-30, **précision ×2** (15–22 % → 36–41 %), **fausses alertes sur élèves sans
-lacune : ~100 % → 8–17 %**. Prochain levier mesuré : faire sonder par RAYA le
-prérequis non vérifié.
+lacune : ~100 % → 8–17 %**. Puis le **sondage actif** (2026-10-01) : le Kernel
+choisit la question qui tranche le mieux où est la lacune ; lacune exacte trouvée
+**56–64 %** (contre 35–40 %), précision **58–65 %**, avec moins de questions qu'un
+tirage au hasard qui fait moins bien.
 
 ## La suite
 **Intégration RAYA** (allume le flywheel) → canal **école→IA→élève** (différenciateur

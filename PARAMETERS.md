@@ -106,6 +106,22 @@ The personal λ is stored as a **base** rate (reviews are applied on top of it, 
 | `UNKNOWN_BUDGET` | 2 | design — how many never-practised prerequisites in a row the search may cross |
 | confidence weights | 0.4 convergence, 0.3 depth, 0.3 severity | design — **not a calibrated probability**. Do not present `confidence` as one. |
 
+## Active probing — `core/probe.py`
+
+| Constant | Value | Provenance | Replaced by |
+|---|---|---|---|
+| `PROBE_MAX_HOPS` | 4 | design — same depth as `/prerequisite_gaps` | — |
+| `PROBE_MAX_HYPOTHESES` | 60 | design — cost bound (hypotheses × questions × evidence) | — |
+| `PROPAGATION` | 0.85 | design — under "the gap is h", a concept built on h is unlearned with this probability, any other learned with it. 1 would assume a single gap and perfect propagation; the benchmark's generator does, real students don't. | fit on `learning_events` once probes have answers: the rate at which a failed prerequisite's dependents are also failed |
+| `PROBE_MIN_GAIN` | 0.05 bit | design — below it a question is not worth the student's time | — |
+| prior over the gap's location | uniform, "no gap" weighted as one concept | design — no concept is assumed a likelier gap than another | the observed distribution of confirmed roots |
+
+The evidence on a practised concept enters as the likelihood ratio
+`odds(K) / odds(p_init)`: how far the student's record moved that concept's
+belief from its prior. A question is chosen by maximum expected information
+about the gap's location, and asked only if its two answers lead the detector to
+different roots.
+
 ## Mindset — `core/mindset.py`
 
 | Constant | Value | Provenance |

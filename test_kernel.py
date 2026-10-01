@@ -23,7 +23,9 @@ from core import (
     anomaly, bkt, calibration, curriculum, detector, forgetting, mindset,
     prerequisites, ratelimit,
 )
+from core import probe as active_probe
 from core.graph import build_graph
+from models.schemas import AnalyzeResponse
 from services import analyze as analyze_pipeline
 from services import db as db_module
 from services import graph_builder
@@ -2576,3 +2578,102 @@ async def test_analyze_measures_abandon_instead_of_trusting_the_llm(fake_supabas
     as_the_llm_said = mindset.compute_mindset_score(0.0, 0.5, 0.5, 0.5)
     assert stored < as_the_llm_said
     assert stored == pytest.approx(mindset.compute_mindset_score(1.0, 0.5, 0.5, 0.5), abs=1e-4)
+
+
+# --------------------------------------------------------------------------- #
+# Active probing (core/probe.py) and the student's history in the diagnosis
+# --------------------------------------------------------------------------- #
+def _probe_inputs(graph, states, known):
+    weak = {lbl: detector.failing_threshold(bkt.BKT_PRIORS["p_init"]) for lbl in known}
+    return states, known, weak
+
+
+def test_probe_asks_the_nearest_question_that_moves_the_root():
+    # derivees is failing, both prerequisites were never practised. Whether
+    # the gap is at the surface or below it hangs on fonctions_polynomiales.
+    graph = _sample_graph()
+    states, known, weak = _probe_inputs(graph, {"derivees": 0.1}, {"derivees"})
+    root = detector.detect_root_cause(graph, ["derivees"], states, known=known, weak_below=weak)["root_gap"]
+    probe = active_probe.choose_probe(graph, ["derivees"], states, known, weak, root)
+    assert probe["label"] == "fonctions_polynomiales"
+    assert probe["root_if_correct"] != probe["root_if_wrong"]
+    assert 0 < probe["p_correct"] < 1
+    assert active_probe.PROBE_MIN_GAIN <= probe["expected_gain"] <= 1.0
+    # Deterministic: the same evidence always yields the same question.
+    assert active_probe.choose_probe(graph, ["derivees"], states, known, weak, root) == probe
+
+
+def test_probe_is_silent_when_no_answer_could_change_the_diagnosis():
+    # A mastered prerequisite is a barrier: what lies below it cannot be the
+    # root, so asking about it would cost the student a question for nothing.
+    graph = _sample_graph()
+    states, known, weak = _probe_inputs(
+        graph, {"derivees": 0.1, "fonctions_polynomiales": 0.95}, {"derivees", "fonctions_polynomiales"}
+    )
+    assert active_probe.choose_probe(graph, ["derivees"], states, known, weak, "derivees") is None
+    assert active_probe.choose_probe(graph, [], states, known, weak, None) is None
+
+
+def test_probe_checks_a_suspected_root_before_it_is_remediated():
+    # Two failing concepts converge on `variable`, never practised: it is the
+    # root by convergence alone. Asking about it confirms or dismisses it.
+    import networkx as nx
+
+    g = nx.DiGraph()
+    g.add_edge("variable", "fonction_affine")
+    g.add_edge("variable", "equation_lineaire")
+    failing = ["fonction_affine", "equation_lineaire"]
+    states, known, weak = _probe_inputs(g, {k: 0.1 for k in failing}, set(failing))
+    root = detector.detect_root_cause(g, failing, states, known=known, weak_below=weak)["root_gap"]
+    assert root == "variable"
+    probe = active_probe.choose_probe(g, failing, states, known, weak, root)
+    assert probe["label"] == "variable" and probe["confirms_root"] is True
+    assert probe["root_if_wrong"] == "variable" and probe["root_if_correct"] != "variable"
+
+
+async def test_analyze_remembers_what_earlier_conversations_showed(fake_supabase, monkeypatch):
+    # Last week the student failed fonctions_affines. Today they fail derivees
+    # and fonctions_affines is not mentioned. It is still the evidence-backed
+    # root: the search used to see it as never practised and stop at the
+    # surface.
+    fake_supabase.seed("kernel.concept_nodes", [
+        {"id": "a", "label": "fonctions_affines", "subject": "MATH"},
+        {"id": "b", "label": "fonctions_polynomiales", "subject": "MATH"},
+        {"id": "c", "label": "derivees", "subject": "MATH"},
+    ])
+    fake_supabase.seed("kernel.concept_edges", [
+        {"id": "e1", "prerequisite_id": "a", "concept_id": "b"},
+        {"id": "e2", "prerequisite_id": "b", "concept_id": "c"},
+    ])
+    fail = {"outcome": "failure", "partial_credit": 0.0, "blocage_type": "conceptual"}
+    await _analyze(fake_supabase, monkeypatch, {
+        "kcs_mentioned": [{"label": "fonctions_affines", "subject": "MATH"}],
+        "attempts": [{"kc_label": "fonctions_affines", **fail}] * 2,
+    })
+    out = await _analyze(fake_supabase, monkeypatch, {
+        "kcs_mentioned": [{"label": "derivees", "subject": "MATH"}],
+        "attempts": [{"kc_label": "derivees", **fail}] * 2,
+    })
+    assert out["root_gap"] == "fonctions_affines"
+    assert out["detection_path"] == ["derivees", "fonctions_polynomiales", "fonctions_affines"]
+    # Only today's concepts are reported in the mastery map.
+    assert set(out["mastery_map"]) == {"derivees"}
+    # Before remediating a root that rests on last week's two answers, the
+    # Kernel asks to check it: wrong confirms it, right sends the search
+    # elsewhere. The response validates against the API contract.
+    assert out["probe"]["label"] == "fonctions_affines"
+    assert out["probe"]["confirms_root"] is True
+    assert out["probe"]["root_if_wrong"] == "fonctions_affines"
+    assert out["probe"]["root_if_correct"] != "fonctions_affines"
+    AnalyzeResponse(kernel_version="test", **{k: v for k, v in out.items() if k != "recalibrate_concept_ids"})
+
+
+def test_a_weak_prerequisite_mid_chain_beats_the_surface():
+    # derivees <- polynomiales (practised, failed) <- affines (never practised).
+    # The chain runs on into the unverified affines, so polynomiales is not its
+    # end — it used to score depth 1, like the surface, and lose to it.
+    graph = _sample_graph()
+    states = {"derivees": 0.2, "fonctions_polynomiales": 0.1}
+    known = {"derivees", "fonctions_polynomiales"}
+    result = detector.detect_root_cause(graph, ["derivees"], states, known=known)
+    assert result["root_gap"] == "fonctions_polynomiales"

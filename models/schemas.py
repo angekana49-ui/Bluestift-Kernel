@@ -68,6 +68,29 @@ class MasteryEntry(BaseModel):
     status: KCStatus
 
 
+class ProbeOut(BaseModel):
+    """The one diagnostic question that would best settle the root gap.
+
+    Ask the student one question on `label`, without help, and send the graded
+    answer to /update_concept_state. The next /analyze reads it back. Absent when
+    no single answer could change the diagnosis.
+    """
+
+    label: str
+    concept_id: Optional[str] = None
+    # Expected information about the root, in bits (max 1): how uncertain the
+    # answer is, given that right and wrong lead to different roots.
+    expected_gain: float
+    # The Kernel's prediction that the student answers correctly.
+    p_correct: float
+    # The root the diagnosis moves to under each answer (None: no root at all).
+    root_if_correct: Optional[str] = None
+    root_if_wrong: Optional[str] = None
+    # The question is about the current root itself: a wrong answer confirms it,
+    # a right one dismisses it. Worth asking before remediating it.
+    confirms_root: bool = False
+
+
 class AnalyzeResponse(BaseModel):
     request_id: str
     user_id: str
@@ -79,6 +102,7 @@ class AnalyzeResponse(BaseModel):
     summary: str = ""
     recommended_path: list[str] = Field(default_factory=list)
     alerts: list[dict] = Field(default_factory=list)
+    probe: Optional[ProbeOut] = None
     # Present only for a student who belongs to a school that has set layers:
     # {school_id, layers_applied, objectives, root_gap_in_program, rules}.
     # See core/curriculum.py and migration 010.

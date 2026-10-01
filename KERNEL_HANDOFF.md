@@ -86,6 +86,12 @@ Response (note the **new `alerts`** field):
   "summary": "Tu bloques parce que ...",
   "recommended_path": ["notion_de_variable", "..."],
   "alerts": [{ "type": "cognitive_overload", "severity": "medium" }],
+  "probe": {
+    "label": "fonctions_affines", "concept_id": "uuid",
+    "expected_gain": 0.62, "p_correct": 0.41,
+    "root_if_correct": "derivation_fonction", "root_if_wrong": "fonctions_affines",
+    "confirms_root": false
+  },
   "curriculum": {
     "school_id": "uuid",
     "layers_applied": ["curriculum", "kc_priorities", "objectives"],
@@ -100,6 +106,18 @@ Response (note the **new `alerts`** field):
   "llm_used": "openai/gpt-oss-120b"
 }
 ```
+
+`probe` is the **one diagnostic question** that would best settle where the gap
+is, or `null` when no single answer could change the diagnosis. RAYA asks one
+short question on `label`, **without help** (a hint makes the answer worthless as
+a test), and sends the graded answer to `/update_concept_state` (by
+`concept_id`). The next `/analyze` reads it back from the student's history.
+`confirms_root: true` means the question is about the current root itself: ask
+it before remediating — a wrong answer confirms the root, a right one sends the
+search elsewhere. `root_if_correct` / `root_if_wrong` say where the diagnosis
+would go under each answer; `expected_gain` (bits, ≤ 1) is how much the Kernel
+expects to learn, `p_correct` its prediction. Never show these to the student.
+To get the probe mid-conversation, call `/analyze` with `commit_state: false`.
 
 `curriculum` is **absent (null)** unless the student belongs to a school that has
 set layers — most students won't have it, so treat it as optional. When present:
@@ -333,6 +351,22 @@ behave differently.
     reading, but "abandon after an error" is now measured (was a failure retried?),
     and it blends in the student's measured learning dynamics. It never uses
     their level. A struggling student who keeps trying is **not** "fixed".
+
+### 3c. Active probing and the student's history (2026-10-01)
+
+13. **New `probe` field in `/analyze`** (see §2). Optional to use, but it is the
+    largest measured gain: in the synthetic benchmark, recall of the planted gap
+    rises from 46–53% to 56–64% (calibrated) when the tutor asks the probe, on
+    fewer extra questions than a random-question control. Type it in
+    `lib/kernel/types.ts` as optional.
+14. **The diagnosis now remembers earlier conversations.** A prerequisite failed
+    or mastered last week counts in today's root-gap search even if today's
+    conversation never mentions it. `mastery_map` still lists only today's
+    concepts. Expect more `root_gap`s that are not in `mastery_map`: they come
+    from history. Fetch their state with `/load_profile` if you need it.
+15. **A failed prerequisite mid-chain can now be the root.** It used to lose to
+    the surface concept whenever the chain continued into unverified concepts
+    below it, so `root_gap` was too often just what the student was stuck on.
 
 ---
 

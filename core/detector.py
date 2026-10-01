@@ -97,7 +97,12 @@ def detect_root_cause(
         return 1 if (r in known and is_weak(r)) else 0
 
     def depth(r: str) -> int:
-        return max((len(ch) for ch in chains.values() if ch and ch[-1] == r), default=1)
+        # How far below a failing concept r sits, on any chain. It used to count
+        # only chains ENDING at r, so a known-weak prerequisite in the middle of
+        # a chain (the chain going on into unverified concepts below it) scored
+        # depth 1, like the surface itself — and lost to the surface on
+        # severity. The module's own rule is the deepest failing prerequisite.
+        return max((ch.index(r) + 1 for ch in chains.values() if r in ch), default=1)
 
     # `candidates` is a set: iterate it sorted, because max() keeps the first
     # maximal element and set order changes between processes.

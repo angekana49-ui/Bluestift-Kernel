@@ -73,6 +73,7 @@ Each KC, per student, carries a four-dimensional state (Luckin / corpus §1.2):
 │   ├── forgetting.py        # Exponential decay -> K_effective, 3-level lambda
 │   ├── mindset.py           # Mindset score M (sigmoid blend)
 │   ├── detector.py          # DFS root-cause by convergence
+│   ├── probe.py             # Active probing: the most informative next question
 │   ├── calibration.py       # Self-calibration of living parameters
 │   ├── anomaly.py           # Pedagogical-safety anomaly detection
 │   ├── curriculum.py        # School curriculum layers -> sequencing + objectives
@@ -89,10 +90,10 @@ Each KC, per student, carries a four-dimensional state (Luckin / corpus §1.2):
 │   ├── build_graph.py       # CLI: distill a KC graph from the LLMs
 │   ├── build_bridges.py     # CLI: generate cross-subject prerequisite bridges
 │   ├── apply_migrations.py  # CLI: apply migrations via the Management API
-│   └── eval_kernel.py       # Synthetic-student benchmark (root-gap recall/precision)
+│   └── eval_kernel.py       # Synthetic-student benchmark (root-gap recall/precision, probing)
 ├── migrations/              # 12 numbered Supabase SQL migrations
 ├── conftest.py              # In-memory fake Supabase for tests
-├── test_kernel.py           # 142 tests
+├── test_kernel.py           # 147 tests
 ├── PARAMETERS.md            # Provenance of every constant
 ├── requirements.txt / requirements-dev.txt
 └── railway.toml            # Deploy config + the cost rules that keep it cheap
@@ -388,7 +389,7 @@ detector change needed; the convergence search crosses the bridge automatically.
 pytest -q
 ```
 
-142 tests. The suite mocks the LLM and uses an in-memory fake Supabase
+147 tests. The suite mocks the LLM and uses an in-memory fake Supabase
 (`conftest.py`, with real ILIKE semantics and the real UNIQUE constraints), so **no network or real keys are
 required**. Coverage: BKT (soft evidence, bounds, assisted attempts, blocage
 rules), forgetting, mindset, detector (convergence, determinism, cycles),
@@ -403,8 +404,10 @@ school curriculum layers, graph-builder validation, `get_or_create_kc`, and the
 ## Evaluation
 
 ```bash
-python scripts/eval_kernel.py --sessions 3                # priors only
-python scripts/eval_kernel.py --sessions 3 --warmup 1000  # after calibration
+python scripts/eval_kernel.py --sessions 3                         # priors only
+python scripts/eval_kernel.py --sessions 3 --warmup 1000           # after calibration
+python scripts/eval_kernel.py --sessions 3 --warmup 1000 --probe kernel   # tutor asks the probe
+python scripts/eval_kernel.py --sessions 3 --warmup 1000 --probe random   # control
 ```
 
 Simulated students with a **planted** root gap (one unlearned concept and
@@ -415,21 +418,32 @@ benchmark scores the diagnosis after the last session. Extraction is assumed
 perfect, so these numbers are the **ceiling** of the Kernel's reasoning, not
 of the whole stack.
 
-400 students × 3 sessions, seeds 0-2, compared with the code before the
-2026-09-30 audit (`160c6a6`):
+400 students × 3 sessions, seeds 0-2. Ranges are priors-only / calibrated.
 
-| | Before | Now, priors | Now, calibrated |
-|---|---|---|---|
-| Named roots that are right (precision) | 15–22% | 38–40% | 36–41% |
-| Planted gap named exactly (recall) | 20–29% | 27–31% | 35–40% |
-| False root on gap-free students | 99–100% | 8–12% | 11–17% |
-| Learned KCs labelled "gap", per student | 1.8–2.0 | 0.10–0.14 | 0.07–0.11 |
+| | Before the audit (`160c6a6`) | Audit 2026-09-30 (`d2ff634`) | + history, depth fix | + active probing |
+|---|---|---|---|---|
+| Named roots that are right (precision) | 15–22% | 38–40% / 36–41% | 44–54% / 47–54% | **51–58% / 58–65%** |
+| Planted gap named exactly (recall) | 20–29% | 27–31% / 35–40% | 32–40% / 46–53% | **37–45% / 56–64%** |
+| False root on gap-free students | 99–100% | 8–12% / 11–17% | 8–12% / 11–17% | 8–12% / 10–18% |
+| Learned KCs labelled "gap", per student | 1.8–2.0 | 0.10–0.14 / 0.07–0.11 | 0.10–0.14 / 0.07–0.11 | 0.10–0.14 / 0.08–0.12 |
 
-What the numbers say:
-
-- **When the gap itself was practised**, it is found 30–44% of the time. When it
-  never was, only 0–11% of the time: the graph alone rarely singles it out.
-  Letting RAYA probe the unverified prerequisite is the biggest lever left.
+- **History**: the diagnosis now uses everything the student showed in earlier
+  conversations, not only the concepts this one mentions — a prerequisite
+  failed last week used to read as never practised.
+- **Depth fix**: a failed prerequisite in the middle of a chain used to lose to
+  the surface concept (`core/detector.py`, `depth`).
+- **Active probing** (`core/probe.py`): `/analyze` returns the one question that
+  would best settle where the gap is; the tutor asks it, unassisted. The tutor
+  asks 1.1–1.6 such questions per student over 3 conversations, and 22–45% of
+  them land on the planted gap.
+- **The choice matters, not just the extra question.** The control asks a
+  random unpractised prerequisite in *every* conversation (1.4–2.3 questions
+  per student, 5–18% on the gap): recall 33–41% / 48–54%, precision 43–56% /
+  49–55% — below the Kernel's probe on fewer questions.
+- A first version that scored questions only by whether they changed the
+  detector's root did no better than random: every unpractised concept has the
+  same prior, so it just asked the nearest one. What works is a posterior over
+  *where* the gap is (see `core/probe.py`).
 - The earlier code's recall came from naming a root for every student, including
   the ones with no gap.
 

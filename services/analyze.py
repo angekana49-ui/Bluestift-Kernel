@@ -9,6 +9,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from core import anomaly, bkt, calibration, curriculum, detector, forgetting, mindset
+from core import probe as active_probe
 from core.graph import build_graph, node_id
 from services import db, serial
 from services.kc_registry import LLMBudget, _normalize_label, get_or_create_kc
@@ -400,6 +401,14 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
     # Fold in mastery for *all* graph nodes (default 0.5 when unknown) so the DFS
     # can reason about prerequisites the student hasn't explicitly touched.
     all_states: dict[str, float] = {n["label"]: 0.5 for n in nodes}
+    # What the student showed in EARLIER conversations counts too. The search
+    # used to know only the KCs this conversation mentioned, so a prerequisite
+    # failed last week — or mastered — read as never practised the moment the
+    # talk moved on, and a probe's answer would have been forgotten by the next
+    # analysis. Decayed like any other state. These inform the prerequisites
+    # only: what the student is failing NOW is still this conversation's call.
+    history_states = _history_states(graph, states_by_concept, effective_states, mastery_map)
+    all_states.update(history_states)
     all_states.update(effective_states)
 
     # 6b. Pedagogical-safety anomaly detection -> persist alerts to monitoring.
@@ -417,19 +426,27 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
     # 7. DFS root-cause from failing KCs. `known` = labels with real evidence, so
     #    the DFS can descend into untouched (suspected) prerequisites.
     #    "Failing" is relative to each KC's own prior (detector.failing_threshold).
+    known = set(effective_states) | set(history_states)
     weak_below = {
-        lbl: detector.failing_threshold(bkt.get_bkt_params(resolved[lbl])["p_init"])
-        for lbl in effective_states
+        lbl: detector.failing_threshold(
+            bkt.get_bkt_params(resolved.get(lbl) or dict(graph.nodes[lbl]))["p_init"]
+        )
+        for lbl in known
     }
     failing = [lbl for lbl, eff in effective_states.items() if eff < weak_below[lbl]]
     detection = detector.detect_root_cause(
-        graph, failing, all_states, known=set(effective_states), weak_below=weak_below
+        graph, failing, all_states, known=known, weak_below=weak_below
     )
     root_gap = detection["root_gap"]
     detection_path = detection["detection_path"]
     confidence = detection["confidence"]
 
     root_concept_id = node_id(graph, root_gap) if root_gap else None
+
+    # 7a. The one question that would best settle the diagnosis (core/probe.py).
+    #     RAYA asks it and sends the answer to /update_concept_state; the next
+    #     analysis reads it back through the student's history above.
+    probe = active_probe.choose_probe(graph, failing, all_states, known, weak_below, root_gap)
 
     # 7b. School layer: if the student belongs to a school, its curriculum layers
     #     shape the sequencing and its objectives are reported against real state.
@@ -455,6 +472,7 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
         "summary": summary,
         "recommended_path": rec_path,
         "alerts": [{"type": a["alert_type"], "severity": a["alert_severity"]} for a in alerts],
+        "probe": probe,
         "llm_used": llm_used if llm_used != "none" else summary_llm,
         # Not part of the API contract: the route pops this and schedules the
         # work after responding. It rides along because only this function knows
@@ -498,6 +516,29 @@ def _load_curriculum_layers(client, user_id: str, subject: str, level: str):
     except Exception as e:  # noqa: BLE001 - degrade to no school context
         db.log_monitoring(client, "warn", "curriculum_layers_failed", {"error": str(e)[:300]})
         return curriculum.CurriculumLayers()
+
+
+def _history_states(graph, states_by_concept: dict, current: dict, mastery_map: dict) -> dict[str, float]:
+    """label -> effective mastery for the student's stored KCs this conversation left out.
+
+    Same decay as the session KCs (forgetting.get_lambda, floor p_init), read
+    off the graph's node attributes. A stored row is evidence by construction:
+    one is only written when an attempt was counted.
+    """
+    by_id = {data.get("id"): label for label, data in graph.nodes(data=True)}
+    out: dict[str, float] = {}
+    for concept_id, state in states_by_concept.items():
+        label = by_id.get(concept_id)
+        if label is None or label in current or label in mastery_map:
+            continue
+        kc = dict(graph.nodes[label])
+        params = bkt.get_bkt_params(kc)
+        out[label] = forgetting.compute_effective_mastery(
+            state["mastery_score_raw"], kc.get("type_kc", "conceptual"),
+            state.get("last_strong_signal_at"),
+            lambda_override=forgetting.get_lambda(kc, state), floor=params["p_init"],
+        )
+    return out
 
 
 def _group_trajectories(rows: list[dict]) -> dict[str, list[float]]:

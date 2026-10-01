@@ -20,6 +20,15 @@ like-for-like comparison:
     python scripts/eval_kernel.py --sessions 3              # evidence accumulates
     python scripts/eval_kernel.py --sessions 3 --warmup 1000   # + calibrated params
     python scripts/eval_kernel.py --json
+    python scripts/eval_kernel.py --sessions 3 --probe kernel  # tutor asks the Kernel's probe
+    python scripts/eval_kernel.py --sessions 3 --probe random  # same effort, a random prerequisite
+
+With --probe, each conversation is first analysed diagnose-only (commit_state
+false), the tutor asks ONE unassisted question on the chosen concept, and that
+answer joins the conversation before the real analysis. `random` is the control:
+one extra question in every conversation (so at least the Kernel's effort), on
+a prerequisite of the surface concept drawn at random among those the student
+has not practised yet.
 """
 from __future__ import annotations
 
@@ -77,6 +86,27 @@ def make_profile(rng: random.Random, g: nx.DiGraph, with_gap: bool) -> dict:
     return {"gap": gap, "unlearned": unlearned, "surface": surface}
 
 
+def make_attempt(rng: random.Random, kc: str, learned: bool, assisted: bool) -> dict:
+    """One graded answer, with the population's noise."""
+    if rng.random() < LINGUISTIC_FAILURE_RATE:
+        correct, blocage = False, "linguistic"
+    else:
+        if learned:
+            p = 1 - TRUE_SLIP
+        else:
+            p = ASSISTED_SUCCESS_WHEN_UNLEARNED if assisted else TRUE_GUESS
+        correct = rng.random() < p
+        blocage = "none" if correct else "conceptual"
+    return {
+        "kc_label": kc,
+        "outcome": "success" if correct else "failure",
+        "partial_credit": rng.choice((1.0, 0.8)) if correct else rng.choice((0.0, 0.3)),
+        "is_assisted": assisted,
+        "blocage_type": blocage,
+        "response_time_estimate": "normal",
+    }
+
+
 def make_session(rng: random.Random, g: nx.DiGraph, profile: dict) -> tuple[dict, bool]:
     """One conversation's ground-truth extraction, and whether it probed the gap."""
     gap, unlearned, surface = profile["gap"], profile["unlearned"], profile["surface"]
@@ -90,26 +120,8 @@ def make_session(rng: random.Random, g: nx.DiGraph, profile: dict) -> tuple[dict
 
     attempts = []
     for kc in sorted(practised):
-        learned = kc not in unlearned
         for _ in range(rng.choice((1, 2, 3))):
-            assisted = rng.random() < ASSISTED_RATE
-            if rng.random() < LINGUISTIC_FAILURE_RATE:
-                correct, blocage = False, "linguistic"
-            else:
-                if learned:
-                    p = 1 - TRUE_SLIP
-                else:
-                    p = ASSISTED_SUCCESS_WHEN_UNLEARNED if assisted else TRUE_GUESS
-                correct = rng.random() < p
-                blocage = "none" if correct else "conceptual"
-            attempts.append({
-                "kc_label": kc,
-                "outcome": "success" if correct else "failure",
-                "partial_credit": rng.choice((1.0, 0.8)) if correct else rng.choice((0.0, 0.3)),
-                "is_assisted": assisted,
-                "blocage_type": blocage,
-                "response_time_estimate": "normal",
-            })
+            attempts.append(make_attempt(rng, kc, kc not in unlearned, rng.random() < ASSISTED_RATE))
     rng.shuffle(attempts)  # interleaved, as in a real conversation
     mentioned = sorted(practised) + rng.sample(sorted(n for n in g if n not in practised), MENTIONED_ONLY)
     extraction = {
@@ -159,7 +171,7 @@ def new_db(g: nx.DiGraph, params: dict) -> FakeSupabase:
     return fake
 
 
-async def diagnose(fake: FakeSupabase, extraction: dict, user: int, session: int) -> dict:
+async def diagnose(fake: FakeSupabase, extraction: dict, user: int, session, commit: bool = True) -> dict:
     async def ground_truth_llm(prompt, max_tokens=1000):
         if "kcs_mentioned" in prompt:
             return json.dumps(extraction), "ground-truth"
@@ -172,11 +184,22 @@ async def diagnose(fake: FakeSupabase, extraction: dict, user: int, session: int
         "conversation_history": [{"role": "user", "content": "..."}],
         "subject": "MATH",
         "level": "lycee",
+        "commit_state": commit,
     }
     return await analyze_pipeline.run_analysis(fake, f"req-{user}-{session}", payload)
 
 
-async def run(students: int, seed: int, warmup: int = 0, sessions: int = 1) -> dict:
+def random_probe(rng: random.Random, g: nx.DiGraph, profile: dict, practised: set) -> str | None:
+    """The control: a prerequisite of the surface, <= 4 hops, not practised yet."""
+    surface = profile["surface"]
+    pool = sorted(
+        a for a in nx.ancestors(g, surface)
+        if a not in practised and nx.shortest_path_length(g, a, surface) <= 4
+    )
+    return rng.choice(pool) if pool else None
+
+
+async def run(students: int, seed: int, warmup: int = 0, sessions: int = 1, probe: str = "none") -> dict:
     rng = random.Random(seed)
     g = make_curriculum(rng)
     # A separate stream for the warm-up cohort, so the evaluated students are
@@ -189,15 +212,40 @@ async def run(students: int, seed: int, warmup: int = 0, sessions: int = 1) -> d
     # Exact-root rate split by whether the gap itself was ever practised: with
     # no evidence on the gap, only the graph's structure can point at it.
     by_evidence = {"practised": [0, 0], "not_practised": [0, 0]}
+    # The probe's answers get their own stream: the sessions themselves are the
+    # same draws in every mode, so modes differ only by the extra question.
+    probe_rng = random.Random(seed + 20_000)
+    questions = probes_on_gap = 0
 
     for i in range(students):
         with_gap = i % 4 != 0  # a quarter of the students have no gap at all
         profile = make_profile(rng, g, with_gap)
         fake = new_db(g, fitted)
         probed_ever = False
+        practised_ever: set[str] = set()
         for s in range(sessions):
             extraction, probed = make_session(rng, g, profile)
             probed_ever = probed_ever or probed
+            practised_ever |= {a["kc_label"] for a in extraction["attempts"]}
+            target = None
+            if probe == "kernel":
+                preview = await diagnose(fake, extraction, i, f"{s}-preview", commit=False)
+                target = (preview.get("probe") or {}).get("label")
+            elif probe == "random":
+                # The control asks in EVERY conversation — at least as many
+                # questions as the Kernel, which stays silent when no answer
+                # would teach it anything.
+                target = random_probe(probe_rng, g, profile, practised_ever)
+            if target:
+                questions += 1
+                probes_on_gap += target == profile["gap"]
+                probed_ever = probed_ever or target == profile["gap"]
+                practised_ever.add(target)
+                extraction["attempts"].append(
+                    make_attempt(probe_rng, target, target not in profile["unlearned"], assisted=False)
+                )
+                if target not in {m["label"] for m in extraction["kcs_mentioned"]}:
+                    extraction["kcs_mentioned"].append({"label": target, "subject": "MATH", "level": "lycee"})
             out = await diagnose(fake, extraction, i, s)
         root, gap = out.get("root_gap"), profile["gap"]
         named_roots += root is not None
@@ -231,6 +279,10 @@ async def run(students: int, seed: int, warmup: int = 0, sessions: int = 1) -> d
         "sessions": sessions,
         "warmup": warmup,
         "calibrated_kcs": len(fitted),
+        "probe_mode": probe,
+        # Extra diagnostic questions asked, and how many landed on the gap itself.
+        "probe_questions_per_student": round(questions / students, 3),
+        "probe_on_gap_share": round(probes_on_gap / questions, 3) if questions else None,
         # Recall: share of gap students whose planted gap is named exactly.
         "root_gap_exact": round(exact / gap_students, 3),
         # Precision: share of NAMED roots that are the planted gap.
@@ -252,21 +304,26 @@ def main() -> None:
     parser.add_argument("--sessions", type=int, default=1, help="conversations per student")
     parser.add_argument("--warmup", type=int, default=0,
                         help="calibrate BKT params on this many warm-up students first")
+    parser.add_argument("--probe", choices=("none", "kernel", "random"), default="none",
+                        help="one extra diagnostic question per conversation, and who picks it")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
-    result = asyncio.run(run(args.students, args.seed, args.warmup, args.sessions))
+    result = asyncio.run(run(args.students, args.seed, args.warmup, args.sessions, args.probe))
     if args.json:
         print(json.dumps(result))
         return
     print(f"Synthetic benchmark - {result['students']} students x {result['sessions']} session(s), "
           f"seed {result['seed']}, {result['calibrated_kcs']} KCs calibrated on "
-          f"{result['warmup']} warm-up students")
+          f"{result['warmup']} warm-up students, probe: {result['probe_mode']}")
     print(f"  root gap found exactly (recall)   {result['root_gap_exact']:.1%}")
     print(f"  named roots that are right        {result['precision']:.1%}")
     print(f"  planted gap on the detection path {result['gap_on_detection_path']:.1%}")
     print(f"  false root on gap-free students   {result['false_root_on_gapless_students']:.1%}")
     print(f"  learned KCs labelled 'gap'/student {result['learned_kcs_labelled_gap_per_student']:.2f}")
     print("  misses: " + ", ".join(f"{k} {v:.1%}" for k, v in result["miss_breakdown"].items()))
+    if result["probe_mode"] != "none":
+        print(f"  probe questions/student {result['probe_questions_per_student']:.2f}, "
+              f"on the gap {result['probe_on_gap_share'] or 0:.1%}")
     split = result["root_gap_exact_when_gap"]
     print(f"  exact when the gap was practised {split['practised']:.1%}, "
           f"when it never was {split['not_practised']:.1%}")
