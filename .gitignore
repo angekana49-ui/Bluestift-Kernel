@@ -18,3 +18,8 @@ env/
 
 # Generated graph visualization (regenerate with scripts/visualize_graph.py)
 graph_viz.html
+
+# graphify: machine-local interpreter/root paths and extraction cache
+graphify-out/.graphify_python
+graphify-out/.graphify_root
+graphify-out/cache/
