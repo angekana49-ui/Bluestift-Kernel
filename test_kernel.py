@@ -30,6 +30,7 @@ from models.schemas import AnalyzeResponse
 from services import analyze as analyze_pipeline
 from services import db as db_module
 from services import display_names
+from services import deepen as deepening
 from services import graph_builder
 from services import kc_registry
 from services import llm
@@ -2943,3 +2944,127 @@ def test_failed_extraction_does_not_assume_french():
     finally:
         pipeline.llm_call = original
     assert data["langue_interaction"] == "other"
+
+
+# --------------------------------------------------------------------------- #
+# Deepening: the graph grows finer where the diagnosis bottoms out
+# --------------------------------------------------------------------------- #
+def _deepen_llm(finer: list[str]):
+    async def fake(prompt, max_tokens=1000):
+        if "PLUS FINS" in prompt:
+            return json.dumps({"prerequisites": finer}), "mock"
+        return json.dumps({"type_kc": "conceptual", "prerequisites": [], "description": "d"}), "mock"
+    return fake
+
+
+def _verifier(monkeypatch, *answers):
+    asked = []
+
+    async def answer(prompt, max_tokens=20, temperature=0.0):
+        asked.append(prompt)
+        return answers[min(len(asked), len(answers)) - 1]
+
+    monkeypatch.setattr(llm, "call_gemini", answer)
+    monkeypatch.setattr(llm, "call_groq", answer)
+    return asked
+
+
+def _seed_fractions(fake_supabase, deepened_at=None):
+    fake_supabase.seed("kernel.concept_nodes", [
+        {"id": "f", "label": "fractions_egales_et_operations", "subject": "MATH", "level": "cycle3",
+         "deepened_at": deepened_at},
+        {"id": "i", "label": "addition_soustraction_entiers", "subject": "MATH", "level": "cycle3"},
+    ])
+    fake_supabase.seed("kernel.concept_edges", [{"id": "e1", "concept_id": "f", "prerequisite_id": "i", "weight": 1.0}])
+
+
+def test_deepen_only_when_the_root_is_itself_failing_and_not_yet_deepened():
+    graph = build_graph(
+        [{"id": "f", "label": "fractions"}, {"id": "d", "label": "denominateur", "deepened_at": "2026-10-01"}], [])
+    assert deepening.should_deepen(graph, "fractions", ["fractions"]) is True
+    assert deepening.should_deepen(graph, "fractions", []) is False          # the root is a suspected prerequisite
+    assert deepening.should_deepen(graph, "denominateur", ["denominateur"]) is False  # once, ever
+    assert deepening.should_deepen(graph, None, ["fractions"]) is False
+
+
+@pytest.mark.asyncio
+async def test_deepen_wires_finer_prerequisites_below_the_concept(fake_supabase, monkeypatch):
+    _seed_fractions(fake_supabase)
+    fake = _deepen_llm(["sens_du_denominateur", "Fractions unitaires", "addition_soustraction_entiers"])
+    monkeypatch.setattr(deepening, "llm_call", fake)
+    monkeypatch.setattr(kc_registry, "llm_call", fake)
+
+    report = await deepening.deepen(fake_supabase, "fractions_egales_et_operations", "MATH", "cycle3")
+    assert report["deepened"] is True
+    assert set(report["added"]) == {"sens_du_denominateur", "fractions_unitaires"}  # the existing one is skipped
+    nodes = {n["id"]: n for n in fake_supabase.tables["kernel.concept_nodes"]}
+    below_f = {nodes[e["prerequisite_id"]]["label"] for e in fake_supabase.tables["kernel.concept_edges"]
+               if e["concept_id"] == "f"}
+    assert below_f == {"addition_soustraction_entiers", "sens_du_denominateur", "fractions_unitaires"}
+    assert nodes["f"]["deepened_at"]
+
+    again = await deepening.deepen(fake_supabase, "fractions_egales_et_operations", "MATH", "cycle3")
+    assert again == {"deepened": False, "reason": "already deepened"}
+
+
+@pytest.mark.asyncio
+async def test_deepen_never_makes_a_cycle(fake_supabase, monkeypatch):
+    _seed_fractions(fake_supabase)
+    # "pourcentages" already depends on the fractions concept: it cannot also be below it.
+    fake_supabase.tables["kernel.concept_nodes"].append(
+        {"id": "p", "label": "pourcentages", "subject": "MATH", "level": "cycle4"})
+    fake_supabase.tables["kernel.concept_edges"].append(
+        {"id": "e2", "concept_id": "p", "prerequisite_id": "f", "weight": 1.0})
+    fake = _deepen_llm(["pourcentages"])
+    monkeypatch.setattr(deepening, "llm_call", fake)
+    monkeypatch.setattr(kc_registry, "llm_call", fake)
+    _verifier(monkeypatch, "oui")  # even when both models say yes
+
+    report = await deepening.deepen(fake_supabase, "fractions_egales_et_operations", "MATH", "cycle3")
+    assert report["added"] == []
+    assert not any(e["concept_id"] == "f" and e["prerequisite_id"] == "p"
+                   for e in fake_supabase.tables["kernel.concept_edges"])
+
+
+@pytest.mark.asyncio
+async def test_deepen_does_nothing_without_migration_014(fake_supabase, monkeypatch):
+    _seed_fractions(fake_supabase)
+    calls = []
+
+    async def fake(prompt, max_tokens=1000):
+        calls.append(prompt)
+        return "{}", "mock"
+
+    def no_column(*_args, **_kwargs):
+        raise Exception('column "deepened_at" of relation "concept_nodes" does not exist')
+
+    monkeypatch.setattr(deepening, "llm_call", fake)
+    monkeypatch.setattr(db_module, "update_concept_node", no_column)
+    report = await deepening.deepen(fake_supabase, "fractions_egales_et_operations", "MATH", "cycle3")
+    assert report == {"deepened": False, "reason": "migration 014 not applied"}
+    assert calls == [], "no LLM call when the Kernel could not remember having deepened"
+
+
+def test_analyze_asks_to_deepen_a_failing_root_and_the_route_schedules_it(fake_supabase, monkeypatch):
+    fake_supabase.seed("kernel.concept_nodes", [{"id": "f", "label": "fractions", "subject": "MATH"}])
+    out = asyncio.run(_analyze(fake_supabase, monkeypatch, {
+        "kcs_mentioned": [{"label": "fractions", "subject": "MATH"}],
+        "attempts": [{"kc_label": "fractions", "outcome": "failure", "partial_credit": 0.0}] * 3,
+    }))
+    assert out["root_gap"] == "fractions"
+    assert out["deepen"] == {"label": "fractions", "subject": "MATH", "level": "lycee"}
+
+
+@pytest.mark.asyncio
+async def test_an_existing_concept_goes_below_only_if_both_models_agree(fake_supabase, monkeypatch):
+    _seed_fractions(fake_supabase)
+    fake_supabase.tables["kernel.concept_nodes"].append(
+        {"id": "s", "label": "pente_ligne", "subject": "MATH", "level": "cycle4", "description": "slope"})
+    fake = _deepen_llm(["pente_ligne", "sens_du_denominateur"])
+    monkeypatch.setattr(deepening, "llm_call", fake)
+    monkeypatch.setattr(kc_registry, "llm_call", fake)
+    asked = _verifier(monkeypatch, "oui", "non")  # one yes is not enough
+
+    report = await deepening.deepen(fake_supabase, "fractions_egales_et_operations", "MATH", "cycle3")
+    assert report["added"] == ["sens_du_denominateur"]  # new and finer: no vote needed
+    assert len(asked) == 2 and "slope" in asked[0], "grounded on the description"

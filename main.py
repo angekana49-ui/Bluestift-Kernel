@@ -53,6 +53,7 @@ from models.schemas import (  # noqa: E402
 )
 from services import analyze as analyze_pipeline  # noqa: E402
 from services import db  # noqa: E402
+from services import deepen  # noqa: E402
 from services import serial  # noqa: E402
 from services.analyze import _commit_session, _learning_events  # noqa: E402
 from services.kc_registry import _normalize_label, get_or_create_kc  # noqa: E402
@@ -281,6 +282,9 @@ async def analyze(
     # cooldown, so a busy KC is not rescanned on every turn.
     for concept_id in output.pop("recalibrate_concept_ids", []):
         background.add_task(_recalibrate_kc, concept_id)
+    deepen_target = output.pop("deepen", None)
+    if deepen_target:
+        background.add_task(_deepen_kc, **deepen_target)
 
     return AnalyzeResponse(kernel_version=KERNEL_VERSION, **output)
 
@@ -439,6 +443,22 @@ async def update_concept_state(
         status=status,
         updated=True,
     )
+
+
+async def _deepen_kc(label: str, subject: str, level: str) -> None:
+    """Background: give a concept the diagnosis bottomed out on its finer
+    prerequisites (services/deepen.py). Once per concept; never raises."""
+    try:
+        client = db.get_client()
+        vocabulary = analyze_pipeline._format_vocabulary(db.load_labels_by_subject(client), subject)
+        report = await deepen.deepen(client, label, subject, level, vocabulary)
+        if report.get("deepened"):
+            db.log_monitoring(client, "info", "concept_deepened", report)
+    except Exception as e:  # noqa: BLE001 - background work must not crash the worker
+        try:
+            db.log_monitoring(db.get_client(), "warn", "deepen_failed", {"label": label, "error": str(e)[:300]})
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _recalibrate_kc(concept_id: str) -> None:

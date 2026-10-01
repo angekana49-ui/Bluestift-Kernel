@@ -98,7 +98,7 @@ Each KC, per student, carries a four-dimensional state (Luckin / corpus §1.2):
 │   └── validate_mindset.py  # Offline: does M predict what students do next?
 ├── migrations/              # 12 numbered Supabase SQL migrations
 ├── conftest.py              # In-memory fake Supabase for tests
-├── test_kernel.py           # 168 tests
+├── test_kernel.py           # 174 tests
 ├── PARAMETERS.md            # Provenance of every constant
 ├── requirements.txt / requirements-dev.txt
 └── railway.toml            # Deploy config + the cost rules that keep it cheap
@@ -263,6 +263,7 @@ Management API with `scripts/apply_migrations.py`):
 011_learning_events.sql           # one row per graded attempt (BKT fitting) + recent autonomous credits
 012_state_chain.sql               # state version (chain height) + review/lapse counts (spacing)
 013_concept_display_names.sql     # readable concept name per locale (the label stays the identity)
+014_concept_deepened_at.sql       # when a concept got its finer prerequisites (once, see services/deepen.py)
 ```
 
 > **Deploy 011 and 012 before the code that uses them.** Without it, state writes still
@@ -395,7 +396,7 @@ detector change needed; the convergence search crosses the bridge automatically.
 pytest -q
 ```
 
-168 tests. The suite mocks the LLM and uses an in-memory fake Supabase
+174 tests. The suite mocks the LLM and uses an in-memory fake Supabase
 (`conftest.py`, with real ILIKE semantics and the real UNIQUE constraints), so **no network or real keys are
 required**. Coverage: BKT (soft evidence, bounds, assisted attempts, blocage
 rules), forgetting, mindset, detector (convergence, determinism, cycles),

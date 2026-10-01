@@ -138,6 +138,21 @@ is flat in it.
 | `UNKNOWN_BUDGET` | 2 | design — how many never-practised prerequisites in a row the search may cross |
 | confidence weights | 0.4 convergence, 0.3 depth, 0.3 severity | design — **not a calibrated probability**. Do not present `confidence` as one. |
 
+## Deepening — `services/deepen.py`, migration 014
+
+When the root the detector returns is itself a failing concept, the graph has
+nothing finer below it. After responding, `/analyze` asks the LLM once for that
+concept's finer prerequisites and wires them in (`deepened_at` makes it once
+per concept, for every learner). A new concept is accepted as proposed; an
+EXISTING concept is wired below only if both models answer "yes" to a
+prerequisite question grounded on each concept's description and level.
+
+| Constant | Value | Provenance |
+|---|---|---|
+| `MAX_FINER` | 3 | design — the same cap as at creation |
+| `DEEPEN_LLM_CALLS` | 5 | design — the question, then the new KCs' own inference |
+| verification | both models, grounded | design — on labels alone one model put "slope" below linear equations; grounded, both answered 7 test pairs right, direction included |
+
 ## Active probing — `core/probe.py`
 
 | Constant | Value | Provenance | Replaced by |
@@ -204,5 +219,7 @@ Requests for one student are served first come, first served (a FIFO queue per s
 |---|---|---|
 | `MAX_DEPTH` | 3 | `services/kc_registry.py` — prerequisite recursion |
 | `MAX_LLM_CALLS_PER_REQUEST` | 6 | `services/kc_registry.py` — KC inference per request |
+| `GROQ_REASONING_ALLOWANCE` | 2000 tokens | `services/llm.py` — added to every Groq call: gpt-oss reasons out of the same budget, and the extraction ran out of it in half the analyses. A reply cut off at the limit goes to Gemini. |
+| deepening | once per concept, ever | `services/deepen.py` — at most `DEEPEN_LLM_CALLS` + 2 verification calls per concept |
 | rate limits | 30 per student per hour, 300 per hour overall | `core/ratelimit.py` |
 

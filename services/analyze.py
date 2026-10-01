@@ -12,6 +12,7 @@ from core import anomaly, bkt, calibration, curriculum, detector, forgetting, mi
 from core import probe as active_probe
 from core.graph import build_graph, node_id
 from services import db, serial
+from services import deepen as deepening
 from services.kc_registry import LLMBudget, _normalize_label, get_or_create_kc
 from services.llm import extract_json, llm_call
 
@@ -517,6 +518,13 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
         # work after responding. It rides along because only this function knows
         # which KCs it actually committed to.
         "recalibrate_concept_ids": sorted(recalibrate_ids),
+        # Same: the diagnosis bottomed out on a failing concept, so the graph
+        # has nothing finer below it yet (services/deepen.py). The route asks
+        # for it after responding; the next analysis can descend into it.
+        "deepen": (
+            {"label": root_gap, "subject": subject, "level": level}
+            if deepening.should_deepen(graph, root_gap, failing) else None
+        ),
     }
 
     if not layers.is_empty:

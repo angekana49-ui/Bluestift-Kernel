@@ -378,6 +378,12 @@ behave differently.
     the existing ones. The app reads the column itself
     (`lib/kernel/concept-names-server.ts`) and falls back to the label made
     readable. Without the migration, concepts are still created, just unnamed.
+18. **The graph now deepens where the diagnosis bottoms out** (migration 014,
+    `services/deepen.py`). When the root gap is itself a failing concept,
+    `/analyze` (after responding) asks once for that concept's finer
+    prerequisites. The app sees nothing new in the response; the next analysis
+    can return a finer `root_gap` and a closer `probe`. Without migration 014
+    the Kernel does not deepen at all.
 
 ---
 
