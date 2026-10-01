@@ -95,7 +95,7 @@ async def name_batch(nodes: list[dict]) -> tuple[dict[str, dict[str, str]], str]
     asked = {n["label"] for n in nodes}
     text, model = await llm_call(
         NAMES_PROMPT.format(concepts=_describe(nodes)),
-        max_tokens=150 * len(nodes) + 200,
+        max_tokens=_TOKENS_PER_CONCEPT * len(nodes) + _REASONING_ALLOWANCE,
     )
     try:
         parsed = extract_json(text)
@@ -112,9 +112,12 @@ async def name_batch(nodes: list[dict]) -> tuple[dict[str, dict[str, str]], str]
     return out, model
 
 
-# [design] Concepts per LLM call: a batch of 20 is about 3k output tokens, well
-# inside one response, and 154 concepts take 8 calls.
-BACKFILL_BATCH = 20
+# [design] Concepts per LLM call. The primary model reasons before it answers,
+# and the reasoning comes out of the same token budget: batches of 20 came back
+# cut off mid-JSON about half the time. 8 per call, with room to think.
+BACKFILL_BATCH = 8
+_TOKENS_PER_CONCEPT = 250
+_REASONING_ALLOWANCE = 2000
 
 
 async def backfill(client, batch_size: int = BACKFILL_BATCH, dry_run: bool = False) -> dict:
@@ -126,17 +129,20 @@ async def backfill(client, batch_size: int = BACKFILL_BATCH, dry_run: bool = Fal
     from . import db
 
     todo = [n for n in db.load_concept_nodes(client) if missing_locales(n.get("display_names"))]
-    report = {"missing": len(todo), "named": 0, "failed_batches": 0, "dry_run": dry_run, "examples": {}}
+    report = {"missing": len(todo), "named": 0, "unnamed": 0, "failed_batches": 0, "dry_run": dry_run, "examples": {}}
     for start in range(0, len(todo), batch_size):
         batch = todo[start:start + batch_size]
         try:
             names, _model = await name_batch(batch)
         except Exception:  # noqa: BLE001 - every provider down: report, move on
             report["failed_batches"] += 1
+            report["unnamed"] += len(batch)
             continue
         for node in batch:
             new = names.get(node["label"])
             if not new:
+                # A reply cut off mid-JSON names nobody: say so, run again.
+                report["unnamed"] += 1
                 continue
             merged = {**new, **clean(node.get("display_names"))}
             if len(report["examples"]) < 8:
