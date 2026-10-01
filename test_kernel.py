@@ -2890,3 +2890,56 @@ def test_summary_without_llm_follows_the_language(monkeypatch):
     assert text.startswith("You're stuck") and "notion de fraction" in text
     no_gap, _ = asyncio.run(analyze_pipeline.generate_summary("fractions", None, [], "en"))
     assert no_gap.startswith("There isn't enough")
+
+
+# --------------------------------------------------------------------------- #
+# The reasoning model's token budget
+# --------------------------------------------------------------------------- #
+class _GroqChoice:
+    def __init__(self, content, finish_reason):
+        self.message = type("M", (), {"content": content})()
+        self.finish_reason = finish_reason
+
+
+def _fake_groq(content, finish_reason, seen):
+    async def create(**kwargs):
+        seen.append(kwargs)
+        return type("R", (), {"choices": [_GroqChoice(content, finish_reason)]})()
+
+    completions = type("C", (), {"create": staticmethod(create)})()
+    return type("G", (), {"chat": type("Chat", (), {"completions": completions})()})()
+
+
+@pytest.mark.asyncio
+async def test_groq_gets_room_to_reason_on_top_of_the_answer(monkeypatch):
+    seen = []
+    monkeypatch.setattr(llm, "_get_groq", lambda: _fake_groq("{}", "stop", seen))
+    text, model = await llm.llm_call("prompt", max_tokens=1200)
+    assert (text, model) == ("{}", llm.GROQ_MODEL)
+    assert seen[0]["max_tokens"] == 1200 + llm.GROQ_REASONING_ALLOWANCE
+
+
+@pytest.mark.asyncio
+async def test_a_cut_off_groq_answer_goes_to_gemini(fake_httpx, monkeypatch):
+    # Half a JSON object used to be returned as the answer, and parsed to an
+    # empty extraction downstream: half the real analyses were empty.
+    seen = []
+    monkeypatch.setattr(llm, "_get_groq", lambda: _fake_groq('{"kcs_mentioned": [{"lab', "length", seen))
+    fake_httpx.response = _FakeResponse({"candidates": [{"content": {"parts": [{"text": "{\"ok\": 1}"}]}}]})
+    text, model = await llm.llm_call("prompt")
+    assert model == llm.GEMINI_MODEL and text == '{"ok": 1}'
+    assert len(seen) == 1, "a truncated answer is not retried on the same model"
+
+
+def test_failed_extraction_does_not_assume_french():
+    async def broken(prompt, max_tokens=1000):
+        return "not json at all", "mock"
+
+    import services.analyze as pipeline
+    original = pipeline.llm_call
+    pipeline.llm_call = broken
+    try:
+        data, _ = asyncio.run(pipeline.extract_kcs([{"role": "user", "content": "hi"}], "MATH", "lycee", []))
+    finally:
+        pipeline.llm_call = original
+    assert data["langue_interaction"] == "other"

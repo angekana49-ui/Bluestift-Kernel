@@ -26,6 +26,17 @@ except Exception:  # noqa: BLE001 - best effort; fall back to default CAs
     pass
 
 GROQ_MODEL = "openai/gpt-oss-120b"
+
+# [design] gpt-oss reasons before it answers, and the reasoning is billed to the
+# same max_tokens. Measured on real conversations: 500-1000 reasoning tokens for
+# the extraction prompt, whose budget was 1200 — half the analyses came back
+# cut off mid-JSON and degraded, silently, to an empty extraction. Callers
+# size max_tokens for the ANSWER; this is added on top for the thinking.
+GROQ_REASONING_ALLOWANCE = 2000
+
+
+class TruncatedResponse(RuntimeError):
+    """The model ran out of tokens before finishing its answer."""
 GEMINI_MODEL = "gemini-3.1-flash-lite"
 
 GEMINI_ENDPOINT = (
@@ -116,10 +127,17 @@ async def llm_call(prompt: str, max_tokens: int = 1000) -> tuple[str, str]:
             response = await client.chat.completions.create(
                 model=GROQ_MODEL,
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=max_tokens,
+                max_tokens=max_tokens + GROQ_REASONING_ALLOWANCE,
                 temperature=0.1,
             )
-            return response.choices[0].message.content, GROQ_MODEL
+            choice = response.choices[0]
+            # A cut-off answer is not an answer: half a JSON object parses to
+            # nothing downstream. Let Gemini have a go rather than retrying a
+            # prompt that will think just as long again.
+            if getattr(choice, "finish_reason", None) == "length":
+                last_error = TruncatedResponse(f"{GROQ_MODEL} hit max_tokens")
+                break
+            return choice.message.content, GROQ_MODEL
         except Exception as e:  # noqa: BLE001 - we deliberately fall through
             last_error = e
             if attempt < 2:
@@ -146,10 +164,13 @@ async def call_groq(prompt: str, max_tokens: int = 2000, temperature: float = 0.
     response = await client.chat.completions.create(
         model=GROQ_MODEL,
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=max_tokens,
+        max_tokens=max_tokens + GROQ_REASONING_ALLOWANCE,
         temperature=temperature,
     )
-    return response.choices[0].message.content
+    choice = response.choices[0]
+    if getattr(choice, "finish_reason", None) == "length":
+        raise TruncatedResponse(f"{GROQ_MODEL} hit max_tokens")
+    return choice.message.content
 
 
 async def call_gemini(prompt: str, max_tokens: int = 2000, temperature: float = 0.2) -> str:

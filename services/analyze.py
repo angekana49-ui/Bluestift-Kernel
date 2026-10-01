@@ -68,6 +68,10 @@ Pour chaque tentative :
   c'est le concept qui manque ; "ambiguous" si on ne peut pas trancher ;
   "none" si pas de blocage.
 
+langue_interaction : la langue dans laquelle l'ELEVE ecrit ses propres messages
+(role user), PAS la langue de ces consignes ni des noms de concepts. Un eleve qui
+ecrit en anglais : "en", meme si tout le reste est en francais.
+
 Pour mindset_signals (chaque valeur entre 0.0 et 1.0, juge depuis la conversation) :
 - abandon_rate : a quel point l'eleve abandonne / se decourage (1 = abandonne vite).
 - persistence_score : a quel point il persevere malgre la difficulte (1 = tres tenace).
@@ -212,7 +216,8 @@ async def extract_kcs(
             "kcs_mentioned": [],
             "attempts": [],
             "blocage_type": "ambiguous",
-            "langue_interaction": "fr",
+            # Unknown, not French: the summary falls back to the app's default.
+            "langue_interaction": "other",
         }
     return data, llm_used
 
