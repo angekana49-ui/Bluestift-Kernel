@@ -70,11 +70,43 @@ Forgetting depends on **days and reviews**: λ = base_λ · 2^(−max(0, 0.5·re
 | `LAMBDA_PRIORS.conceptual` | 0.02 /day (≈ 35 days) | design | same |
 | `LAMBDA_PRIORS.declarative` | 0.05 /day (≈ 14 days) | design | same |
 | `MIN_INTERACTIONS_FOR_EMPIRICAL` | 10 | design | — |
-| `REVIEW_GAIN`, `LAPSE_PENALTY` | 0.5, 0.5 half-lives | design | half-life regression weights fitted on `learning_events` |
+| `REVIEW_GAIN`, `LAPSE_PENALTY` | 0.5, 0.5 half-lives | design | **fitted** by `scripts/fit_forgetting.py` (see below) |
 | `REVIEW_MIN_GAP_DAYS` | 1 | design — a retrieval the same day tests short-term memory, not retention | — |
 | `TAU_LAMBDA_SLOPE` | 1.0 | design — rigour scales the forgetting prior | — |
 
 The personal λ is stored as a **base** rate (reviews are applied on top of it, never baked in).
+
+### Fitting the forgetting constants — `core/forgetting_fit.py`
+
+`scripts/fit_forgetting.py` fits `REVIEW_GAIN`, `LAPSE_PENALTY` and a
+multiplier of each `LAMBDA_PRIORS` entry by replaying the logged histories
+through the Kernel's model and scoring each retrieval (first unassisted answer
+after a gap ≥ `REVIEW_MIN_GAP_DAYS`) by cross-entropy. Personal λ is left out,
+since it is learned from those same retrievals.
+
+| Constant | Value | Provenance |
+|---|---|---|
+| `MIN_RETRIEVALS_FOR_FIT` | 200 | design — fewer, and the held-out comparison is noise |
+| `HOLDOUT_SHARE` | 0.2 of students, by hash | design |
+| grids | weights 0–2 by 0.1; prior ×1/8 to ×8 by √2 | design — coordinate descent from the current values |
+| adoption rule | fitted beats current **and** no-spacing by > 2 standard errors, held out | design |
+
+The 95% intervals are likelihood-ratio intervals with the other constants held
+at their fitted values. They understate the uncertainty when constants trade
+off (more reviews vs a slower base rate). On simulated students with known
+constants, `REVIEW_GAIN` and the conceptual and procedural priors were recovered
+inside their intervals. The declarative prior once fell outside: the likelihood
+is flat in it.
+
+## Validating M — `core/mindset_validation.py`
+
+| Constant | Value | Provenance |
+|---|---|---|
+| `OUTCOME_WINDOW_DAYS` | 30 | design — outcomes are measured in this window after each reading |
+| `RETURN_WINDOW_DAYS` | 14 | design — "came back" |
+| `SESSION_GAP_HOURS` | 1 | design — sessions for attempts without a request_id |
+| `MIN_STUDENTS`, `MIN_ANALYSES` | 30, 100 | design |
+| `BOOTSTRAP_SAMPLES` | 500, resampling students | design |
 
 ## Calibration — `core/calibration.py`
 
@@ -130,7 +162,7 @@ different roots.
 | `W_MEASURED` | learning speed 0.30, progression 0.30, recovery after error 0.20, stability (1 − slip) 0.20 | design — the Kernel's own traces, renormalised over the ones available |
 | `MEASURED_HALF_WEIGHT_AT`, `MAX_MEASURED_SHARE` | 5 data points, 0.5 | design — the measured share grows with its evidence; the conversation always keeps half |
 | `GAIN` | 6.0 | design — spreads the score over [~0.05, ~0.95] |
-| `EMA_WEIGHT` | 0.3 | design — symmetric. The condensate's "degrades fast, rebuilds slowly" is a hypothesis, not implemented. |
+| `EMA_WEIGHT` | 0.3 | design — symmetric. The condensate's "degrades fast, rebuilds slowly" is a hypothesis, not implemented. **Tested by** `scripts/validate_mindset.py` (paired intervals vs other weights). |
 | `M_FLOOR`, `M_CEIL` | 0.05, 0.95 | design |
 | labels | growth ≥ 0.66, fixed ≤ 0.40 | design |
 

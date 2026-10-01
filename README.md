@@ -74,6 +74,8 @@ Each KC, per student, carries a four-dimensional state (Luckin / corpus §1.2):
 │   ├── mindset.py           # Mindset score M (sigmoid blend)
 │   ├── detector.py          # DFS root-cause by convergence
 │   ├── probe.py             # Active probing: the most informative next question
+│   ├── forgetting_fit.py    # Fit of the decay/review constants (half-life regression)
+│   ├── mindset_validation.py # Predictive validity of M, and of its smoothing
 │   ├── calibration.py       # Self-calibration of living parameters
 │   ├── anomaly.py           # Pedagogical-safety anomaly detection
 │   ├── curriculum.py        # School curriculum layers -> sequencing + objectives
@@ -90,10 +92,12 @@ Each KC, per student, carries a four-dimensional state (Luckin / corpus §1.2):
 │   ├── build_graph.py       # CLI: distill a KC graph from the LLMs
 │   ├── build_bridges.py     # CLI: generate cross-subject prerequisite bridges
 │   ├── apply_migrations.py  # CLI: apply migrations via the Management API
-│   └── eval_kernel.py       # Synthetic-student benchmark (root-gap recall/precision, probing)
+│   ├── eval_kernel.py       # Synthetic-student benchmark (root-gap recall/precision, probing)
+│   ├── fit_forgetting.py    # Offline: fit the forgetting constants on learning_events
+│   └── validate_mindset.py  # Offline: does M predict what students do next?
 ├── migrations/              # 12 numbered Supabase SQL migrations
 ├── conftest.py              # In-memory fake Supabase for tests
-├── test_kernel.py           # 147 tests
+├── test_kernel.py           # 154 tests
 ├── PARAMETERS.md            # Provenance of every constant
 ├── requirements.txt / requirements-dev.txt
 └── railway.toml            # Deploy config + the cost rules that keep it cheap
@@ -389,7 +393,7 @@ detector change needed; the convergence search crosses the bridge automatically.
 pytest -q
 ```
 
-147 tests. The suite mocks the LLM and uses an in-memory fake Supabase
+154 tests. The suite mocks the LLM and uses an in-memory fake Supabase
 (`conftest.py`, with real ILIKE semantics and the real UNIQUE constraints), so **no network or real keys are
 required**. Coverage: BKT (soft evidence, bounds, assisted attempts, blocage
 rules), forgetting, mindset, detector (convergence, determinism, cycles),
@@ -446,6 +450,32 @@ of the whole stack.
   *where* the gap is (see `core/probe.py`).
 - The earlier code's recall came from naming a root for every student, including
   the ones with no gap.
+
+### Offline fits on real data
+
+Two read-only scripts turn production data into evidence for or against the
+design values. Both refuse to report numbers below a minimum amount of data,
+and both run on simulated students (`--synthetic N`) to show what they can
+recover.
+
+```bash
+python scripts/fit_forgetting.py      # REVIEW_GAIN, LAPSE_PENALTY, LAMBDA_PRIORS
+python scripts/validate_mindset.py    # does M predict persistence, learning, return?
+```
+
+- **`fit_forgetting.py`** replays every history through the Kernel's own decay
+  and review model and scores the first unassisted answer after each gap. It
+  fits on 80% of students and judges on the other 20%: `adopt: true` only when
+  the fitted constants beat both the current ones and a no-spacing model by
+  more than two standard errors.
+- **`validate_mindset.py`** needs the `mindset_trace` that each analysis now
+  logs in `kernel_outputs.output`. It measures what followed each reading:
+  retries after failures, answers better than the mastery estimate predicted
+  (a residual, so M is not credited for tracking level), and returns. It also
+  tests the EMA weight against alternatives, with paired intervals.
+
+On 2026-10-01 production holds no `learning_events` yet (the Kernel has been
+offline since they were introduced), so both report "not enough data".
 
 ---
 

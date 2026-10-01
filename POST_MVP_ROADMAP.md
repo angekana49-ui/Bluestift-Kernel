@@ -152,6 +152,14 @@ Still open here:
   detector's convergence/depth rules would become one Bayesian decision. Worth
   it only if the benchmark and, later, real remediation outcomes say so.
 
+- **Forgetting constants and M — tooling shipped 2026-10-01, waiting on data.**
+  `scripts/fit_forgetting.py` fits `REVIEW_GAIN`, `LAPSE_PENALTY` and the λ
+  priors on held-out retrievals; `scripts/validate_mindset.py` tests whether M
+  predicts persistence, learning beyond level and return, and whether its EMA
+  weight is right. Both need weeks of production `learning_events` (and, for M,
+  the `mindset_trace` now logged per analysis). Run them once the Kernel has
+  been live for about a month; adopt only what clears their significance rules.
+
 - **Confidence calibration** — the current confidence blend (convergence + depth
   + severity) is heuristic; calibrate against observed remediation outcomes.
 - **Root-selection refinement** — when convergence ties, the longest-chain

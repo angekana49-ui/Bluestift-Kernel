@@ -23,6 +23,7 @@ from core import (
     anomaly, bkt, calibration, curriculum, detector, forgetting, mindset,
     prerequisites, ratelimit,
 )
+from core import forgetting_fit, mindset_validation
 from core import probe as active_probe
 from core.graph import build_graph
 from models.schemas import AnalyzeResponse
@@ -2677,3 +2678,92 @@ def test_a_weak_prerequisite_mid_chain_beats_the_surface():
     known = {"derivees", "fonctions_polynomiales"}
     result = detector.detect_root_cause(graph, ["derivees"], states, known=known)
     assert result["root_gap"] == "fonctions_polynomiales"
+
+
+# --------------------------------------------------------------------------- #
+# Offline fits: forgetting constants and the mindset score's validity
+# --------------------------------------------------------------------------- #
+def test_forgetting_fit_recovers_the_constants_that_generated_the_data():
+    import random
+
+    seqs = forgetting_fit.simulate(
+        random.Random(0), 300, gain=1.0, penalty=0.2,
+        scales={"procedural": 2.0, "conceptual": 1.0, "declarative": 0.5},
+    )
+    report = forgetting_fit.fit(seqs)
+    assert report["fitted"] is not None
+    lo, hi = report["interval_95"]["REVIEW_GAIN"]
+    assert lo <= 1.0 <= hi
+    # Spacing is real in this data: ignoring reviews must predict worse.
+    assert report["held_out"]["vs_no_spacing"]["fitted_better_by"] > 0
+
+
+def test_forgetting_fit_refuses_to_answer_on_too_little_data():
+    import random
+
+    report = forgetting_fit.fit(forgetting_fit.simulate(random.Random(0), 5, 1.0, 0.2, {}))
+    assert report["fitted"] is None and report["adopt"] is False
+
+
+def test_forgetting_fit_counts_retrievals_as_the_kernel_does():
+    # A retrieval is the first UNASSISTED answer after a gap of a day or more:
+    # the same rule as services/analyze.py, or the fit tunes another model.
+    node = {"id": "c", "type_kc": "conceptual"}
+    day = lambda d: f"2026-01-{d:02d}T10:00:00+00:00"
+    events = [
+        {"user_id": "u", "concept_id": "c", "credit": 1.0, "is_assisted": False, "created_at": day(1)},
+        {"user_id": "u", "concept_id": "c", "credit": 1.0, "is_assisted": False, "created_at": day(1)},
+        {"user_id": "u", "concept_id": "c", "credit": 0.0, "is_assisted": True, "created_at": day(5)},
+        {"user_id": "u", "concept_id": "c", "credit": 0.0, "is_assisted": False, "created_at": day(9)},
+        {"user_id": "u", "concept_id": "c", "credit": 1.0, "is_assisted": False, "counted": False,
+         "created_at": day(20)},
+    ]
+    (seq,) = forgetting_fit.sequences(events, {"c": node})
+    assert len(seq["events"]) == 4  # the uncounted attempt is not evidence
+    retrievals = list(forgetting_fit.replay(seq, 0.5, 0.5, 1.0))
+    assert [c for _, c in retrievals] == [0.0]  # day 5 was assisted; day 9 counts
+
+
+def test_mindset_validation_finds_a_real_signal_and_prefers_smoothing(monkeypatch):
+    import random
+
+    monkeypatch.setattr(mindset_validation, "BOOTSTRAP_SAMPLES", 60)
+    traces, events = mindset_validation.simulate(random.Random(1), 80)
+    report = mindset_validation.report(mindset_validation.records(traces, events, {}))
+    assert report["enough_data"]
+    persistence = report["associations"]["m_score"]["persistence"]
+    assert persistence["rho"] > 0 and persistence["interval_95"][0] > 0
+    # A stable trait read through noisy conversations: averaging beats one reading.
+    ema = report["ema_weight_mean_rho"]
+    assert ema["0.3"] > ema["1.0"]
+
+
+def test_mindset_validation_resamples_students_not_analyses():
+    # Two students; one has 50 analyses. A per-analysis bootstrap would treat
+    # them as 51 independent points.
+    recs = [{"user_id": "a", "m_score": 0.1 * (i % 10), "persistence": 0.1 * (i % 10)} for i in range(50)]
+    recs.append({"user_id": "b", "m_score": 0.9, "persistence": 0.0})
+    out = mindset_validation.association(recs, "m_score", "persistence")
+    assert out["students"] == 2 and out["n"] == 51
+
+
+def test_mindset_validation_needs_enough_students():
+    assert mindset_validation.report([{"user_id": "a"}] * 500)["enough_data"] is False
+
+
+def test_analyze_logs_the_mindset_trace_but_does_not_return_it(fake_supabase, monkeypatch):
+    fake_supabase.seed("kernel.concept_nodes", [{"id": "f", "label": "fractions", "subject": "MATH"}])
+    signals = {"abandon_rate": 0.2, "persistence_score": 0.8, "time_on_task": 0.6, "interaction_quality": 0.5}
+    out = asyncio.run(_analyze(fake_supabase, monkeypatch, {
+        "kcs_mentioned": [{"label": "fractions", "subject": "MATH"}],
+        "attempts": [{"kc_label": "fractions", "outcome": "failure", "partial_credit": 0.0},
+                     {"kc_label": "fractions", "outcome": "success", "partial_credit": 1.0}],
+        "mindset_signals": signals,
+    }))
+    assert "mindset_trace" not in out
+    logged = fake_supabase.tables["kernel.kernel_outputs"][0]["output"]["mindset_trace"]
+    assert logged["m_score"] == pytest.approx(fake_supabase.tables["kernel.student_mindset_state"][0]["m_score"], abs=1e-4)
+    assert logged["abandon_after_error"] == 0.0 and logged["recovery"] == 1.0
+    assert logged["ema_weight"] == mindset.EMA_WEIGHT
+    (trace,) = db_module.load_mindset_traces(fake_supabase)
+    assert trace["user_id"] == "u1" and trace["observed"] == logged["observed"]

@@ -367,6 +367,10 @@ behave differently.
 15. **A failed prerequisite mid-chain can now be the root.** It used to lose to
     the surface concept whenever the chain continued into unverified concepts
     below it, so `root_gap` was too often just what the student was stuck on.
+16. **`kernel_outputs.output` now carries a `mindset_trace`** (the M reading of
+    that analysis and its parts), for `scripts/validate_mindset.py`. It is
+    **not** in the `/analyze` response. `kernel_outputs` is already in the GDPR
+    erasure and export lists, so nothing changes app-side.
 
 ---
 

@@ -109,7 +109,7 @@ class _Query:
         self._on_conflict = None
         self._limit = None
         self._count = None
-        self._order = None
+        self._order: list[tuple[str, bool]] = []
         self._range = None
 
     # --- terminal-ish builders ------------------------------------------- #
@@ -169,7 +169,8 @@ class _Query:
         return self
 
     def order(self, col, desc=False):
-        self._order = (col, desc)
+        # Chained .order() calls sort by each key in turn, as PostgREST does.
+        self._order.append((col, desc))
         return self
 
     # --- helpers --------------------------------------------------------- #
@@ -202,10 +203,10 @@ class _Query:
     def execute(self) -> _Result:
         if self._op == "select":
             rows = [r for r in self._rows if self._matches(r)]
-            if self._order is not None:
-                col, desc = self._order
-                # Sort before the limit, as PostgREST does — a limit applied to
-                # unordered rows would silently return the wrong window.
+            # Sort before the limit, as PostgREST does — a limit applied to
+            # unordered rows would silently return the wrong window. Stable
+            # sorts from the last key to the first give a multi-key order.
+            for col, desc in reversed(self._order):
                 rows = sorted(rows, key=lambda r: (r.get(col) is None, r.get(col)), reverse=desc)
             if self._range is not None:
                 start, end = self._range

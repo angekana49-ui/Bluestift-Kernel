@@ -283,9 +283,10 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
             for c in (_attempt_credit(a) for a in atts)
             if c is not None
         ]
+        mindset_trace: dict = {}
         m_score = _update_mindset(
             client, user_id, extraction.get("mindset_signals"),
-            states_rows, trajectories, session_attempts,
+            states_rows, trajectories, session_attempts, trace=mindset_trace,
         )
 
         # 4-5. Decay -> effective mastery, then a BKT update on every attempt.
@@ -495,7 +496,9 @@ async def run_analysis(client, request_id: str, payload: dict) -> dict:
         }
 
     # 9. Persist output + insight (request was already logged by the caller).
-    db.log_kernel_output(client, request_id, user_id, output)
+    # The M reading rides along in the log, not the response: it is what
+    # scripts/validate_mindset.py tests against what the student did next.
+    db.log_kernel_output(client, request_id, user_id, {**output, "mindset_trace": mindset_trace})
     db.log_individual_insight(client, user_id, request_id, summary, root_gap)
 
     return output
@@ -840,6 +843,7 @@ def _update_mindset(
     states: list[dict] | None = None,
     trajectories: dict[str, list[float]] | None = None,
     session_attempts: list[tuple[str, float]] | None = None,
+    trace: dict | None = None,
 ) -> float:
     """Fold this conversation's mindset reading into the stored score M.
 
@@ -850,6 +854,9 @@ def _update_mindset(
     When the exchange said nothing about mindset, the STORED score is returned —
     "this conversation carried no signal" is not the same claim as "this student
     is average", and P is modulated by whichever one we hand back.
+
+    `trace`, when given, is filled with every intermediate reading, so the
+    score can later be validated against what the student actually did.
     """
     previous = None
     row = db.load_mindset(client, user_id)
@@ -880,8 +887,23 @@ def _update_mindset(
         )
 
     observed = mindset.combine(conversation, measured, evidence)
+    if trace is not None:
+        trace.update({
+            "previous": previous,
+            "conversation_linear": conversation,
+            "measured_linear": measured,
+            "measured_evidence": evidence,
+            "abandon_after_error": behaviour["abandon_after_error"],
+            "recovery": behaviour["recovery"],
+            "failures": behaviour["failures"],
+            "observed": observed,
+            "m_score": fallback if observed is None else None,
+            "ema_weight": mindset.EMA_WEIGHT,
+        })
     if observed is None:
         return fallback
     m = mindset.blend_mindset(previous, observed)
+    if trace is not None:
+        trace["m_score"] = m
     db.upsert_mindset(client, user_id, round(m, 4), mindset.classify_mindset(m))
     return m

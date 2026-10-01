@@ -250,6 +250,37 @@ def load_learning_events_for_concept(client, concept_id: str, limit: int = 20000
     )
 
 
+def load_all_learning_events(client) -> list[dict]:
+    """Every logged attempt, oldest first — for offline fits (scripts/), not requests."""
+    return _load_all(
+        lambda: _kernel(client, "learning_events")
+        .select("id, user_id, concept_id, credit, is_assisted, counted, k_before, request_id, created_at")
+        .order("created_at")
+        .order("id")
+    )
+
+
+def load_mindset_traces(client) -> list[dict]:
+    """Per-analysis M readings logged in kernel_outputs.output["mindset_trace"], oldest first.
+
+    For scripts/validate_mindset.py. Analyses logged before the trace existed
+    are skipped.
+    """
+    rows = _load_all(
+        lambda: _kernel(client, "kernel_outputs")
+        .select("request_id, user_id, created_at, output")
+        .order("created_at")
+        .order("request_id")
+    )
+    out = []
+    for r in rows:
+        trace = (r.get("output") or {}).get("mindset_trace")
+        if trace:
+            out.append({"request_id": r.get("request_id"), "user_id": r["user_id"],
+                        "created_at": r["created_at"], **trace})
+    return out
+
+
 def load_states_for_concept(client, concept_id: str) -> list[dict]:
     """All students' states for one KC — used by background calibration."""
     return (
